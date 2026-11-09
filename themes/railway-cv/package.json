@@ -1,0 +1,23 @@
+{
+  "name": "signal-cv-theme",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@12.6.0",
+  "description": "Reusable Signal CV presentation layer for Hugo.",
+  "scripts": {
+    "css:build": "tailwindcss -i assets/css/daisyui.input.css -o assets/css/daisyui.generated.css --minify",
+    "dev": "pnpm run css:build && hugo server --source ../.. --disableFastRender",
+    "build": "pnpm run css:build && hugo --source ../.. --cleanDestinationDir --minify",
+    "pagefind": "pagefind --site ../../public"
+  },
+  "dependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "@tailwindcss/typography": "^0.5.20",
+    "pagefind": "^1.5.2",
+    "preact": "^10.29.8",
+    "tailwindcss": "^4.3.3"
+  },
+  "devDependencies": {
+    "daisyui": "5.7.47"
+  }
+}

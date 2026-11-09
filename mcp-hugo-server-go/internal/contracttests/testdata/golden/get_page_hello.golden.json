@@ -1,0 +1,61 @@
+{
+  "data": {
+    "page": {
+      "categories": [
+        "tutorials"
+      ],
+      "category_terms": [
+        {
+          "label": "Tutorials",
+          "slug": "tutorials",
+          "source": "tutorials"
+        }
+      ],
+      "date": "2026-01-05T03:04:05Z",
+      "html": "\u003ch1\u003eHello\u003c/h1\u003e\n    \u003cp\u003eMinimal English content.\u003c/p\u003e",
+      "html_origin": "rendered_public",
+      "lang": "en",
+      "rendered_html_available": true,
+      "resolved_lang": "",
+      "resolved_source_path": "content/posts/hello.md",
+      "revision": "sha256:cd389cff5937b3567f228eca770c7b9b1b48cbf24400a913dd56fda01b165ad1",
+      "slug": "/posts/hello/",
+      "source_key": "posts/hello",
+      "state": {
+        "build_state": "built",
+        "index_state": "fresh",
+        "public_state": "available",
+        "source_state": "present"
+      },
+      "summary": "Minimal English article",
+      "tag_terms": [
+        {
+          "label": "Go",
+          "slug": "go",
+          "source": "go"
+        },
+        {
+          "label": "Hugo",
+          "slug": "hugo",
+          "source": "hugo"
+        }
+      ],
+      "tags": [
+        "go",
+        "hugo"
+      ],
+      "title": "Hello",
+      "url": "https://example.test/posts/hello/"
+    }
+  },
+  "errors": [],
+  "meta": {
+    "build_channel": "main",
+    "commit": "0123456789ab",
+    "content_provenance": "site_rendered_public_untrusted",
+    "release_version": "test-server-version",
+    "schema_version": "v2.0.0"
+  },
+  "success": true,
+  "warnings": []
+}

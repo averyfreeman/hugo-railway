@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="{{ .Site.Language.Lang | default "en" }}" data-theme="signal">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="{{ .Description | default .Site.Params.description }}">
+    <meta name="theme-color" content="#303136">
+    <meta property="og:title" content="{{ .Title }} · {{ .Site.Title }}">
+    <meta property="og:description" content="{{ .Description | default .Site.Params.description }}">
+    <meta property="og:type" content="{{ if .IsPage }}article{{ else }}website{{ end }}">
+    <meta property="og:url" content="{{ .Permalink }}">
+    <link rel="icon" href="{{ "favicon.svg" | relURL }}" type="image/svg+xml">
+    {{ with .OutputFormats.Get "RSS" }}
+      <link rel="alternate" type="application/rss+xml" href="{{ .RelPermalink }}" title="{{ $.Site.Title }}">
+    {{ end }}
+    {{ $componentStyles := resources.Get "css/daisyui.generated.css" }}
+    {{ $themeStyles := resources.Get "css/main.css" }}
+    {{ $styles := slice $componentStyles $themeStyles | resources.Concat "css/site.css" | resources.Minify | resources.Fingerprint }}
+    <link rel="stylesheet" href="{{ $styles.RelPermalink }}">
+    {{ block "head" . }}{{ end }}
+  </head>
+  <body class="{{ if .IsHome }}is-home{{ end }}">
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {{ partial "site-header.html" . }}
+    <main id="main-content">
+      {{ block "main" . }}{{ end }}
+    </main>
+    {{ partial "site-footer.html" . }}
+    {{ if eq .Section "portfolio" }}
+      {{ $repoFilter := resources.Get "js/repository-filters.mjs" | resources.Minify | resources.Fingerprint }}
+      <script type="module" defer src="{{ $repoFilter.RelPermalink }}"></script>
+    {{ end }}
+    {{ if eq .Section "posts" }}
+      {{ $postSearch := resources.Get "js/post-search.mjs" | resources.Minify | resources.Fingerprint }}
+      <script type="module" defer src="{{ $postSearch.RelPermalink }}"></script>
+    {{ end }}
+    {{ $script := resources.Get "js/site.js" | resources.Minify | resources.Fingerprint }}
+    <script defer src="{{ $script.RelPermalink }}"></script>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+{{ $file := .Get "file" | default (.Get 0) }}
+{{ with .Page.Resources.GetMatch $file }}
+  <aside class="latex-embed notebook-embed signal-surface" aria-label="LaTeX source artifact">
+    <div class="notebook-embed__top"><span class="notebook-embed__icon">∑</span><span>source companion</span><span class="notebook-embed__status">latex / ready</span></div>
+    <div class="notebook-embed__body"><h3>{{ $file }}</h3><p>Keep the source beside the readable Markdown abstract. This makes the publication easy to version, export, and hand to another toolchain.</p><a class="text-link" href="{{ .RelPermalink }}" download>Download .tex <span aria-hidden="true">↘</span></a></div>
+  </aside>
+{{ else }}
+  <p class="notebook-missing">LaTeX source artifact <code>{{ $file }}</code> was not found in this page bundle.</p>
+{{ end }}

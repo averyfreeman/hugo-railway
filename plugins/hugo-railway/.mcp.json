@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "hugo-railway": {
+      "command": "node",
+      "args": ["./scripts/launch-mcp.cjs"],
+      "cwd": ".",
+      "env": {
+        "MCP_HUGO_SITE_URL": "http://localhost:1313",
+        "MCP_HUGO_SITE_NAME": "Signal CV"
+      }
+    }
+  }
+}

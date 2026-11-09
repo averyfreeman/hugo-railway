@@ -1,0 +1,40 @@
+{{ define "main" }}
+  {{ $kind := .Params.migration_kind }}
+  {{ $pages := where .Site.RegularPages "Params.migration_source" "vitepress" }}
+  {{ if eq $kind "article-index" }}
+    {{ $pages = where $pages "Params.migration_kind" "article" }}
+  {{ else if eq $kind "policy-index" }}
+    {{ $pages = where $pages "Params.migration_kind" "policy" }}
+  {{ end }}
+  {{ $pages = $pages.ByDate.Reverse }}
+  <section class="migration-shell page-shell">
+    <header class="migration-header">
+      <p class="eyebrow">STAGED IMPORT / {{ $kind | upper }}</p>
+      <h1>{{ .Title }}</h1>
+      {{ with .Description }}<p class="lede">{{ . }}</p>{{ end }}
+      <p class="migration-notice">Imported VitePress material · review namespace · existing demo content remains separate.</p>
+    </header>
+    {{ if $pages }}
+      <div class="migration-grid">
+        {{ range $page := $pages }}
+          <article class="migration-card signal-surface">
+            {{ with $page.Params.thumbnail }}
+              <div class="migration-card__media">
+                {{ if strings.HasPrefix . "/" }}<img src="{{ . | relURL }}" alt="{{ $page.Params.thumbnail_alt | default $page.Title }}" loading="lazy">{{ else }}<img src="{{ . }}" alt="{{ $page.Params.thumbnail_alt | default $page.Title }}" loading="lazy">{{ end }}
+              </div>
+            {{ end }}
+            <div class="migration-card__body">
+              <div class="migration-card__top"><span>{{ $page.Params.migration_kind }}</span>{{ if $page.Params.date }}<span>{{ $page.Date.Format "2006" }}</span>{{ end }}</div>
+              <h2><a href="{{ $page.RelPermalink }}">{{ $page.Title }}</a></h2>
+              {{ with $page.Params.working_note }}<span class="migration-badge">working note</span>{{ end }}
+              <p>{{ $page.Params.summary | default $page.Description | default $page.Summary }}</p>
+              <a class="text-link" href="{{ $page.RelPermalink }}">Open staged page <span aria-hidden="true">↗</span></a>
+            </div>
+          </article>
+        {{ end }}
+      </div>
+    {{ else }}
+      <div class="empty-state signal-surface"><span class="status-dot"></span><p>No staged pages are available yet.</p></div>
+    {{ end }}
+  </section>
+{{ end }}

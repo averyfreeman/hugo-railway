@@ -1,0 +1,52 @@
+{
+  "data": {
+    "has_more": false,
+    "limit": 2,
+    "offset": 0,
+    "pages": [
+      {
+        "categories": [
+          "tutorials"
+        ],
+        "date": "2026-01-05T03:04:05Z",
+        "lang": "en",
+        "slug": "/posts/hello/",
+        "source_key": "posts/hello",
+        "summary": "Minimal English article",
+        "tags": [
+          "hugo",
+          "read-only"
+        ],
+        "title": "Hello",
+        "url": "https://example.test/posts/hello/"
+      },
+      {
+        "categories": [
+          "homelab",
+          "infrastructure"
+        ],
+        "date": "2026-01-02T03:04:05Z",
+        "lang": "fr",
+        "slug": "/posts/bonjour/",
+        "summary": "Article français minimal",
+        "tags": [
+          "hugo",
+          "security"
+        ],
+        "title": "Bonjour",
+        "url": "https://example.test/posts/bonjour/"
+      }
+    ],
+    "returned_count": 2,
+    "total": 2
+  },
+  "errors": [],
+  "meta": {
+    "build_channel": "main",
+    "commit": "0123456789ab",
+    "release_version": "test-server-version",
+    "schema_version": "v2.0.0"
+  },
+  "success": true,
+  "warnings": []
+}

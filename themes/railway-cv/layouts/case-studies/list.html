@@ -1,0 +1,20 @@
+{{ define "main" }}
+  {{ $caseStudies := sort .Pages "Params.order" "asc" }}
+  <section class="archive page-shell">
+    <header class="archive__header">
+      <p class="eyebrow">PORTFOLIO / PROJECT STORIES</p>
+      <h1>{{ .Title }}</h1>
+      {{ with .Description }}<p class="lede">{{ . }}</p>{{ end }}
+    </header>
+    <div class="case-study-grid">
+      {{ range $caseStudies }}
+        <a class="case-study-card card signal-surface" href="{{ .RelPermalink }}">
+          <span class="case-study-card__order badge badge-outline">{{ printf "%02d" .Params.order }} / {{ .Params.focus }}</span>
+          <h2>{{ .Title }}</h2>
+          <p>{{ .Params.summary }}</p>
+          <span class="case-study-card__link">Read case study <span aria-hidden="true">↗</span></span>
+        </a>
+      {{ end }}
+    </div>
+  </section>
+{{ end }}

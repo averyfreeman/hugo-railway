@@ -1,0 +1,14 @@
+<footer class="site-footer page-shell">
+  <div class="site-footer__top">
+    <a class="brand" href="{{ "/" | relURL }}"><span class="brand__mark">{{ hugo.Data.home.identity.mark }}</span><span class="brand__name">{{ hugo.Data.home.identity.name }}</span></a>
+    <p>{{ hugo.Data.home.footer.tagline | default "Practical software and systems work, with the source close at hand." }}</p>
+  </div>
+  <div class="site-footer__bottom">
+    <span>© {{ now.Year }} {{ hugo.Data.home.identity.name }}</span>
+    <div class="site-footer__links">
+      {{ range hugo.Data.home.identity.links }}<a href="{{ .url }}" rel="me">{{ .label }}</a>{{ end }}
+      {{ with hugo.Data.home.footer.rss_url }}<a href="{{ . | relURL }}">RSS</a>{{ end }}
+    </div>
+    <span>{{ hugo.Data.home.footer.note | default "Signal CV / Hugo" }}</span>
+  </div>
+</footer>

@@ -1,0 +1,59 @@
+identity:
+  mark: AF
+  name: Avery Freeman
+  role: Software & systems developer
+  descriptor: software & systems
+  eyebrow: SOFTWARE · SYSTEMS · PRACTICAL TOOLS
+  summary: I connect software, infrastructure, and operations to build tools and workflows that are easier to inspect, use, and maintain.
+  location: Seattle, Washington
+  links:
+    - label: GitHub
+      url: https://github.com/averyfreeman
+    - label: LinkedIn
+      url: https://www.linkedin.com/in/averyfreeman/
+hero:
+  heading: 'I build practical tools<br><em>for complex work.</em>'
+  command: trace --build --explain
+  prompt: avery@systems:~$
+  terminal_lines:
+    - requirements -> a useful tool
+    - software + infrastructure + operations
+    - leave a trail another person can follow
+  primary_label: View the portfolio
+  primary_url: /portfolio/
+  secondary_label: LinkedIn
+  secondary_url: https://www.linkedin.com/in/averyfreeman/
+  secondary_external: true
+navigation:
+  - label: Portfolio
+    url: /portfolio/
+  - label: Blog
+    url: /posts/
+  - label: About
+    url: /about/
+  - label: Skills
+    url: /skills/
+  - label: LinkedIn
+    url: https://www.linkedin.com/in/averyfreeman/
+    external: true
+    cta: true
+interests:
+  - AI DEVELOPER TOOLING
+  - LINUX & INFRASTRUCTURE
+  - SOFTWARE & AUTOMATION
+  - DATA & CIVIC PROJECTS
+writing:
+  label: Recent writing
+  archive_label: All posts
+  archive_url: /posts/
+  intro: Practical notes from software, infrastructure, Linux, data, and the work of making systems easier to understand.
+cta:
+  kicker: About Avery
+  title: Good systems make room for better work.
+  body: Read about the experience behind the projects, from infrastructure and operations to software and AI developer tooling.
+  label: About Avery
+  href: /about/
+footer:
+  tagline: Practical software and systems work, with the source close at hand.
+  rss_url: /posts/index.xml
+  note: Signal CV / Hugo

@@ -1,0 +1,375 @@
+package oauth
+
+import (
+	"encoding/json"
+	"fmt"
+	"html"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/audit"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/tools"
+)
+
+type agentRegistration struct {
+	RegistrationID   string
+	AssertionToken   string
+	IssuedScope      string
+	ClaimToken       string
+	AssertionExpires time.Time
+	ClaimExpires     time.Time
+	// Claimed is set to true only when the operator has verified the claim via
+	// /agent/identity/verify. Until then the assertion cannot be exchanged for
+	// a privileged token.
+	Claimed bool
+}
+
+type agentClaim struct {
+	RegistrationID string
+	ClaimAttemptID string
+	ExpiresAt      time.Time
+}
+
+type AgentClaimInfo struct {
+	ExpiresIn       int    `json:"expires_in"`
+	VerificationURI string `json:"verification_uri"`
+	Interval        int    `json:"interval"`
+}
+
+type AgentIdentityResponse struct {
+	RegistrationID    string          `json:"registration_id"`
+	RegistrationType  string          `json:"registration_type"`
+	IdentityAssertion string          `json:"identity_assertion"`
+	AssertionExpires  string          `json:"assertion_expires"`
+	PreClaimScopes    []string        `json:"pre_claim_scopes"`
+	ClaimURL          string          `json:"claim_url"`
+	ClaimToken        string          `json:"claim_token"`
+	ClaimTokenExpires string          `json:"claim_token_expires"`
+	PostClaimScopes   []string        `json:"post_claim_scopes"`
+	Claim             *AgentClaimInfo `json:"claim"`
+}
+
+type AgentClaimResponse struct {
+	RegistrationID string          `json:"registration_id"`
+	ClaimAttemptID string          `json:"claim_attempt_id"`
+	Status         string          `json:"status"`
+	ExpiresAt      string          `json:"expires_at"`
+	ClaimAttempt   *AgentClaimInfo `json:"claim_attempt"`
+}
+
+func (s *Service) registerAgentAnonymous() (*AgentIdentityResponse, error) {
+	issuer := s.cfg.Issuer
+	regSuffix, err := randomString(20)
+	if err != nil {
+		return nil, fmt.Errorf("server_error: generate registration id: %w", err)
+	}
+	assertionSuffix, err := randomString(32)
+	if err != nil {
+		return nil, fmt.Errorf("server_error: generate assertion token: %w", err)
+	}
+	regID := "reg_" + regSuffix
+	assertion := "arleo_assert_" + assertionSuffix
+	now := time.Now()
+	assertionExpires := now.Add(time.Hour)
+	issuedScope := "read"
+	claimed := false
+	claimToken := ""
+	claimExpires := time.Time{}
+	if s.cfg.AllowReaderSelfRegistration {
+		issuedScope = "read"
+		claimed = true
+	} else {
+		claimSuffix, err := randomString(24)
+		if err != nil {
+			return nil, fmt.Errorf("server_error: generate claim token: %w", err)
+		}
+		claimToken = "clm_" + claimSuffix
+		claimExpires = now.Add(10 * time.Minute)
+	}
+
+	s.mu.Lock()
+	s.agentRegs[assertion] = agentRegistration{
+		RegistrationID:   regID,
+		AssertionToken:   assertion,
+		IssuedScope:      issuedScope,
+		ClaimToken:       claimToken,
+		AssertionExpires: assertionExpires,
+		ClaimExpires:     claimExpires,
+		Claimed:          claimed,
+	}
+	if claimToken != "" {
+		s.agentClaimTokens[claimToken] = assertion
+	}
+	s.mu.Unlock()
+
+	if claimed {
+		audit.Info(audit.EventOperatorMilestone, "reader_self_registered", "registration_id", regID, "issued_scope", issuedScope)
+	} else {
+		audit.Info(audit.EventOperatorMilestone, "pending_operator_claim", "registration_id", regID)
+	}
+
+	resp := &AgentIdentityResponse{
+		RegistrationID:    regID,
+		RegistrationType:  "anonymous",
+		IdentityAssertion: assertion,
+		AssertionExpires:  assertionExpires.UTC().Format(time.RFC3339Nano),
+		PreClaimScopes:    []string{},
+		PostClaimScopes:   []string{issuedScope},
+	}
+	if claimed {
+		resp.PreClaimScopes = []string{"read"}
+		return resp, nil
+	}
+	resp.ClaimURL = issuer + "/agent/identity/claim"
+	resp.ClaimToken = claimToken
+	resp.ClaimTokenExpires = claimExpires.UTC().Format(time.RFC3339Nano)
+	resp.Claim = &AgentClaimInfo{
+		ExpiresIn:       600,
+		VerificationURI: issuer + "/agent/identity/verify",
+		Interval:        5,
+	}
+	return resp, nil
+}
+
+func (s *Service) exchangeAgentAssertion(assertion string) (*TokenResponse, error) {
+	s.mu.RLock()
+	reg, ok := s.agentRegs[assertion]
+	s.mu.RUnlock()
+	if !ok {
+		// Assertion not found — most likely lost on server restart (in-memory state).
+		// Use a distinct sentinel so the HTTP handler can add Retry-After: 0.
+		return nil, fmt.Errorf("invalid_grant: assertion_not_found")
+	}
+	if time.Now().After(reg.AssertionExpires) {
+		return nil, fmt.Errorf("invalid_grant")
+	}
+	if !reg.Claimed {
+		return nil, fmt.Errorf("invalid_grant: claim_required")
+	}
+
+	token, err := randomString(32)
+	if err != nil {
+		return nil, fmt.Errorf("server_error: generate access token: %w", err)
+	}
+	ttl := time.Duration(s.cfg.AccessTokenTTLSeconds) * time.Second
+	if reg.IssuedScope == "" {
+		reg.IssuedScope = "read"
+	}
+	if err := s.store.AddAccessToken(HashToken(token), reg.IssuedScope, reg.RegistrationID, time.Now().Add(ttl)); err != nil {
+		return nil, fmt.Errorf("server_error: store token: %w", err)
+	}
+
+	return &TokenResponse{
+		AccessToken: token,
+		TokenType:   "Bearer",
+		ExpiresIn:   s.cfg.AccessTokenTTLSeconds,
+		Scope:       reg.IssuedScope,
+	}, nil
+}
+
+func (s *Service) initiateClaim(claimToken string) (*AgentClaimResponse, error) {
+	issuer := s.cfg.Issuer
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	assertionKey, ok := s.agentClaimTokens[claimToken]
+	if !ok {
+		return nil, fmt.Errorf("invalid_claim_token")
+	}
+	reg, ok := s.agentRegs[assertionKey]
+	if !ok {
+		return nil, fmt.Errorf("invalid_claim_token")
+	}
+	if time.Now().After(reg.ClaimExpires) {
+		return nil, fmt.Errorf("claim_expired")
+	}
+
+	attemptSuffix, err := randomString(20)
+	if err != nil {
+		return nil, fmt.Errorf("server_error: generate claim attempt id: %w", err)
+	}
+	attemptID := "cla_" + attemptSuffix
+	expiresAt := time.Now().Add(10 * time.Minute)
+	s.agentClaims[attemptID] = agentClaim{
+		RegistrationID: reg.RegistrationID,
+		ClaimAttemptID: attemptID,
+		ExpiresAt:      expiresAt,
+	}
+
+	return &AgentClaimResponse{
+		RegistrationID: reg.RegistrationID,
+		ClaimAttemptID: attemptID,
+		Status:         "initiated",
+		ExpiresAt:      expiresAt.UTC().Format(time.RFC3339Nano),
+		ClaimAttempt: &AgentClaimInfo{
+			ExpiresIn:       600,
+			VerificationURI: issuer + "/agent/identity/verify",
+			Interval:        5,
+		},
+	}, nil
+}
+
+func (s *Service) HandleAgentIdentity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Type string `json:"type"`
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8192))
+	_ = r.Body.Close()
+	if err != nil || json.Unmarshal(body, &req) != nil {
+		writeAgentAuthError(w, "invalid_request", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	switch req.Type {
+	case "anonymous":
+		resp, err := s.registerAgentAnonymous()
+		if err != nil {
+			writeAgentAuthError(w, "server_error", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	default:
+		writeAgentAuthError(w, "invalid_request", http.StatusBadRequest)
+	}
+}
+
+func (s *Service) HandleAgentClaim(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		ClaimToken string `json:"claim_token"`
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8192))
+	_ = r.Body.Close()
+	if err != nil || json.Unmarshal(body, &req) != nil || req.ClaimToken == "" {
+		writeAgentAuthError(w, "invalid_request", http.StatusBadRequest)
+		return
+	}
+	resp, err := s.initiateClaim(req.ClaimToken)
+	if err != nil {
+		writeAgentAuthError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Service) verifyAgentClaim(claimToken string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	assertionKey, ok := s.agentClaimTokens[claimToken]
+	if !ok {
+		return fmt.Errorf("invalid_claim_token")
+	}
+	reg, ok := s.agentRegs[assertionKey]
+	if !ok {
+		return fmt.Errorf("invalid_claim_token")
+	}
+	if time.Now().After(reg.ClaimExpires) {
+		return fmt.Errorf("claim_expired")
+	}
+	reg.Claimed = true
+	s.agentRegs[assertionKey] = reg
+	delete(s.agentClaimTokens, claimToken)
+	return nil
+}
+
+func (s *Service) HandleAgentVerify(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		claimToken := r.URL.Query().Get("claim_token")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Agent Identity Verification</title></head>
+<body>
+<h1>Agent Identity Verification</h1>
+<p>An agent is requesting access. Operator approval is required (write token).</p>
+<form method="POST" action="/agent/identity/verify">
+  <label>Admin token: <input type="password" name="admin_token" size="40" required></label><br>
+  <label>Claim token: <input type="text" name="claim_token" value="%s" size="40" required></label><br>
+  <button type="submit">Approve</button>
+</form>
+</body></html>`, html.EscapeString(claimToken))
+	case http.MethodPost:
+		// Operator must authenticate with a write-scope Bearer token.
+		// Accept it via Authorization header (API callers) or admin_token form field
+		// (browser form submissions, which cannot set custom headers).
+		adminToken := strings.TrimSpace(strings.TrimPrefix(
+			strings.TrimSpace(r.Header.Get("Authorization")), "Bearer "))
+		if adminToken == "" {
+			if err := r.ParseForm(); err != nil {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			adminToken = r.FormValue("admin_token")
+		}
+		if adminToken == "" {
+			audit.Warn(audit.EventAuthRejected, "missing_bearer", "context", "agent_claim_verify")
+			w.Header().Set("WWW-Authenticate", `Bearer realm="agent-verify"`)
+			http.Error(w, "operator authentication required", http.StatusUnauthorized)
+			return
+		}
+		scope, _, ok := s.ValidateBearerDetails(adminToken)
+		if !ok || !tools.IsWriteScope(scope) {
+			audit.Warn(audit.EventScopeDenied, "denied", "context", "agent_claim_verify", "scope", scope)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="agent-verify", error="insufficient_scope"`)
+			http.Error(w, "forbidden: write scope required", http.StatusForbidden)
+			return
+		}
+
+		claimToken := r.FormValue("claim_token")
+		if claimToken == "" {
+			http.Error(w, "missing claim_token", http.StatusBadRequest)
+			return
+		}
+		if err := s.verifyAgentClaim(claimToken); err != nil {
+			audit.Warn(audit.EventOperatorMilestone, "claim_failed", "operator_scope", scope, "error", err.Error())
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		audit.Info(audit.EventOperatorMilestone, "claim_approved", "operator_scope", scope)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Verified</title></head>
+<body><h1>Agent claim verified</h1><p>The agent can now exchange its assertion for an access token.</p></body></html>`)
+	default:
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Service) HandleAgentEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 65536))
+	_ = r.Body.Close()
+	slog.Info("agent_event_notify", "content_type", r.Header.Get("Content-Type"), "body_len", len(body))
+	w.WriteHeader(http.StatusOK)
+}
+
+func writeAgentAuthError(w http.ResponseWriter, code string, httpStatus int) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(httpStatus)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": code})
+}

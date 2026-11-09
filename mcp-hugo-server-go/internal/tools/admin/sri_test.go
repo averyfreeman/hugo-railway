@@ -1,0 +1,339 @@
+package admin_test
+
+import (
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/config"
+)
+
+func computeTestSHA384(data []byte) string {
+	h := sha512.New384()
+	h.Write(data)
+	return "sha384-" + base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+type sriResult struct {
+	URL          string `json:"url"`
+	TemplateHash string `json:"template_hash"`
+	CurrentHash  string `json:"current_hash"`
+	Match        bool   `json:"match"`
+	Error        string `json:"error"`
+}
+
+type sriOutput struct {
+	Data struct {
+		FilesScanned           int         `json:"files_scanned"`
+		FilesWithSRIAttributes int         `json:"files_with_sri_attributes"`
+		SRIEntriesLoaded       int         `json:"sri_entries_loaded"`
+		SRIChecked             int         `json:"sri_checked"`
+		Status                 string      `json:"status"`
+		Summary                string      `json:"summary"`
+		Findings               []sriResult `json:"findings"`
+	} `json:"data"`
+}
+
+func setupSRILayout(t *testing.T, url, hash string) string {
+	t.Helper()
+	hugoRoot := t.TempDir()
+	layoutsDir := filepath.Join(hugoRoot, "layouts")
+	if err := os.MkdirAll(layoutsDir, 0o755); err != nil {
+		t.Fatalf("mkdir layouts: %v", err)
+	}
+	content := `<script src="` + url + `" integrity="` + hash + `"></script>`
+	if err := os.WriteFile(filepath.Join(layoutsDir, "base.html"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write base.html: %v", err)
+	}
+	return hugoRoot
+}
+
+// TestCheckSRIVersionsNoRootFieldDuplication is a regression test for #1118:
+// finishes #520/#573's convergence for this tool — the payload must live
+// only under data.*, with no root-level compatibility aliases (which #552
+// originally added and #1060 deprecated).
+func TestCheckSRIVersionsNoRootFieldDuplication(t *testing.T) {
+	body := []byte("console.log('hello');")
+	correctHash := computeTestSHA384(body)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	hugoRoot := setupSRILayout(t, srv.URL+"/lib.js", correctHash)
+	cfg := config.Default()
+	cfg.HugoRoot = hugoRoot
+
+	session, done := newTestServer(t, cfg)
+	defer done()
+
+	res, err := callTool(t, session, "check_sri_versions", map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool returned error: %s", resultText(res))
+	}
+
+	out := decodeStructuredResult(t, res)
+	if got := out["success"]; got != true {
+		t.Fatalf("success = %v, want true (#1118)", got)
+	}
+	data, ok := out["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("data type = %T, want map[string]any (#1118)", out["data"])
+	}
+	if _, ok := out["meta"].(map[string]any); !ok {
+		t.Fatalf("meta type = %T, want map[string]any (#1118)", out["meta"])
+	}
+	for _, field := range []string{"files_scanned", "files_with_sri_attributes", "sri_entries_loaded", "sri_checked", "status", "summary", "findings"} {
+		if _, present := data[field]; !present {
+			t.Fatalf("data.%s missing (#1118)", field)
+		}
+		if _, present := out[field]; present {
+			t.Fatalf("root %s = %v, want absent — no more root/data duplication (#1118)", field, out[field])
+		}
+	}
+}
+
+func TestSRIMatchingHash(t *testing.T) {
+	body := []byte("console.log('hello');")
+	correctHash := computeTestSHA384(body)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	hugoRoot := setupSRILayout(t, srv.URL+"/lib.js", correctHash)
+
+	cfg := config.Default()
+	cfg.HugoRoot = hugoRoot
+
+	session, done := newTestServer(t, cfg)
+	defer done()
+
+	res, err := callTool(t, session, "check_sri_versions", map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool returned error: %s", resultText(res))
+	}
+
+	text := resultText(res)
+	var out sriOutput
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		t.Fatalf("response not JSON: %v — got %q", err, text)
+	}
+	if out.Data.SRIChecked < 1 {
+		t.Fatal("expected at least 1 SRI check")
+	}
+	r := out.Data.Findings[0]
+	if r.Error != "" {
+		t.Fatalf("unexpected error in result: %s", r.Error)
+	}
+	if !r.Match {
+		t.Errorf("expected match=true, got false (template=%s current=%s)", r.TemplateHash, r.CurrentHash)
+	}
+}
+
+func TestSRIMismatchHash(t *testing.T) {
+	realBody := []byte("console.log('hello');")
+	wrongHash := "sha384-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(realBody)
+	}))
+	defer srv.Close()
+
+	hugoRoot := setupSRILayout(t, srv.URL+"/lib.js", wrongHash)
+
+	cfg := config.Default()
+	cfg.HugoRoot = hugoRoot
+
+	session, done := newTestServer(t, cfg)
+	defer done()
+
+	res, err := callTool(t, session, "check_sri_versions", map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool returned error: %s", resultText(res))
+	}
+
+	text := resultText(res)
+	var out sriOutput
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		t.Fatalf("response not JSON: %v — got %q", err, text)
+	}
+	if out.Data.SRIChecked < 1 {
+		t.Fatal("expected at least 1 SRI check")
+	}
+	r := out.Data.Findings[0]
+	if r.Error != "" {
+		t.Fatalf("unexpected error in result: %s", r.Error)
+	}
+	if r.Match {
+		t.Errorf("expected match=false, got true (template=%s current=%s)", r.TemplateHash, r.CurrentHash)
+	}
+}
+
+func TestSRICheckSummaryFields(t *testing.T) {
+	body := []byte("console.log('hello');")
+	correctHash := computeTestSHA384(body)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	hugoRoot := setupSRILayout(t, srv.URL+"/lib.js", correctHash)
+
+	cfg := config.Default()
+	cfg.HugoRoot = hugoRoot
+
+	session, done := newTestServer(t, cfg)
+	defer done()
+
+	res, err := callTool(t, session, "check_sri_versions", map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool returned error: %s", resultText(res))
+	}
+
+	text := resultText(res)
+	var out sriOutput
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		t.Fatalf("response not JSON: %v — got %q", err, text)
+	}
+
+	if out.Data.FilesScanned < 1 {
+		t.Errorf("expected files_scanned >= 1, got %d", out.Data.FilesScanned)
+	}
+	if out.Data.FilesWithSRIAttributes != 1 {
+		t.Errorf("expected files_with_sri_attributes == 1, got %d", out.Data.FilesWithSRIAttributes)
+	}
+	if out.Data.SRIChecked != 1 {
+		t.Errorf("expected sri_checked == 1, got %d", out.Data.SRIChecked)
+	}
+	if out.Data.SRIEntriesLoaded != 0 {
+		t.Errorf("expected sri_entries_loaded == 0 for layouts-only fixture, got %d", out.Data.SRIEntriesLoaded)
+	}
+	if out.Data.Status != "clean" {
+		t.Errorf("expected status clean, got %q", out.Data.Status)
+	}
+	if out.Data.Summary == "" {
+		t.Error("expected non-empty summary")
+	}
+	if !strings.Contains(out.Data.Summary, "passed") && !strings.Contains(out.Data.Summary, "mismatch") {
+		t.Errorf("summary should contain 'passed' or 'mismatch', got %q", out.Data.Summary)
+	}
+	if out.Data.Summary != "All 1 SRI integrity check(s) passed." {
+		t.Errorf("unexpected summary: %q", out.Data.Summary)
+	}
+}
+
+func TestSRICheckLoadsDataSRIYAML(t *testing.T) {
+	hugoRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hugoRoot, "data"), 0o755); err != nil {
+		t.Fatalf("mkdir data: %v", err)
+	}
+	body := []byte("console.log('from data file');")
+	hash := computeTestSHA384(body)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	if err := os.WriteFile(filepath.Join(hugoRoot, "data", "sri.yaml"), []byte(`
+"`+srv.URL+`/fontawesome.css": "`+hash+`"
+assets:
+  theme:
+    url: `+srv.URL+`/theme.js
+    integrity: `+hash+`
+`), 0o644); err != nil {
+		t.Fatalf("write sri.yaml: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(hugoRoot, "layouts"), 0o755); err != nil {
+		t.Fatalf("mkdir layouts: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hugoRoot, "layouts", "plugin.html"), []byte(`{{ with index site.Data.sri $src }}integrity="{{ . }}"{{ end }}`), 0o644); err != nil {
+		t.Fatalf("write plugin.html: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.HugoRoot = hugoRoot
+
+	session, done := newTestServer(t, cfg)
+	defer done()
+
+	res, err := callTool(t, session, "check_sri_versions", map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool returned error: %s", resultText(res))
+	}
+
+	var out sriOutput
+	if err := json.Unmarshal([]byte(resultText(res)), &out); err != nil {
+		t.Fatalf("response not JSON: %v — got %q", err, resultText(res))
+	}
+	if out.Data.SRIEntriesLoaded != 2 {
+		t.Fatalf("sri_entries_loaded = %d want 2", out.Data.SRIEntriesLoaded)
+	}
+	if out.Data.SRIChecked != 2 {
+		t.Fatalf("sri_checked = %d want 2 when layouts use site.Data.sri", out.Data.SRIChecked)
+	}
+	if out.Data.Status != "clean" {
+		t.Fatalf("status = %q want clean", out.Data.Status)
+	}
+	if out.Data.FilesWithSRIAttributes != 1 {
+		t.Fatalf("files_with_sri_attributes = %d want 1", out.Data.FilesWithSRIAttributes)
+	}
+	if out.Data.Summary == "" || !strings.Contains(out.Data.Summary, "passed") {
+		t.Fatalf("summary = %q want passed summary", out.Data.Summary)
+	}
+}
+
+func TestSRICheckMissingDataAndNoAttributesIsNotConfigured(t *testing.T) {
+	hugoRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(hugoRoot, "layouts"), 0o755); err != nil {
+		t.Fatalf("mkdir layouts: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hugoRoot, "layouts", "base.html"), []byte(`<html></html>`), 0o644); err != nil {
+		t.Fatalf("write base.html: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.HugoRoot = hugoRoot
+
+	session, done := newTestServer(t, cfg)
+	defer done()
+
+	res, err := callTool(t, session, "check_sri_versions", map[string]any{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("tool returned error: %s", resultText(res))
+	}
+
+	var out sriOutput
+	if err := json.Unmarshal([]byte(resultText(res)), &out); err != nil {
+		t.Fatalf("response not JSON: %v — got %q", err, resultText(res))
+	}
+	if out.Data.Status != "not_configured" {
+		t.Fatalf("status = %q want not_configured", out.Data.Status)
+	}
+}

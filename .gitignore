@@ -1,0 +1,34 @@
+# Hugo output and generated resources
+public/
+**/public/
+resources/
+**/resources/
+.hugo_build.lock
+
+# Node tooling
+node_modules/
+**/node_modules/
+.pnpm-store/
+themes/railway-cv/assets/css/daisyui.generated.css
+
+# Go build and coverage artifacts
+mcp-hugo-server-go/mcp-hugo-server-go
+mcp-hugo-server-go/coverage.out
+*.test
+
+# Local editor and OS files
+.DS_Store
+.idea/
+.vscode/settings.json
+
+# Local credentials and generated development files
+.venv/
+.build/
+.uv-cache/
+.gocache/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.next/
+.gradle/
+.env*

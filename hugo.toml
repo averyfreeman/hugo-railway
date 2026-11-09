@@ -1,0 +1,31 @@
+baseURL = '/'
+title = 'Avery Freeman — Software & Systems Portfolio'
+theme = 'railway-cv'
+enableRobotsTXT = true
+enableGitInfo = false
+disableKinds = ['taxonomy', 'term']
+
+[pagination]
+pagerSize = 9
+
+[markup]
+[markup.goldmark]
+[markup.goldmark.renderer]
+unsafe = true
+
+[taxonomies]
+tag = 'tags'
+category = 'categories'
+
+[outputs]
+home = ['HTML', 'RSS']
+section = ['HTML', 'RSS']
+
+[params]
+description = 'Avery Freeman builds practical software and systems across AI developer tooling, infrastructure, automation, and data.'
+themeName = 'Signal CV'
+author = 'Avery Freeman'
+
+[security]
+[security.exec]
+allow = ['^dart-sass$', '^go$', '^git$', '^node$', '^postcss$', '^tailwindcss$']

@@ -1,0 +1,8 @@
+baseURL = 'http://localhost:1313/'
+title = 'Signal CV — Research systems in public'
+theme = 'railway-cv'
+themesDir = '../../../'
+disableKinds = ['taxonomy', 'term']
+
+[markup.goldmark.renderer]
+unsafe = true

@@ -1,0 +1,5464 @@
+package read_test
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/config"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/contentmodel"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/hugosite"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/site"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/tools/read"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+func mustTestIndex(t *testing.T) *site.Index {
+	t.Helper()
+	root := filepath.Join("testdata", "public", "minimal")
+	cfg := config.Default()
+	cfg.SiteRoot = root
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	return idx
+}
+
+func mustTestSourceIndex(t *testing.T) *hugosite.SourceIndex {
+	t.Helper()
+	root := filepath.Join("..", "..", "..", "testdata", "fixtures", "content")
+	idx, err := hugosite.NewSourceIndex(root)
+	if err != nil {
+		t.Fatalf("NewSourceIndex() error = %v", err)
+	}
+	return idx
+}
+
+func newTestClient(t *testing.T, idx *site.Index) (*mcp.ClientSession, func()) {
+	t.Helper()
+	s := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.1"}, nil)
+	srcIdx := mustTestSourceIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = filepath.Join("..", "..", "..", "testdata", "fixtures", "content")
+	read.Register(s, idx, cfg, srcIdx)
+	read.RegisterWithSourceIndex(s, idx, srcIdx, cfg)
+
+	ctx := context.Background()
+	t1, t2 := mcp.NewInMemoryTransports()
+	if _, err := s.Connect(ctx, t1, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1"}, nil)
+	session, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	return session, func() { _ = session.Close() }
+}
+
+func newTestClientWithSourceIndex(t *testing.T, idx *site.Index, srcIdx *hugosite.SourceIndex) (*mcp.ClientSession, func()) {
+	t.Helper()
+	cfg := config.Default()
+	cfg.ContentRoot = filepath.Join("..", "..", "..", "testdata", "fixtures", "content")
+	return newTestClientWithCfg(t, idx, cfg, srcIdx)
+}
+
+func newTestClientWithCfg(t *testing.T, idx *site.Index, cfg config.Config, srcIdx *hugosite.SourceIndex) (*mcp.ClientSession, func()) {
+	t.Helper()
+	s := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.1"}, nil)
+	read.Register(s, idx, cfg, srcIdx)
+	read.RegisterWithSourceIndex(s, idx, srcIdx, cfg)
+
+	ctx := context.Background()
+	t1, t2 := mcp.NewInMemoryTransports()
+	if _, err := s.Connect(ctx, t1, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1"}, nil)
+	session, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	return session, func() { _ = session.Close() }
+}
+
+func callTool(t *testing.T, session *mcp.ClientSession, name string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool(%q) error = %v", name, err)
+	}
+	return res
+}
+
+// decodeEnvelope decodes the full response envelope
+// (success/data/errors/warnings/meta), unmodified. Use this when a test
+// needs an envelope-level field; use decodeContent for the tool's data
+// payload.
+func decodeEnvelope(t *testing.T, res *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	return m
+}
+
+// decodeContent returns the tool's data payload (envelope.data), unwrapped.
+// #433/#495 removed the top-level duplicate of data.X from every tool in
+// this package, so data is the sole location for tool-specific fields —
+// this must fatal, not silently fall back to the envelope root, or a
+// regression that empties data would go unnoticed.
+func decodeContent(t *testing.T, res *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	envelope := decodeEnvelope(t, res)
+	data, ok := envelope["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("structured content missing data object: %#v", envelope)
+	}
+	return data
+}
+
+func assertEnvelopeContentProvenance(t *testing.T, res *mcp.CallToolResult, want string) {
+	t.Helper()
+	envelope := decodeEnvelope(t, res)
+	meta, ok := envelope["meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("meta type = %T, want map[string]any", envelope["meta"])
+	}
+	if got := meta["content_provenance"]; got != want {
+		t.Fatalf("meta.content_provenance = %v, want %q", got, want)
+	}
+}
+
+func decodeErrorEnvelope(t *testing.T, res *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	if res.StructuredContent != nil {
+		return decodeEnvelope(t, res)
+	}
+	text := res.Content[0].(*mcp.TextContent).Text
+	var m map[string]any
+	if err := json.Unmarshal([]byte(text), &m); err != nil {
+		t.Fatalf("unmarshal error payload: %v", err)
+	}
+	return m
+}
+
+func TestGetFullPageMarkdown(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_markdown", map[string]any{"slug": "/posts/hello"})
+	if res.IsError {
+		t.Fatalf("get_page_markdown returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	pageVal, ok := m["page"]
+	if !ok {
+		t.Fatal("get_page_markdown: missing 'page' key")
+	}
+	page, ok := pageVal.(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_markdown: 'page' is %T, want map", pageVal)
+	}
+	markdownVal, ok := page["markdown"]
+	if !ok {
+		t.Fatal("get_page_markdown: missing 'markdown' key in page")
+	}
+	markdown, ok := markdownVal.(string)
+	if !ok || markdown == "" {
+		t.Fatalf("get_page_markdown: markdown is empty or not a string: %v", markdownVal)
+	}
+	if markdown != "This is the hello world post body." {
+		t.Fatalf("get_page_markdown markdown = %q, want source body", markdown)
+	}
+	if got := page["resolved_source_path"]; got != "content/posts/hello.md" {
+		t.Fatalf("get_page_markdown resolved_source_path = %v, want content/posts/hello.md", got)
+	}
+	assertReadPageState(t, page["state"], "present", "built", "available", "fresh")
+	assertEnvelopeContentProvenance(t, res, "site_source_untrusted")
+}
+
+func TestSourceBearingReadToolsCarryUntrustedContentProvenance(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	tests := []struct {
+		name string
+		args map[string]any
+	}{
+		{name: "get_page_markdown", args: map[string]any{"slug": "/posts/hello"}},
+		{name: "get_page_frontmatter", args: map[string]any{"slug": "/posts/hello"}},
+		{name: "get_page_for_edit", args: map[string]any{"slug": "/posts/hello"}},
+		{name: "build_agent_context", args: map[string]any{"slug": "/posts/hello"}},
+		{name: "export_agent_context", args: map[string]any{"limit": 1, "include_body": true}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res := callTool(t, session, tc.name, tc.args)
+			if res.IsError {
+				t.Fatalf("%s returned error: %v", tc.name, res.Content)
+			}
+			assertEnvelopeContentProvenance(t, res, "site_source_untrusted")
+		})
+	}
+}
+
+func TestGetFullPageMarkdownIncludeTermsFalseOmitsTerms(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_markdown", map[string]any{
+		"slug":          "/posts/hello",
+		"include_terms": false,
+	})
+	if res.IsError {
+		t.Fatalf("get_page_markdown returned error: %v", res.Content)
+	}
+	page, ok := decodeContent(t, res)["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_markdown page type = %T", decodeContent(t, res)["page"])
+	}
+	if _, present := page["tag_terms"]; present {
+		t.Fatal("get_page_markdown tag_terms present with include_terms=false, want omitted")
+	}
+	if _, present := page["category_terms"]; present {
+		t.Fatal("get_page_markdown category_terms present with include_terms=false, want omitted")
+	}
+	if _, present := page["tags"]; !present {
+		t.Fatal("get_page_markdown tags absent with include_terms=false, want present")
+	}
+	if _, present := page["categories"]; !present {
+		t.Fatal("get_page_markdown categories absent with include_terms=false, want present")
+	}
+}
+
+func TestGetFullPageMarkdownUnknown(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_markdown", map[string]any{"slug": "/posts/does-not-exist"})
+	if !res.IsError {
+		t.Fatal("get_page_markdown with unknown slug should return error")
+	}
+	raw, _ := json.Marshal(res.Content)
+	if len(raw) == 0 {
+		t.Fatal("expected error content")
+	}
+}
+
+func TestGetPageFrontmatter(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/posts/hello"})
+	if res.IsError {
+		t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	fmVal, ok := m["frontmatter"]
+	if !ok {
+		t.Fatal("get_page_frontmatter: missing 'frontmatter' key")
+	}
+	fm, ok := fmVal.(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_frontmatter: 'frontmatter' is %T, want map", fmVal)
+	}
+	rtVal, ok := fm["reading_time_minutes"]
+	if !ok {
+		t.Fatal("get_page_frontmatter: missing 'reading_time_minutes'")
+	}
+	rt, ok := rtVal.(float64)
+	if !ok || rt < 1 {
+		t.Fatalf("get_page_frontmatter: reading_time_minutes = %v, want >= 1", rtVal)
+	}
+	cats, ok := fm["categories"].([]any)
+	if !ok || len(cats) != 1 || cats[0] != "tutorials" {
+		t.Fatalf("get_page_frontmatter categories = %#v, want source frontmatter category", fm["categories"])
+	}
+	categoryTerms, ok := fm["category_terms"].([]any)
+	if !ok || len(categoryTerms) != 1 {
+		t.Fatalf("get_page_frontmatter category_terms = %#v, want one normalized term", fm["category_terms"])
+	}
+	term := categoryTerms[0].(map[string]any)
+	if term["source"] != "tutorials" || term["slug"] != "tutorials" || term["label"] != "Tutorials" {
+		t.Fatalf("category term = %#v, want source/slug/label for tutorials", term)
+	}
+	assertReadPageState(t, fm["state"], "present", "built", "available", "fresh")
+	assertEnvelopeContentProvenance(t, res, "site_source_untrusted")
+}
+
+func TestGetPageFrontmatterExposesStableMetadataContract(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/posts/hello"})
+	if res.IsError {
+		t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	fm, ok := m["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_frontmatter frontmatter type = %T", m["frontmatter"])
+	}
+	for _, key := range []string{"slug", "lang", "url", "title", "reading_time_minutes", "tag_terms", "category_terms", "resolved_lang", "resolved_source_path"} {
+		if _, ok := fm[key]; !ok {
+			t.Fatalf("get_page_frontmatter missing %q in frontmatter: %#v", key, fm)
+		}
+	}
+	if got := fm["resolved_lang"]; got != "" {
+		t.Fatalf("get_page_frontmatter resolved_lang = %v, want empty default lang for hello.md fixture", got)
+	}
+	if got := fm["resolved_source_path"]; got != "content/posts/hello.md" {
+		t.Fatalf("get_page_frontmatter resolved_source_path = %v, want content/posts/hello.md", got)
+	}
+}
+
+func TestGetPageFrontmatterIncludeTermsFalseOmitsTerms(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_frontmatter", map[string]any{
+		"slug":          "/posts/hello",
+		"include_terms": false,
+	})
+	if res.IsError {
+		t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+	}
+	fm, ok := decodeContent(t, res)["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_frontmatter frontmatter type = %T", decodeContent(t, res)["frontmatter"])
+	}
+	if _, present := fm["tag_terms"]; present {
+		t.Fatal("get_page_frontmatter tag_terms present with include_terms=false, want omitted")
+	}
+	if _, present := fm["category_terms"]; present {
+		t.Fatal("get_page_frontmatter category_terms present with include_terms=false, want omitted")
+	}
+	if _, present := fm["tags"]; !present {
+		t.Fatal("get_page_frontmatter tags absent with include_terms=false, want present")
+	}
+	if _, present := fm["categories"]; !present {
+		t.Fatal("get_page_frontmatter categories absent with include_terms=false, want present")
+	}
+}
+
+// TestGetPageFrontmatterLangMatchesResolvedLangBeforeBuild is a regression
+// test for #476: a page that exists only in the source index (e.g. right
+// after create_page, before the next Hugo build) must report a non-empty
+// `lang` that agrees with `resolved_lang`, rather than leaving `lang` empty
+// until the page is built and gains a site.Index entry.
+func TestGetPageFrontmatterLangMatchesResolvedLangBeforeBuild(t *testing.T) {
+	cfg := config.Default()
+	cfg.DefaultLanguage = "en"
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	contentRoot := t.TempDir()
+	full := filepath.Join(contentRoot, "posts", "unbuilt", "index.fr.md")
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	body := "---\ntitle: Pas Encore Construit\n---\nContenu non construit.\n"
+	if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	cfg.ContentRoot = contentRoot
+	session, done := newTestClientWithCfg(t, idx, cfg, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/posts/unbuilt"})
+	if res.IsError {
+		t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	fm, ok := m["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_frontmatter frontmatter type = %T", m["frontmatter"])
+	}
+	if got := fm["resolved_lang"]; got != "fr" {
+		t.Fatalf("get_page_frontmatter resolved_lang = %v, want fr", got)
+	}
+	if got := fm["lang"]; got != "fr" {
+		t.Fatalf("get_page_frontmatter lang = %v, want fr (must agree with resolved_lang before any build)", got)
+	}
+}
+
+func TestGetRelatedContent(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_related_content", map[string]any{"slug": "/posts/hello", "limit": 5})
+	if res.IsError {
+		t.Fatalf("get_related_content returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	relVal, ok := m["related_pages"]
+	if !ok {
+		t.Fatal("get_related_content: missing 'related_pages' key")
+	}
+	related, ok := relVal.([]any)
+	if !ok {
+		t.Fatalf("get_related_content: 'related_pages' is %T, want []any", relVal)
+	}
+	if len(related) == 0 {
+		t.Fatal("get_related_content: expected at least one related page (bonjour shares Hugo tag)")
+	}
+}
+
+// newImpactFixtureSession builds a two-page site for #434's impact facet:
+// /posts/hello/ carries a shared tag ("Hugo", also on /posts/guide/) and an
+// unshared tag ("UniqueOrphanTag", nowhere else) plus a shared category
+// ("Infrastructure") and a redirect alias, so a single get_related_content
+// call can assert orphan detection, non-orphan exclusion, sitemap/feed
+// presence, and the aliases passthrough all at once.
+func newImpactFixtureSession(t *testing.T) (*mcp.ClientSession, func()) {
+	t.Helper()
+	htmlDir := t.TempDir()
+	writeHTML := func(rel, html string) {
+		t.Helper()
+		full := filepath.Join(htmlDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(html), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeHTML(filepath.Join("posts", "hello", "index.html"), `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/posts/hello/">
+<meta property="og:title" content="Hello">
+<meta property="article:tag" content="Hugo">
+<meta property="article:tag" content="UniqueOrphanTag">
+<meta property="article:section" content="Infrastructure">
+</head><body><article>Hello public body</article></body></html>`)
+	writeHTML(filepath.Join("posts", "guide", "index.html"), `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/posts/guide/">
+<meta property="og:title" content="Guide">
+<meta property="article:tag" content="Hugo">
+<meta property="article:section" content="Infrastructure">
+</head><body><article>Guide public body</article></body></html>`)
+
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	contentRoot := t.TempDir()
+	writeSource := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(contentRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeSource("posts/hello/index.md", "---\ntitle: Hello\ntags: [Hugo, UniqueOrphanTag]\ncategories: [Infrastructure]\naliases: [/old-hello/]\n---\nHello body.\n")
+	writeSource("posts/guide/index.md", "---\ntitle: Guide\ntags: [Hugo]\ncategories: [Infrastructure]\n---\nGuide body.\n")
+
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	cfg.ContentRoot = contentRoot
+	return newTestClientWithCfg(t, idx, cfg, srcIdx)
+}
+
+// Both tests below read m["impact"] via decodeContent's data unwrap — #495
+// removed the top-level duplicate of data.impact, so this is data.impact,
+// not a top-level field.
+func TestGetRelatedContentImpactDetectsTaxonomyOrphans(t *testing.T) {
+	session, done := newImpactFixtureSession(t)
+	defer done()
+
+	res := callTool(t, session, "get_related_content", map[string]any{"slug": "/posts/hello/", "include": []any{"impact"}})
+	if res.IsError {
+		t.Fatalf("get_related_content returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	impact, ok := m["impact"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_related_content impact type = %T, want map[string]any", m["impact"])
+	}
+	orphans, ok := impact["taxonomy_orphans"].([]any)
+	if !ok || len(orphans) != 1 || orphans[0] != "UniqueOrphanTag" {
+		t.Fatalf("impact.taxonomy_orphans = %#v, want exactly [UniqueOrphanTag] (Hugo/Infrastructure are shared with /posts/guide/)", impact["taxonomy_orphans"])
+	}
+	if got, ok := impact["sitemap_present"].(bool); !ok || !got {
+		t.Fatalf("impact.sitemap_present = %v, want true", impact["sitemap_present"])
+	}
+	if got, ok := impact["feed_present"].(bool); !ok || !got {
+		t.Fatalf("impact.feed_present = %v, want true", impact["feed_present"])
+	}
+	aliases, ok := impact["aliases"].([]any)
+	if !ok || len(aliases) != 1 || aliases[0] != "/old-hello/" {
+		t.Fatalf("impact.aliases = %#v, want exactly [/old-hello/]", impact["aliases"])
+	}
+}
+
+func TestGetRelatedContentOmitsImpactByDefault(t *testing.T) {
+	session, done := newImpactFixtureSession(t)
+	defer done()
+
+	res := callTool(t, session, "get_related_content", map[string]any{"slug": "/posts/hello/"})
+	if res.IsError {
+		t.Fatalf("get_related_content returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	if _, ok := m["impact"]; ok {
+		t.Fatalf("get_related_content impact = %#v, want omitted when include is not requested (#434)", m["impact"])
+	}
+}
+
+func TestGetRelatedContentInvalidIncludeRejected(t *testing.T) {
+	session, done := newImpactFixtureSession(t)
+	defer done()
+
+	res := callTool(t, session, "get_related_content", map[string]any{"slug": "/posts/hello/", "include": []any{"bogus"}})
+	if !res.IsError {
+		t.Fatal("get_related_content with invalid include value should return an error")
+	}
+	raw, _ := json.Marshal(res.Content)
+	if !strings.Contains(string(raw), "invalid_params") {
+		t.Fatalf("expected invalid_params error, got: %s", raw)
+	}
+}
+
+func TestListContentTypesMergesArchetypeAndObservedSections(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// "posts": has both an archetype and observed source pages.
+	write("archetypes/posts.md", "---\ntitle: \"\"\nsubtitle: \"\"\ntags: []\n---\n")
+	write("content/posts/a/index.md", "---\ntitle: A\n---\nBody A.\n")
+	write("content/posts/b/index.md", "---\ntitle: B\n---\nBody B.\n")
+	// "notes": observed only, no archetype.
+	write("content/notes/c/index.md", "---\ntitle: C\n---\nBody C.\n")
+	// "landing": archetype only, no source pages yet.
+	write("archetypes/landing.md", "---\nhero_image: \"\"\n---\n")
+	// default.md is Hugo's fallback archetype, not a content type itself.
+	write("archetypes/default.md", "---\ntitle: \"\"\n---\n")
+
+	src, err := hugosite.NewSourceIndex(filepath.Join(root, "content"))
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	idx := mustTestIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = filepath.Join(root, "content")
+	cfg.HugoRoot = root
+	session, done := newTestClientWithCfg(t, idx, cfg, src)
+	defer done()
+
+	res := callTool(t, session, "list_content_types", map[string]any{})
+	if res.IsError {
+		t.Fatalf("list_content_types returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	types, ok := m["content_types"].([]any)
+	if !ok {
+		t.Fatalf("list_content_types: 'content_types' is %T, want []any", m["content_types"])
+	}
+	byName := make(map[string]map[string]any, len(types))
+	for _, raw := range types {
+		ct, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("list_content_types: entry = %T, want map", raw)
+		}
+		name, _ := ct["name"].(string)
+		byName[name] = ct
+	}
+	if _, ok := byName["default"]; ok {
+		t.Fatal("list_content_types: 'default' archetype must not appear as a content type")
+	}
+
+	posts, ok := byName["posts"]
+	if !ok {
+		t.Fatal("list_content_types: missing 'posts'")
+	}
+	if posts["source"] != "archetype+observed" {
+		t.Fatalf("list_content_types posts.source = %v, want archetype+observed", posts["source"])
+	}
+	if count, _ := posts["page_count"].(float64); count != 2 {
+		t.Fatalf("list_content_types posts.page_count = %v, want 2", posts["page_count"])
+	}
+	fields, _ := posts["expected_fields"].([]any)
+	if len(fields) == 0 {
+		t.Fatal("list_content_types posts.expected_fields is empty, want archetype's front matter keys")
+	}
+
+	notes, ok := byName["notes"]
+	if !ok {
+		t.Fatal("list_content_types: missing 'notes'")
+	}
+	if notes["source"] != "observed" {
+		t.Fatalf("list_content_types notes.source = %v, want observed", notes["source"])
+	}
+	if _, present := notes["archetype_path"]; present {
+		t.Fatal("list_content_types notes: unexpected archetype_path, notes has no archetype")
+	}
+	notesFields, _ := notes["expected_fields"].([]any)
+	if len(notesFields) != 1 || notesFields[0] != "title" {
+		t.Fatalf("list_content_types notes.expected_fields = %v, want [title] inferred from observed pages", notesFields)
+	}
+
+	landing, ok := byName["landing"]
+	if !ok {
+		t.Fatal("list_content_types: missing 'landing'")
+	}
+	if landing["source"] != "archetype" {
+		t.Fatalf("list_content_types landing.source = %v, want archetype", landing["source"])
+	}
+	if _, present := landing["page_count"]; present {
+		t.Fatal("list_content_types landing: unexpected page_count, landing has no source pages")
+	}
+}
+
+// TestListContentTypesExcludesSectionIndexFiles is a regression test for
+// #457: _index.en/_index.fr section-index files must not appear in
+// content_types (an agent shouldn't be able to infer they're a creatable
+// content type), but must still be discoverable, now under special_files.
+func TestListContentTypesExcludesSectionIndexFiles(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Root-level homepage section index, two languages.
+	write("content/_index.en.md", "---\ntitle: Home\n---\nHome EN.\n")
+	write("content/_index.fr.md", "---\ntitle: Accueil\n---\nHome FR.\n")
+	// "posts" section index, two languages, plus one real post.
+	write("content/posts/_index.en.md", "---\ntitle: Posts\n---\n")
+	write("content/posts/_index.fr.md", "---\ntitle: Articles\n---\n")
+	write("content/posts/a/index.en.md", "---\ntitle: A\n---\nBody A.\n")
+
+	src, err := hugosite.NewSourceIndex(filepath.Join(root, "content"))
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	idx := mustTestIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = filepath.Join(root, "content")
+	cfg.HugoRoot = root
+	session, done := newTestClientWithCfg(t, idx, cfg, src)
+	defer done()
+
+	res := callTool(t, session, "list_content_types", map[string]any{})
+	if res.IsError {
+		t.Fatalf("list_content_types returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	types, _ := m["content_types"].([]any)
+	for _, raw := range types {
+		ct, _ := raw.(map[string]any)
+		if name, _ := ct["name"].(string); strings.HasPrefix(name, "_index") {
+			t.Fatalf("list_content_types: %q must not appear as a content type", name)
+		}
+	}
+	posts, ok := func() (map[string]any, bool) {
+		for _, raw := range types {
+			ct, _ := raw.(map[string]any)
+			if ct["name"] == "posts" {
+				return ct, true
+			}
+		}
+		return nil, false
+	}()
+	if !ok {
+		t.Fatal("list_content_types: missing 'posts' (its section index must not have swallowed it)")
+	}
+	if count, _ := posts["page_count"].(float64); count != 1 {
+		t.Fatalf("list_content_types posts.page_count = %v, want 1 (section index excluded)", posts["page_count"])
+	}
+
+	special, ok := m["special_files"].([]any)
+	if !ok || len(special) != 2 {
+		t.Fatalf("list_content_types special_files = %v, want 2 entries (root + posts)", m["special_files"])
+	}
+	bySection := make(map[string]map[string]any, len(special))
+	for _, raw := range special {
+		sf, _ := raw.(map[string]any)
+		bySection[sf["section"].(string)] = sf
+	}
+	root0, ok := bySection[""]
+	if !ok {
+		t.Fatal("list_content_types special_files: missing root/home section index")
+	}
+	if root0["kind"] != "section_index" {
+		t.Fatalf("list_content_types special_files root.kind = %v, want section_index", root0["kind"])
+	}
+	rootLangs, _ := root0["languages"].([]any)
+	if len(rootLangs) != 2 {
+		t.Fatalf("list_content_types special_files root.languages = %v, want [en fr]", rootLangs)
+	}
+	postsIdx, ok := bySection["posts"]
+	if !ok {
+		t.Fatal("list_content_types special_files: missing posts section index")
+	}
+	postsLangs, _ := postsIdx["languages"].([]any)
+	if len(postsLangs) != 2 {
+		t.Fatalf("list_content_types special_files posts.languages = %v, want [en fr]", postsLangs)
+	}
+}
+
+func TestListPageAssetsListsSiblingFilesInBundle(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel string, data []byte) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("content/posts/article/index.md", []byte("---\ntitle: Article\n---\nBody.\n"))
+	write("content/posts/article/cover.webp", []byte("cover bytes"))
+	write("content/posts/article/notes.txt", []byte("notes"))
+
+	src, err := hugosite.NewSourceIndex(filepath.Join(root, "content"))
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	idx := mustTestIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = filepath.Join(root, "content")
+	session, done := newTestClientWithCfg(t, idx, cfg, src)
+	defer done()
+
+	res := callTool(t, session, "list_page_assets", map[string]any{"slug": "/posts/article"})
+	if res.IsError {
+		t.Fatalf("list_page_assets returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	assets, ok := m["assets"].([]any)
+	if !ok {
+		t.Fatalf("list_page_assets: 'assets' is %T, want []any", m["assets"])
+	}
+	names := make(map[string]bool, len(assets))
+	for _, raw := range assets {
+		a, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("list_page_assets: entry = %T, want map", raw)
+		}
+		names[a["name"].(string)] = true
+		if a["name"] == "cover.webp" {
+			if size, _ := a["size_bytes"].(float64); size != float64(len("cover bytes")) {
+				t.Fatalf("list_page_assets cover.webp size_bytes = %v, want %d", a["size_bytes"], len("cover bytes"))
+			}
+			// #574: sha256 must be present, matching this tool's own
+			// description that promises it for delete_page_asset's
+			// expected_sha256 concurrency guard.
+			sha, _ := a["sha256"].(string)
+			if !strings.HasPrefix(sha, "sha256:") {
+				t.Fatalf("list_page_assets cover.webp sha256 = %q, want sha256:<hex> prefix", sha)
+			}
+		}
+	}
+	if !names["cover.webp"] || !names["notes.txt"] {
+		t.Fatalf("list_page_assets missing expected siblings, got %v", names)
+	}
+	if names["index.md"] {
+		t.Fatal("list_page_assets must not list the page's own index.md")
+	}
+	if _, ok := m["hint"]; ok {
+		t.Fatalf("list_page_assets data.hint = %v, want absent when assets is non-empty", m["hint"])
+	}
+}
+
+// TestListPageAssetsEmptyBundleIncludesHint is a regression test for #569:
+// an empty data.assets list should carry a hint clarifying this tool only
+// covers page-bundle sibling files, not the site's global static assets a
+// page's rendered HTML may still reference.
+func TestListPageAssetsEmptyBundleIncludesHint(t *testing.T) {
+	root := t.TempDir()
+	full := filepath.Join(root, "content", "posts", "article", "index.md")
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("---\ntitle: Article\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := hugosite.NewSourceIndex(filepath.Join(root, "content"))
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	idx := mustTestIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = filepath.Join(root, "content")
+	session, done := newTestClientWithCfg(t, idx, cfg, src)
+	defer done()
+
+	res := callTool(t, session, "list_page_assets", map[string]any{"slug": "/posts/article"})
+	if res.IsError {
+		t.Fatalf("list_page_assets returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	assets, _ := m["assets"].([]any)
+	if len(assets) != 0 {
+		t.Fatalf("list_page_assets assets = %v, want empty (no sibling files written)", assets)
+	}
+	hint, _ := m["hint"].(string)
+	if hint == "" {
+		t.Fatal("list_page_assets data.hint must be present when assets is empty")
+	}
+}
+
+func TestListPageAssetsIncludesGeneratedHeroImagesSeparately(t *testing.T) {
+	root := t.TempDir()
+	contentPath := filepath.Join(root, "content", "posts", "article", "index.md")
+	if err := os.MkdirAll(filepath.Dir(contentPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(contentPath, []byte("---\ntitle: Article\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	heroPath := filepath.Join(root, "static", "images", "posts", "article-featured.jpg")
+	if err := os.MkdirAll(filepath.Dir(heroPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	heroBytes := []byte("hero-bytes")
+	if err := os.WriteFile(heroPath, heroBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	src, err := hugosite.NewSourceIndex(filepath.Join(root, "content"))
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	idx := mustTestIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = filepath.Join(root, "content")
+	cfg.HugoRoot = root
+	session, done := newTestClientWithCfg(t, idx, cfg, src)
+	defer done()
+
+	res := callTool(t, session, "list_page_assets", map[string]any{"slug": "/posts/article"})
+	if res.IsError {
+		t.Fatalf("list_page_assets returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	if _, ok := m["hint"]; ok {
+		t.Fatalf("list_page_assets data.hint = %v, want omitted when generated assets exist", m["hint"])
+	}
+	assets, _ := m["assets"].([]any)
+	if len(assets) != 0 {
+		t.Fatalf("list_page_assets assets = %v, want empty bundle assets for this fixture", assets)
+	}
+	generated, ok := m["generated_assets"].([]any)
+	if !ok || len(generated) != 1 {
+		t.Fatalf("list_page_assets generated_assets = %#v, want one generated asset", m["generated_assets"])
+	}
+	ga, ok := generated[0].(map[string]any)
+	if !ok {
+		t.Fatalf("generated_assets[0] type = %T, want map[string]any", generated[0])
+	}
+	if got := ga["name"]; got != "article-featured.jpg" {
+		t.Fatalf("generated_assets[0].name = %v, want article-featured.jpg", got)
+	}
+	if got := ga["kind"]; got != "global_static" {
+		t.Fatalf("generated_assets[0].kind = %v, want global_static", got)
+	}
+	if got := ga["path"]; got != "static/images/posts/article-featured.jpg" {
+		t.Fatalf("generated_assets[0].path = %v, want static/images/posts/article-featured.jpg", got)
+	}
+	if got := ga["sha256"]; got != contentmodel.SourceRevisionBytes(heroBytes) {
+		t.Fatalf("generated_assets[0].sha256 = %v, want hash of hero-bytes", got)
+	}
+}
+
+func TestListPageAssetsSingleFilePageReturnsNotABundle(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "content", "pages"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "content", "pages", "about.md"), []byte("---\ntitle: About\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src, err := hugosite.NewSourceIndex(filepath.Join(root, "content"))
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	idx := mustTestIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = filepath.Join(root, "content")
+	session, done := newTestClientWithCfg(t, idx, cfg, src)
+	defer done()
+
+	res := callTool(t, session, "list_page_assets", map[string]any{"slug": "/pages/about"})
+	if !res.IsError {
+		t.Fatal("list_page_assets: want error for single-file page, got success")
+	}
+	raw, _ := json.Marshal(res.Content)
+	if !strings.Contains(string(raw), "not_a_bundle") {
+		t.Fatalf("list_page_assets error = %s, want not_a_bundle", raw)
+	}
+}
+
+func TestListPageAssetsNotFound(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "list_page_assets", map[string]any{"slug": "/no/such/page"})
+	if !res.IsError {
+		t.Fatal("list_page_assets: want error for missing page, got success")
+	}
+	raw, _ := json.Marshal(res.Content)
+	if !strings.Contains(string(raw), "content_not_found") {
+		t.Fatalf("list_page_assets error = %s, want content_not_found", raw)
+	}
+}
+
+func TestGetPageForEditDefaultReturnsFullBundle(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/hello"})
+	if res.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	page, ok := m["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit: 'page' is %T, want map", m["page"])
+	}
+	for _, field := range []string{"slug", "revision", "frontmatter", "markdown", "state", "quality"} {
+		if _, present := page[field]; !present {
+			t.Errorf("get_page_for_edit default: missing field %q, got keys %v", field, mapKeysRead(page))
+		}
+	}
+	if rev, _ := page["revision"].(string); rev == "" {
+		t.Error("get_page_for_edit default: revision is empty, want a stable revision (#335 dependency)")
+	}
+	if got := page["source_key"]; got != "posts/hello" {
+		t.Fatalf("get_page_for_edit default: source_key = %v, want posts/hello", got)
+	}
+	quality, ok := page["quality"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit: 'quality' is %T, want map", page["quality"])
+	}
+	if _, present := quality["valid"]; !present {
+		t.Error("get_page_for_edit: quality.valid missing")
+	}
+	if _, present := quality["broken_links"]; !present {
+		t.Error("get_page_for_edit: quality.broken_links missing")
+	}
+	assertEnvelopeContentProvenance(t, res, "site_source_untrusted")
+}
+
+func TestGetPageFrontmatterIncludesSourceKey(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/posts/hello"})
+	if res.IsError {
+		t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	fm, ok := m["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_frontmatter: 'frontmatter' is %T, want map", m["frontmatter"])
+	}
+	if got := fm["slug"]; got != "/posts/hello/" {
+		t.Fatalf("get_page_frontmatter slug = %v, want canonical public slug /posts/hello/", got)
+	}
+	if got := fm["source_key"]; got != "posts/hello" {
+		t.Fatalf("get_page_frontmatter source_key = %v, want posts/hello", got)
+	}
+}
+
+// featuredImageFixtureSourceIndex builds an isolated hugosite.SourceIndex
+// over a fresh t.TempDir() containing a single page with featuredImage/
+// featuredImagePreview/description/draft set — deliberately not added to
+// the shared testdata/fixtures/content tree, which several unrelated
+// packages (internal/hugosite, internal/contracttests golden snapshots)
+// assert exact page counts/hashes against.
+func featuredImageFixtureSourceIndex(t *testing.T) (*hugosite.SourceIndex, string) {
+	t.Helper()
+	contentRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	page := "---\n" +
+		"title: Featured Fixture\n" +
+		"date: 2024-01-16T10:00:00Z\n" +
+		"draft: false\n" +
+		"description: The featured-image fixture post.\n" +
+		"featuredImage: /images/posts/featured-fixture-featured.jpg\n" +
+		"featuredImagePreview: /images/posts/featured-fixture-preview.jpg\n" +
+		"tags:\n  - go\n" +
+		"categories:\n  - tutorials\n" +
+		"---\n\nBody.\n"
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "featured-fixture.md"), []byte(page), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex() error = %v", err)
+	}
+	return srcIdx, contentRoot
+}
+
+// TestGetPageFrontmatterExposesFeaturedImageAndDescription is a regression
+// test for #817: get_page_frontmatter previously had no way to surface
+// featuredImage/featuredImagePreview/description/draft even though they were
+// present in source frontmatter and already writable via update_page's
+// featured_image/description/draft params — the only way to discover them
+// was an indirect tool like diff_page or list_page_assets. Field names are
+// snake_case to match update_page's write parameters directly (read/write
+// round-tripping is the whole point).
+func TestGetPageFrontmatterExposesFeaturedImageAndDescription(t *testing.T) {
+	idx := mustTestIndex(t)
+	srcIdx, contentRoot := featuredImageFixtureSourceIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = contentRoot
+	session, done := newTestClientWithCfg(t, idx, cfg, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/posts/featured-fixture"})
+	if res.IsError {
+		t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	fm, ok := m["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_frontmatter: 'frontmatter' is %T, want map", m["frontmatter"])
+	}
+	if got, want := fm["featured_image"], "/images/posts/featured-fixture-featured.jpg"; got != want {
+		t.Fatalf("get_page_frontmatter featured_image = %v, want %q", got, want)
+	}
+	if got, want := fm["featured_image_preview"], "/images/posts/featured-fixture-preview.jpg"; got != want {
+		t.Fatalf("get_page_frontmatter featured_image_preview = %v, want %q", got, want)
+	}
+	if got, want := fm["description"], "The featured-image fixture post."; got != want {
+		t.Fatalf("get_page_frontmatter description = %v, want %q", got, want)
+	}
+	if got, ok := fm["draft"].(bool); !ok || got != false {
+		t.Fatalf("get_page_frontmatter draft = %v (present=%v), want false", fm["draft"], ok)
+	}
+}
+
+// TestGetPageForEditExposesFeaturedImage proves the same fields reach
+// get_page_for_edit's nested frontmatter object — the exact tool+field an
+// external live audit reported as missing (#817).
+func TestGetPageForEditExposesFeaturedImage(t *testing.T) {
+	idx := mustTestIndex(t)
+	srcIdx, contentRoot := featuredImageFixtureSourceIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = contentRoot
+	session, done := newTestClientWithCfg(t, idx, cfg, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/featured-fixture"})
+	if res.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	page, ok := m["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit: 'page' is %T, want map", m["page"])
+	}
+	fm, ok := page["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit: 'frontmatter' is %T, want map", page["frontmatter"])
+	}
+	if got, want := fm["featured_image"], "/images/posts/featured-fixture-featured.jpg"; got != want {
+		t.Fatalf("get_page_for_edit frontmatter.featured_image = %v, want %q", got, want)
+	}
+}
+
+func TestGetPageForEditIncludeShapesResponse(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/hello", "include": []string{"markdown"}})
+	if res.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	page, ok := m["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit: 'page' is %T, want map", m["page"])
+	}
+	if _, present := page["markdown"]; !present {
+		t.Error("get_page_for_edit include=[markdown]: missing markdown")
+	}
+	for _, field := range []string{"frontmatter", "state", "quality"} {
+		if _, present := page[field]; present {
+			t.Errorf("get_page_for_edit include=[markdown]: unexpected field %q present", field)
+		}
+	}
+}
+
+func TestGetPageForEditCompactOmitsNestedTermPayloads(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_for_edit", map[string]any{
+		"slug":          "/posts/hello",
+		"response_mode": "compact",
+	})
+	if res.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", res.Content)
+	}
+	page, ok := decodeContent(t, res)["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit page type = %T", decodeContent(t, res)["page"])
+	}
+	fm, ok := page["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit frontmatter type = %T", page["frontmatter"])
+	}
+	if _, present := fm["tag_terms"]; present {
+		t.Fatal("get_page_for_edit compact frontmatter.tag_terms present, want omitted")
+	}
+	if _, present := fm["category_terms"]; present {
+		t.Fatal("get_page_for_edit compact frontmatter.category_terms present, want omitted")
+	}
+}
+
+func TestBuildAgentContextCompactOmitsNestedTermPayloads(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "build_agent_context", map[string]any{
+		"slug":          "/posts/hello",
+		"response_mode": "compact",
+	})
+	if res.IsError {
+		t.Fatalf("build_agent_context returned error: %v", res.Content)
+	}
+	ctxData, ok := decodeContent(t, res)["context"].(map[string]any)
+	if !ok {
+		t.Fatalf("build_agent_context context type = %T", decodeContent(t, res)["context"])
+	}
+	fm, ok := ctxData["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("build_agent_context frontmatter type = %T", ctxData["frontmatter"])
+	}
+	if _, present := fm["tag_terms"]; present {
+		t.Fatal("build_agent_context compact frontmatter.tag_terms present, want omitted")
+	}
+	if _, present := fm["category_terms"]; present {
+		t.Fatal("build_agent_context compact frontmatter.category_terms present, want omitted")
+	}
+}
+
+func TestExportAgentContextIncludeTermsFalseOmitsNestedTermPayloads(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "export_agent_context", map[string]any{
+		"limit":         2,
+		"include_body":  false,
+		"include_terms": false,
+	})
+	if res.IsError {
+		t.Fatalf("export_agent_context returned error: %v", res.Content)
+	}
+	pages, ok := decodeContent(t, res)["pages"].([]any)
+	if !ok || len(pages) == 0 {
+		t.Fatalf("export_agent_context pages = %#v, want non-empty array", decodeContent(t, res)["pages"])
+	}
+	first, ok := pages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("export_agent_context first page type = %T", pages[0])
+	}
+	fm, ok := first["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("export_agent_context frontmatter type = %T", first["frontmatter"])
+	}
+	if _, present := fm["tag_terms"]; present {
+		t.Fatal("export_agent_context frontmatter.tag_terms present with include_terms=false, want omitted")
+	}
+	if _, present := fm["category_terms"]; present {
+		t.Fatal("export_agent_context frontmatter.category_terms present with include_terms=false, want omitted")
+	}
+}
+
+func TestGetPageForEditMaxBodyCharsTruncatesAndWarns(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/hello", "max_body_chars": 10})
+	if res.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", res.Content)
+	}
+	envelope := decodeEnvelope(t, res)
+	m := decodeContent(t, res)
+	page, ok := m["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit: 'page' is %T, want map", m["page"])
+	}
+	md, _ := page["markdown"].(string)
+	if len(md) != 10 {
+		t.Fatalf("get_page_for_edit max_body_chars=10: markdown length = %d, want 10", len(md))
+	}
+	warnings, _ := envelope["warnings"].([]any)
+	if len(warnings) == 0 {
+		t.Fatal("get_page_for_edit max_body_chars=10: expected a truncation warning")
+	}
+}
+
+func TestGetPageForEditRejectsNonPositiveMaxBodyChars(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	for _, v := range []int{0, -1} {
+		res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/hello", "max_body_chars": v})
+		if !res.IsError {
+			t.Fatalf("get_page_for_edit max_body_chars=%d: expected error", v)
+		}
+		raw, _ := json.Marshal(res.Content)
+		if !strings.Contains(string(raw), "max_body_chars must be greater than 0") {
+			t.Fatalf("get_page_for_edit max_body_chars=%d error = %s", v, raw)
+		}
+	}
+}
+
+func TestGetPageForEditInvalidIncludeRejected(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/hello", "include": []string{"bogus"}})
+	if !res.IsError {
+		t.Fatal("get_page_for_edit include=[bogus]: expected error")
+	}
+}
+
+// TestGetPageForEditBacklinksIncludeMatchesStandaloneGetBacklinks is a
+// regression test for #465: include=["backlinks"] must return the exact
+// same data a standalone get_backlinks call would for the same slug, and
+// must NOT be present when omitted (backlinks is opt-in only, not part of
+// the default four-section bundle).
+func TestGetPageForEditBacklinksIncludeMatchesStandaloneGetBacklinks(t *testing.T) {
+	siteRoot := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(siteRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/target/index.html", `<!doctype html><html><head>
+<title>Target</title>
+<link rel="canonical" href="https://example.test/posts/target/">
+</head><body><article>Target body.</article></body></html>`)
+	write("posts/linker/index.html", `<!doctype html><html><head>
+<title>Linker</title>
+<link rel="canonical" href="https://example.test/posts/linker/">
+</head><body><article>See <a href="/posts/target/">target</a>.</article></body></html>`)
+
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	standalone := callTool(t, session, "get_backlinks", map[string]any{"slug": "/posts/target/"})
+	if standalone.IsError {
+		t.Fatalf("get_backlinks returned error: %v", standalone.Content)
+	}
+	standaloneData := decodeContent(t, standalone)
+	standaloneBacklinks, ok := standaloneData["backlinks"].([]any)
+	if !ok || len(standaloneBacklinks) == 0 {
+		t.Fatalf("get_backlinks backlinks = %#v, want at least one entry from posts/linker", standaloneData["backlinks"])
+	}
+
+	withBacklinks := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/target/", "include": []string{"backlinks"}})
+	if withBacklinks.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", withBacklinks.Content)
+	}
+	withBacklinksData := decodeContent(t, withBacklinks)
+	page, ok := withBacklinksData["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit: 'page' is %T, want map", withBacklinksData["page"])
+	}
+	editBacklinks, ok := page["backlinks"].([]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit include=[backlinks]: 'backlinks' is %T, want array", page["backlinks"])
+	}
+	standaloneJSON, _ := json.Marshal(standaloneBacklinks)
+	editJSON, _ := json.Marshal(editBacklinks)
+	if string(standaloneJSON) != string(editJSON) {
+		t.Fatalf("get_page_for_edit backlinks = %s, want identical to get_backlinks = %s", editJSON, standaloneJSON)
+	}
+	for _, field := range []string{"frontmatter", "markdown", "state", "quality"} {
+		if _, present := page[field]; present {
+			t.Errorf("get_page_for_edit include=[backlinks]: unexpected field %q present (backlinks is additive to explicit include, not exclusive)", field)
+		}
+	}
+
+	// Default (omitted include) must NOT carry backlinks.
+	defaultRes := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/target/"})
+	if defaultRes.IsError {
+		t.Fatalf("get_page_for_edit default returned error: %v", defaultRes.Content)
+	}
+	defaultData := decodeContent(t, defaultRes)
+	defaultPage, ok := defaultData["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit default: 'page' is %T, want map", defaultData["page"])
+	}
+	if _, present := defaultPage["backlinks"]; present {
+		t.Fatalf("get_page_for_edit default: unexpected 'backlinks' present, want omitted since it's opt-in only")
+	}
+
+	// Requested-but-empty must stay present as `[]`, distinct from
+	// not-requested (absent) — this is the whole reason Backlinks is a
+	// pointer field rather than a plain slice.
+	noInboundRes := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/linker/", "include": []string{"backlinks"}})
+	if noInboundRes.IsError {
+		t.Fatalf("get_page_for_edit include=[backlinks] (no inbound links) returned error: %v", noInboundRes.Content)
+	}
+	noInboundPage, ok := decodeContent(t, noInboundRes)["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit include=[backlinks] (no inbound links): 'page' is not a map")
+	}
+	noInboundBacklinks, present := noInboundPage["backlinks"]
+	if !present {
+		t.Fatal("get_page_for_edit include=[backlinks] (no inbound links): 'backlinks' absent, want present as []")
+	}
+	arr, ok := noInboundBacklinks.([]any)
+	if !ok || len(arr) != 0 {
+		t.Fatalf("get_page_for_edit include=[backlinks] (no inbound links): backlinks = %#v, want empty array", noInboundBacklinks)
+	}
+}
+
+func newPremutationBundleSession(t *testing.T) (*mcp.ClientSession, func()) {
+	t.Helper()
+	siteRoot := t.TempDir()
+	writeRendered := func(rel, html string) {
+		t.Helper()
+		full := filepath.Join(siteRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(html), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeRendered("posts/hello/index.html", `<!DOCTYPE html>
+<html lang="en">
+<head>
+<title>Hello World</title>
+<meta name="description" content="A short, valid description of this page.">
+<link rel="canonical" href="https://example.test/posts/hello/">
+</head>
+<body>
+<p>Hello. <a href="/posts/missing/">a broken link</a></p>
+</body>
+</html>`)
+	writeRendered("posts/guide/index.html", `<!DOCTYPE html><html lang="en"><head>
+<title>Guide</title>
+<link rel="canonical" href="https://example.test/posts/guide/">
+</head><body><article>Guide public body</article></body></html>`)
+	writeRendered("posts/linker/index.html", `<!DOCTYPE html><html lang="en"><head>
+<title>Linker</title>
+<link rel="canonical" href="https://example.test/posts/linker/">
+</head><body><article>See <a href="/posts/hello/">hello</a>.</article></body></html>`)
+
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	writeSource := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(contentRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeSource("posts/hello/index.md", "---\ndate: 2026-07-03\ntags: [Hugo, UniqueOrphanTag]\ncategories: [Infrastructure]\naliases: [/old-hello/]\n---\nHello world.\n")
+	writeSource("posts/guide/index.md", "---\ntitle: Guide\ntags: [Hugo]\ncategories: [Infrastructure]\n---\nGuide body.\n")
+	writeSource("posts/linker/index.md", "---\ntitle: Linker\n---\nLinker body.\n")
+
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.test")
+	runGit(t, root, "config", "user.name", "Test User")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "initial")
+	writeSource("posts/hello/index.md", "---\ndate: 2026-07-03\ntags: [Hugo, UniqueOrphanTag]\ncategories: [Infrastructure]\naliases: [/old-hello/]\n---\nHello brave new world.\n")
+
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	cfg.ContentRoot = contentRoot
+	return newTestClientWithCfg(t, idx, cfg, srcIdx)
+}
+
+func TestGetPageForEditImpactIncludeMatchesStandaloneGetRelatedContent(t *testing.T) {
+	session, done := newPremutationBundleSession(t)
+	defer done()
+
+	standalone := callTool(t, session, "get_related_content", map[string]any{"slug": "/posts/hello/", "include": []any{"impact"}})
+	if standalone.IsError {
+		t.Fatalf("get_related_content returned error: %v", standalone.Content)
+	}
+	standaloneImpact, ok := decodeContent(t, standalone)["impact"].(map[string]any)
+	if !ok {
+		t.Fatalf("standalone impact is %T, want map", decodeContent(t, standalone)["impact"])
+	}
+
+	bundled := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/hello/", "include": []string{"impact"}})
+	if bundled.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", bundled.Content)
+	}
+	page, ok := decodeContent(t, bundled)["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit page is %T, want map", decodeContent(t, bundled)["page"])
+	}
+	bundledImpact, ok := page["impact"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit impact is %T, want map", page["impact"])
+	}
+	standaloneJSON, _ := json.Marshal(standaloneImpact)
+	bundledJSON, _ := json.Marshal(bundledImpact)
+	if string(bundledJSON) != string(standaloneJSON) {
+		t.Fatalf("get_page_for_edit impact = %s, want identical to get_related_content impact = %s", bundledJSON, standaloneJSON)
+	}
+	for _, field := range []string{"frontmatter", "markdown", "state", "quality", "backlinks", "preview"} {
+		if _, present := page[field]; present {
+			t.Errorf("get_page_for_edit include=[impact]: unexpected field %q present", field)
+		}
+	}
+}
+
+func TestGetPageForEditPreviewIncludeMatchesStandaloneInspectRendered(t *testing.T) {
+	session, done := newPremutationBundleSession(t)
+	defer done()
+
+	standalone := callTool(t, session, "inspect_rendered", map[string]any{"slug": "/posts/hello/", "include_preview": true})
+	if standalone.IsError {
+		t.Fatalf("inspect_rendered returned error: %v", standalone.Content)
+	}
+	standalonePreview, ok := decodeContent(t, standalone)["preview"].(map[string]any)
+	if !ok {
+		t.Fatalf("inspect_rendered preview is %T, want map", decodeContent(t, standalone)["preview"])
+	}
+
+	bundled := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/hello/", "include": []string{"preview"}})
+	if bundled.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", bundled.Content)
+	}
+	page, ok := decodeContent(t, bundled)["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit page is %T, want map", decodeContent(t, bundled)["page"])
+	}
+	bundledPreview, ok := page["preview"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit preview is %T, want map", page["preview"])
+	}
+	standaloneJSON, _ := json.Marshal(standalonePreview)
+	bundledJSON, _ := json.Marshal(bundledPreview)
+	if string(bundledJSON) != string(standaloneJSON) {
+		t.Fatalf("get_page_for_edit preview = %s, want identical to inspect_rendered preview = %s", bundledJSON, standaloneJSON)
+	}
+	for _, field := range []string{"frontmatter", "markdown", "state", "quality", "backlinks", "impact"} {
+		if _, present := page[field]; present {
+			t.Errorf("get_page_for_edit include=[preview]: unexpected field %q present", field)
+		}
+	}
+}
+
+func TestGetPageForEditPreviewIncludeWarnsWhenRenderedPageIsUnavailable(t *testing.T) {
+	siteRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	contentRoot := t.TempDir()
+	full := filepath.Join(contentRoot, "posts", "source-only", "index.md")
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", full, err)
+	}
+	if err := os.WriteFile(full, []byte(`---
+title: Source only
+date: 2026-07-19
+---
+Body.
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", full, err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex() error = %v", err)
+	}
+	cfg.ContentRoot = contentRoot
+	session, done := newTestClientWithCfg(t, idx, cfg, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/source-only/", "include": []string{"preview"}})
+	if res.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", res.Content)
+	}
+	envelope := decodeEnvelope(t, res)
+	page, ok := decodeContent(t, res)["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit page is %T, want map", decodeContent(t, res)["page"])
+	}
+	if _, present := page["preview"]; present {
+		t.Fatalf("get_page_for_edit include=[preview]: unexpected preview present for source-only page: %#v", page["preview"])
+	}
+	warnings, ok := envelope["warnings"].([]any)
+	if !ok || len(warnings) == 0 {
+		t.Fatal("get_page_for_edit include=[preview]: expected warning when rendered page is unavailable")
+	}
+}
+
+// TestGetPageForEditReadinessIncludeMatchesStandaloneCheckAIReadiness is the
+// regression test for #621: get_page_for_edit's opt-in `readiness` facet
+// must return byte-identical output to a standalone check_ai_readiness
+// call for the same slug (minus the fields already present at the page
+// level: slug/resolved_lang/resolved_source_path/revision/state), so the
+// bundled call is a real composition, not a re-derived approximation.
+func TestGetPageForEditReadinessIncludeMatchesStandaloneCheckAIReadiness(t *testing.T) {
+	session, done := newPremutationBundleSession(t)
+	defer done()
+
+	standalone := callTool(t, session, "check_ai_readiness", map[string]any{"slug": "/posts/hello/"})
+	if standalone.IsError {
+		t.Fatalf("check_ai_readiness returned error: %v", standalone.Content)
+	}
+	standaloneData := decodeContent(t, standalone)
+
+	bundled := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/hello/", "include": []string{"readiness"}})
+	if bundled.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", bundled.Content)
+	}
+	page, ok := decodeContent(t, bundled)["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit page is %T, want map", decodeContent(t, bundled)["page"])
+	}
+	readiness, ok := page["readiness"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit readiness is %T, want map", page["readiness"])
+	}
+
+	for _, field := range []string{"status", "checks", "warnings", "suggestions"} {
+		standaloneJSON, _ := json.Marshal(standaloneData[field])
+		bundledJSON, _ := json.Marshal(readiness[field])
+		if string(bundledJSON) != string(standaloneJSON) {
+			t.Errorf("get_page_for_edit readiness.%s = %s, want identical to check_ai_readiness %s = %s", field, bundledJSON, field, standaloneJSON)
+		}
+	}
+	for _, field := range []string{"frontmatter", "markdown", "state", "quality", "backlinks", "impact", "preview"} {
+		if _, present := page[field]; present {
+			t.Errorf("get_page_for_edit include=[readiness]: unexpected field %q present", field)
+		}
+	}
+}
+
+// TestGetPageForEditReadinessIncludeWarnsWhenSourceIsUnavailable mirrors
+// TestGetPageForEditPreviewIncludeWarnsWhenRenderedPageIsUnavailable: a page
+// with no matching source (public-only legacy content) must omit
+// `readiness` with a warning instead of failing the whole edit-prep bundle.
+func TestGetPageForEditReadinessIncludeWarnsWhenSourceIsUnavailable(t *testing.T) {
+	siteRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	idx.UpsertPage(site.Page{
+		Slug:  "/posts/public-only/",
+		Title: "Public Only",
+		URL:   "https://example.test/posts/public-only/",
+		Lang:  "en",
+	})
+
+	contentRoot := t.TempDir()
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex() error = %v", err)
+	}
+	cfg.ContentRoot = contentRoot
+	session, done := newTestClientWithCfg(t, idx, cfg, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/public-only/", "include": []string{"readiness"}})
+	if res.IsError {
+		t.Fatalf("get_page_for_edit returned error: %v", res.Content)
+	}
+	envelope := decodeEnvelope(t, res)
+	page, ok := decodeContent(t, res)["page"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_for_edit page is %T, want map", decodeContent(t, res)["page"])
+	}
+	if _, present := page["readiness"]; present {
+		t.Fatalf("get_page_for_edit include=[readiness]: unexpected readiness present for source-less page: %#v", page["readiness"])
+	}
+	warnings, ok := envelope["warnings"].([]any)
+	if !ok || len(warnings) == 0 {
+		t.Fatal("get_page_for_edit include=[readiness]: expected warning when source is unavailable")
+	}
+}
+
+func TestGetPageForEditNotFound(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/does/not/exist/"})
+	if !res.IsError {
+		t.Fatal("get_page_for_edit(missing slug): expected error")
+	}
+}
+
+func mapKeysRead(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func TestBuildAgentContext(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "build_agent_context", map[string]any{"slug": "/posts/hello"})
+	if res.IsError {
+		t.Fatalf("build_agent_context returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	ctxVal, ok := m["context"]
+	if !ok {
+		t.Fatal("build_agent_context: missing 'context' key")
+	}
+	ctx, ok := ctxVal.(map[string]any)
+	if !ok {
+		t.Fatalf("build_agent_context: 'context' is %T, want map", ctxVal)
+	}
+	if _, ok := ctx["frontmatter"]; !ok {
+		t.Fatal("build_agent_context: missing 'frontmatter' in context")
+	}
+	fm := ctx["frontmatter"].(map[string]any)
+	if got := fm["resolved_source_path"]; got != "content/posts/hello.md" {
+		t.Fatalf("build_agent_context resolved_source_path = %v, want content/posts/hello.md", got)
+	}
+	assertReadPageState(t, fm["state"], "present", "built", "available", "fresh")
+	assertReadPageState(t, ctx["state"], "present", "built", "available", "fresh")
+	markdown, ok := ctx["markdown"].(string)
+	if !ok {
+		t.Fatal("build_agent_context: missing 'markdown' in context")
+	}
+	if markdown != "This is the hello world post body." {
+		t.Fatalf("build_agent_context markdown = %q, want source body", markdown)
+	}
+	if _, ok := ctx["related_pages"]; !ok {
+		t.Fatal("build_agent_context: missing 'related_pages' in context")
+	}
+	assertEnvelopeContentProvenance(t, res, "site_source_untrusted")
+}
+
+func TestBuildAgentContextResponseModeCompact(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "build_agent_context", map[string]any{"slug": "/posts/hello", "response_mode": "compact"})
+	if res.IsError {
+		t.Fatalf("build_agent_context returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	ctx, ok := m["context"].(map[string]any)
+	if !ok {
+		t.Fatalf("build_agent_context: 'context' is %T, want map", m["context"])
+	}
+	for _, field := range []string{"frontmatter", "markdown", "state"} {
+		if _, present := ctx[field]; !present {
+			t.Errorf("build_agent_context compact: missing field %q", field)
+		}
+	}
+	for _, field := range []string{"translations", "related_pages"} {
+		if _, present := ctx[field]; present {
+			t.Errorf("build_agent_context compact: unexpected field %q present, want reduced shape", field)
+		}
+	}
+
+	standard := callTool(t, session, "build_agent_context", map[string]any{"slug": "/posts/hello"})
+	standardBytes, err := json.Marshal(decodeContent(t, standard)["context"])
+	if err != nil {
+		t.Fatalf("marshal standard context: %v", err)
+	}
+	compactBytes, err := json.Marshal(ctx)
+	if err != nil {
+		t.Fatalf("marshal compact context: %v", err)
+	}
+	if len(compactBytes) >= len(standardBytes) {
+		t.Errorf("build_agent_context compact payload (%d bytes) not smaller than standard (%d bytes)", len(compactBytes), len(standardBytes))
+	}
+}
+
+func TestBuildAgentContextMaxBodyCharsTruncatesAndWarns(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "build_agent_context", map[string]any{"slug": "/posts/hello", "max_body_chars": 10})
+	if res.IsError {
+		t.Fatalf("build_agent_context returned error: %v", res.Content)
+	}
+	envelope := decodeEnvelope(t, res)
+	m := decodeContent(t, res)
+	ctx, ok := m["context"].(map[string]any)
+	if !ok {
+		t.Fatalf("build_agent_context: 'context' is %T, want map", m["context"])
+	}
+	md, _ := ctx["markdown"].(string)
+	if len(md) != 10 {
+		t.Fatalf("build_agent_context max_body_chars=10: markdown length = %d, want 10", len(md))
+	}
+	warnings, _ := envelope["warnings"].([]any)
+	if len(warnings) == 0 {
+		t.Fatal("build_agent_context max_body_chars=10: expected a truncation warning")
+	}
+}
+
+func TestBuildAgentContextRejectsNonPositiveMaxBodyChars(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	for _, v := range []int{0, -1} {
+		res := callTool(t, session, "build_agent_context", map[string]any{"slug": "/posts/hello", "max_body_chars": v})
+		if !res.IsError {
+			t.Fatalf("build_agent_context max_body_chars=%d: expected error", v)
+		}
+		raw, _ := json.Marshal(res.Content)
+		if !strings.Contains(string(raw), "max_body_chars must be greater than 0") {
+			t.Fatalf("build_agent_context max_body_chars=%d error = %s", v, raw)
+		}
+	}
+}
+
+func TestBuildAgentContextResponseModeReservedRejected(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "build_agent_context", map[string]any{"slug": "/posts/hello", "response_mode": "full"})
+	if !res.IsError {
+		t.Fatal("build_agent_context response_mode=full: expected error, reserved mode is not yet implemented")
+	}
+}
+
+func TestExportAgentContext(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res0 := callTool(t, session, "export_agent_context", map[string]any{"limit": 1, "offset": 0})
+	if res0.IsError {
+		t.Fatalf("export_agent_context offset=0 returned error: %v", res0.Content)
+	}
+	exp0 := decodeContent(t, res0)
+	pages0, _ := exp0["pages"].([]any)
+	if len(pages0) != 1 {
+		t.Fatalf("export_agent_context limit=1 offset=0: expected 1 page, got %d", len(pages0))
+	}
+	assertEnvelopeContentProvenance(t, res0, "site_source_untrusted")
+
+	res1 := callTool(t, session, "export_agent_context", map[string]any{"limit": 1, "offset": 1})
+	if res1.IsError {
+		t.Fatalf("export_agent_context offset=1 returned error: %v", res1.Content)
+	}
+	exp1 := decodeContent(t, res1)
+	pages1, _ := exp1["pages"].([]any)
+	if len(pages1) == 0 {
+		t.Fatal("export_agent_context offset=1: expected at least one page (fixture has 2+ pages)")
+	}
+
+	slug0 := pages0[0].(map[string]any)["frontmatter"].(map[string]any)["slug"]
+	slug1 := pages1[0].(map[string]any)["frontmatter"].(map[string]any)["slug"]
+	if slug0 == slug1 {
+		t.Fatalf("export_agent_context offset should skip pages: got same slug %v at offset 0 and 1", slug0)
+	}
+	assertReadPageState(t, pages0[0].(map[string]any)["state"], "present", "built", "available", "fresh")
+}
+
+func TestExportAgentContextPaginationMetadata(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "export_agent_context", map[string]any{"limit": 1, "offset": 0})
+	if res.IsError {
+		t.Fatalf("export_agent_context returned error: %v", res.Content)
+	}
+	exportVal := decodeContent(t, res)
+	assertReadPaginationMetadata(t, exportVal, 2, 1, 0, 1, true, 1, true)
+}
+
+func TestExportAgentContextPaginationMetadataTerminalPage(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "export_agent_context", map[string]any{"limit": 10, "offset": 1})
+	if res.IsError {
+		t.Fatalf("export_agent_context returned error: %v", res.Content)
+	}
+	exportVal := decodeContent(t, res)
+	assertReadPaginationMetadata(t, exportVal, 2, 10, 1, 1, false, 0, false)
+}
+
+func TestExportAgentContextDefaultCapsLimitWhenIncludeBody(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "export_agent_context", map[string]any{"limit": 15})
+	if res.IsError {
+		t.Fatalf("export_agent_context returned error: %v", res.Content)
+	}
+	envelope := decodeEnvelope(t, res)
+	exportVal, ok := envelope["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("export_agent_context data type = %T", envelope["data"])
+	}
+	if got := exportVal["limit"]; got != float64(10) {
+		t.Fatalf("export_agent_context limit=15 with include_body default: effective limit = %v, want 10 (capped)", got)
+	}
+	if got := exportVal["include_body"]; got != true {
+		t.Fatalf("export_agent_context include_body = %v, want true (default)", got)
+	}
+	warnings, _ := envelope["warnings"].([]any)
+	if len(warnings) == 0 {
+		t.Fatal("export_agent_context limit=15 with include_body default: expected a warning that the limit was capped")
+	}
+}
+
+func TestExportAgentContextIncludeBodyFalseOmitsMarkdownAndRaisesCap(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "export_agent_context", map[string]any{"limit": 15, "include_body": false})
+	if res.IsError {
+		t.Fatalf("export_agent_context returned error: %v", res.Content)
+	}
+	envelope := decodeEnvelope(t, res)
+	exportVal, ok := envelope["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("export_agent_context data type = %T", envelope["data"])
+	}
+	if got := exportVal["limit"]; got != float64(15) {
+		t.Fatalf("export_agent_context limit=15 with include_body=false: effective limit = %v, want 15 (not capped)", got)
+	}
+	if got := exportVal["include_body"]; got != false {
+		t.Fatalf("export_agent_context include_body = %v, want false", got)
+	}
+	warnings, _ := envelope["warnings"].([]any)
+	if len(warnings) != 0 {
+		t.Fatalf("export_agent_context limit=15 with include_body=false: unexpected warnings %v", warnings)
+	}
+	pages, _ := exportVal["pages"].([]any)
+	if len(pages) == 0 {
+		t.Fatal("export_agent_context include_body=false: expected at least one page")
+	}
+	for _, raw := range pages {
+		page, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("export_agent_context page = %T, want map", raw)
+		}
+		if md, present := page["markdown"]; present {
+			t.Fatalf("export_agent_context include_body=false: page still carries markdown field: %v", md)
+		}
+	}
+}
+
+func TestExportAgentContextUsesSourceMarkdownForPublicLanguageSlug(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "export_agent_context", map[string]any{"tag": "Hugo", "limit": 1, "offset": 0})
+	if res.IsError {
+		t.Fatalf("export_agent_context returned error: %v", res.Content)
+	}
+	exportVal := decodeContent(t, res)
+	pages, ok := exportVal["pages"].([]any)
+	if !ok || len(pages) != 1 {
+		t.Fatalf("export_agent_context pages = %#v, want one page", exportVal["pages"])
+	}
+	first, ok := pages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("export page type = %T", pages[0])
+	}
+	md, _ := first["markdown"].(string)
+	if !strings.Contains(md, "This is the hello world post body.") {
+		t.Fatalf("markdown = %q, want source body", md)
+	}
+	for _, bad := range []string{"javascript:void(0)", "Read Markdown", "Share"} {
+		if strings.Contains(md, bad) {
+			t.Fatalf("markdown contains theme artifact %q: %q", bad, md)
+		}
+	}
+}
+
+func newMultilingualHelloReadSession(t *testing.T) (*mcp.ClientSession, func()) {
+	t.Helper()
+	htmlDir := t.TempDir()
+	htmlPage := filepath.Join(htmlDir, "en", "posts", "hello")
+	if err := os.MkdirAll(htmlPage, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	htmlFile := filepath.Join(htmlPage, "index.html")
+	const html = `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/en/posts/hello/">
+<meta property="og:title" content="Hello EN">
+<meta property="article:tag" content="Hugo">
+</head><body><article>English public body</article></body></html>`
+	if err := os.WriteFile(htmlFile, []byte(html), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "fr"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	contentRoot := t.TempDir()
+	writeSource := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(contentRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeSource("posts/hello/index.fr.md", "---\ntitle: Bonjour FR\ntags: [Hugo]\ncategories: [Infrastructure]\n---\nBonjour depuis la source francaise.\n")
+	writeSource("posts/hello/index.en.md", "---\ntitle: Hello EN\ntags: [Hugo]\ncategories: [Infrastructure]\n---\nHello from the English source.\n")
+
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	cfg.ContentRoot = contentRoot
+	return newTestClientWithCfg(t, idx, cfg, srcIdx)
+}
+
+func newSourceOnlyBilingualDefaultLangReadSession(t *testing.T) (*mcp.ClientSession, func()) {
+	t.Helper()
+	cfg := config.Default()
+	htmlDir := t.TempDir()
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.SiteRoot = htmlDir
+	cfg.DefaultLanguage = "fr"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	contentRoot := t.TempDir()
+	writeSource := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(contentRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeSource("posts/source-only/index.fr.md", "---\ntitle: Bonjour FR\ntags: [Hugo]\ncategories: [Infrastructure]\n---\nBonjour depuis la source francaise.\n")
+	writeSource("posts/source-only/index.en.md", "---\ntitle: Hello EN\ntags: [Hugo]\ncategories: [Infrastructure]\n---\nHello from the English source.\n")
+
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	cfg.ContentRoot = contentRoot
+	return newTestClientWithCfg(t, idx, cfg, srcIdx)
+}
+
+// newRootMultilingualReadSession builds a two-language site whose homepage
+// ("/" default-language English, "/fr/" secondary-language French) has both
+// a rendered public page and an explicitly-labelled source file
+// ("_index.en.md"/"_index.fr.md") for every language — the #1184 root cause
+// only reproduces when every language is explicitly labelled, since an
+// unlabelled "_index.md" resolves via a different, already-working code
+// path (GetDefaultBySlug/byDefault).
+func newRootMultilingualReadSession(t *testing.T) (*mcp.ClientSession, func()) {
+	t.Helper()
+	htmlDir := t.TempDir()
+	writeHTML := func(rel, lang, body string) {
+		t.Helper()
+		full := filepath.Join(htmlDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		html := `<!DOCTYPE html><html lang="` + lang + `"><head>
+<link rel="canonical" href="https://example.test/` + rel[:len(rel)-len("index.html")] + `">
+<meta property="og:title" content="Home ` + lang + `">
+</head><body><main>` + body + `</main></body></html>`
+		if err := os.WriteFile(full, []byte(html), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeHTML("index.html", "en", "English public home")
+	writeHTML(filepath.Join("fr", "index.html"), "fr", "French public home")
+
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	contentRoot := t.TempDir()
+	writeSource := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(contentRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeSource("_index.en.md", "---\ntitle: Home\n---\nEnglish home body.\n")
+	writeSource("_index.fr.md", "---\ntitle: Accueil\n---\nCorps francais.\n")
+
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	cfg.ContentRoot = contentRoot
+	return newTestClientWithCfg(t, idx, cfg, srcIdx)
+}
+
+// TestRootMultilingualToolsAgreeOnSourceResolution is the cross-tool
+// regression test #1184 asked for: get_page_for_edit and check_ai_readiness
+// previously couldn't resolve the site root ("/") to its source at all
+// (content_not_found), while validate_site/inspect_rendered (which don't
+// route through PageResolver) resolved it fine. Exercises both the default
+// and a secondary explicitly-labelled language, and both the bare "/" slug
+// and its "/fr/" language-prefixed form.
+func TestRootMultilingualToolsAgreeOnSourceResolution(t *testing.T) {
+	session, done := newRootMultilingualReadSession(t)
+	defer done()
+
+	for _, tc := range []struct {
+		name     string
+		slug     string
+		lang     string
+		wantBody string
+	}{
+		{name: "default lang bare slug", slug: "/", lang: "", wantBody: "English home body."},
+		{name: "default lang explicit", slug: "/", lang: "en", wantBody: "English home body."},
+		{name: "secondary lang prefixed slug", slug: "/fr/", lang: "", wantBody: "Corps francais."},
+		{name: "secondary lang explicit", slug: "/", lang: "fr", wantBody: "Corps francais."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := map[string]any{"slug": tc.slug}
+			if tc.lang != "" {
+				args["lang"] = tc.lang
+			}
+
+			editRes := callTool(t, session, "get_page_for_edit", args)
+			if editRes.IsError {
+				t.Fatalf("get_page_for_edit(%v) returned error: %v", args, editRes.Content)
+			}
+			m := decodeContent(t, editRes)
+			page, _ := m["page"].(map[string]any)
+			md, _ := page["markdown"].(string)
+			if !strings.Contains(md, tc.wantBody) {
+				t.Fatalf("get_page_for_edit(%v).page.markdown = %q, want to contain %q", args, md, tc.wantBody)
+			}
+
+			readinessRes := callTool(t, session, "check_ai_readiness", args)
+			if readinessRes.IsError {
+				raw, _ := json.Marshal(readinessRes.Content)
+				t.Fatalf("check_ai_readiness(%v) returned error: %s", args, raw)
+			}
+		})
+	}
+}
+
+func newEditorialGraphSession(t *testing.T) (*mcp.ClientSession, func()) {
+	t.Helper()
+	htmlDir := t.TempDir()
+	writeHTML := func(rel, html string) {
+		t.Helper()
+		full := filepath.Join(htmlDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(html), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeHTML(filepath.Join("posts", "hello", "index.html"), `<!DOCTYPE html><html lang="fr"><head>
+<link rel="canonical" href="https://example.test/posts/hello/">
+<meta property="og:title" content="Bonjour FR">
+<meta property="article:tag" content="Hugo">
+<meta property="article:section" content="Infrastructure">
+</head><body><article>Bonjour FR public body</article></body></html>`)
+	writeHTML(filepath.Join("en", "posts", "hello", "index.html"), `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/en/posts/hello/">
+<meta property="og:title" content="Hello EN">
+<meta property="article:tag" content="Hugo">
+<meta property="article:section" content="Infrastructure">
+</head><body><article>Hello EN public body</article></body></html>`)
+	writeHTML(filepath.Join("posts", "guide", "index.html"), `<!DOCTYPE html><html lang="fr"><head>
+<link rel="canonical" href="https://example.test/posts/guide/">
+<meta property="og:title" content="Guide FR">
+<meta property="article:tag" content="Hugo">
+<meta property="article:section" content="Infrastructure">
+</head><body><article>Guide FR public body</article></body></html>`)
+
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "fr"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	contentRoot := t.TempDir()
+	writeSource := func(rel, body string) {
+		t.Helper()
+		full := filepath.Join(contentRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeSource("posts/hello/index.fr.md", "---\ntitle: Bonjour FR\ntags: [Hugo]\ncategories: [Infrastructure]\n---\nBonjour depuis la source francaise.\n")
+	writeSource("posts/hello/index.en.md", "---\ntitle: Hello EN\ntags: [Hugo]\ncategories: [Infrastructure]\n---\nHello from the English source.\n")
+	writeSource("posts/guide/index.fr.md", "---\ntitle: Guide FR\ntags: [Hugo]\ncategories: [Infrastructure]\n---\nGuide associe en francais.\n")
+
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	cfg.ContentRoot = contentRoot
+	return newTestClientWithCfg(t, idx, cfg, srcIdx)
+}
+
+func TestExportAgentContextPrefersMatchingLanguageSource(t *testing.T) {
+	session, done := newMultilingualHelloReadSession(t)
+	defer done()
+
+	res := callTool(t, session, "export_agent_context", map[string]any{"tag": "Hugo", "limit": 10, "offset": 0})
+	if res.IsError {
+		t.Fatalf("export_agent_context returned error: %v", res.Content)
+	}
+	exportVal := decodeContent(t, res)
+	pages, ok := exportVal["pages"].([]any)
+	if !ok || len(pages) != 1 {
+		t.Fatalf("export_agent_context pages = %#v, want one page", exportVal["pages"])
+	}
+	page, ok := pages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("export page type = %T", pages[0])
+	}
+	fm, ok := page["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("frontmatter type = %T", page["frontmatter"])
+	}
+	if got := fm["lang"]; got != "en" {
+		t.Fatalf("frontmatter.lang = %v, want en", got)
+	}
+	if got := fm["resolved_lang"]; got != "en" {
+		t.Fatalf("frontmatter.resolved_lang = %v, want en", got)
+	}
+	if got := asString(t, fm["resolved_source_path"]); got != "content/posts/hello/index.en.md" {
+		t.Fatalf("frontmatter.resolved_source_path = %q, want content/posts/hello/index.en.md", got)
+	}
+	md, _ := page["markdown"].(string)
+	if !strings.Contains(md, "Hello from the English source.") {
+		t.Fatalf("markdown = %q, want English source content", md)
+	}
+	if strings.Contains(md, "Bonjour depuis la source francaise.") {
+		t.Fatalf("markdown unexpectedly used French source content: %q", md)
+	}
+}
+
+func TestRichReadToolsPreferMatchingLanguageSource(t *testing.T) {
+	session, done := newMultilingualHelloReadSession(t)
+	defer done()
+
+	checkFrontmatter := func(t *testing.T, fm map[string]any) {
+		t.Helper()
+		if got := fm["lang"]; got != "en" {
+			t.Fatalf("lang = %v, want en", got)
+		}
+		if got := fm["resolved_lang"]; got != "en" {
+			t.Fatalf("resolved_lang = %v, want en", got)
+		}
+		if got := asString(t, fm["resolved_source_path"]); got != "content/posts/hello/index.en.md" {
+			t.Fatalf("resolved_source_path = %q, want content/posts/hello/index.en.md", got)
+		}
+	}
+
+	t.Run("get_page_frontmatter", func(t *testing.T) {
+		res := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/en/posts/hello/"})
+		if res.IsError {
+			t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+		}
+		m := decodeContent(t, res)
+		fm, ok := m["frontmatter"].(map[string]any)
+		if !ok {
+			t.Fatalf("frontmatter type = %T", m["frontmatter"])
+		}
+		checkFrontmatter(t, fm)
+	})
+
+	t.Run("get_page_markdown", func(t *testing.T) {
+		res := callTool(t, session, "get_page_markdown", map[string]any{"slug": "/en/posts/hello/"})
+		if res.IsError {
+			t.Fatalf("get_page_markdown returned error: %v", res.Content)
+		}
+		m := decodeContent(t, res)
+		page, ok := m["page"].(map[string]any)
+		if !ok {
+			t.Fatalf("page type = %T", m["page"])
+		}
+		checkFrontmatter(t, page)
+		md, _ := page["markdown"].(string)
+		if !strings.Contains(md, "Hello from the English source.") {
+			t.Fatalf("markdown = %q, want English source content", md)
+		}
+	})
+
+	t.Run("build_agent_context", func(t *testing.T) {
+		res := callTool(t, session, "build_agent_context", map[string]any{"slug": "/en/posts/hello/"})
+		if res.IsError {
+			t.Fatalf("build_agent_context returned error: %v", res.Content)
+		}
+		m := decodeContent(t, res)
+		ctx, ok := m["context"].(map[string]any)
+		if !ok {
+			t.Fatalf("context type = %T", m["context"])
+		}
+		fm, ok := ctx["frontmatter"].(map[string]any)
+		if !ok {
+			t.Fatalf("context.frontmatter type = %T", ctx["frontmatter"])
+		}
+		checkFrontmatter(t, fm)
+		md, _ := ctx["markdown"].(string)
+		if !strings.Contains(md, "Hello from the English source.") {
+			t.Fatalf("markdown = %q, want English source content", md)
+		}
+	})
+}
+
+func TestRichReadToolsSupportExplicitLangSelection(t *testing.T) {
+	session, done := newMultilingualHelloReadSession(t)
+	defer done()
+
+	checkFrontmatter := func(t *testing.T, fm map[string]any) {
+		t.Helper()
+		if got := fm["lang"]; got != "en" {
+			t.Fatalf("lang = %v, want en", got)
+		}
+		if got := fm["resolved_lang"]; got != "en" {
+			t.Fatalf("resolved_lang = %v, want en", got)
+		}
+		if got := asString(t, fm["resolved_source_path"]); got != "content/posts/hello/index.en.md" {
+			t.Fatalf("resolved_source_path = %q, want content/posts/hello/index.en.md", got)
+		}
+	}
+
+	t.Run("get_page_frontmatter", func(t *testing.T) {
+		res := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/posts/hello/", "lang": "en"})
+		if res.IsError {
+			t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+		}
+		fm := decodeContent(t, res)["frontmatter"].(map[string]any)
+		checkFrontmatter(t, fm)
+	})
+
+	t.Run("get_page_markdown", func(t *testing.T) {
+		res := callTool(t, session, "get_page_markdown", map[string]any{"slug": "posts/hello", "lang": "en"})
+		if res.IsError {
+			t.Fatalf("get_page_markdown returned error: %v", res.Content)
+		}
+		page := decodeContent(t, res)["page"].(map[string]any)
+		checkFrontmatter(t, page)
+		if md, _ := page["markdown"].(string); !strings.Contains(md, "Hello from the English source.") {
+			t.Fatalf("markdown = %q, want English source content", md)
+		}
+	})
+
+	t.Run("get_page_for_edit", func(t *testing.T) {
+		res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/hello/", "lang": "en"})
+		if res.IsError {
+			t.Fatalf("get_page_for_edit returned error: %v", res.Content)
+		}
+		page := decodeContent(t, res)["page"].(map[string]any)
+		fm := page["frontmatter"].(map[string]any)
+		checkFrontmatter(t, fm)
+		if md, _ := page["markdown"].(string); !strings.Contains(md, "Hello from the English source.") {
+			t.Fatalf("markdown = %q, want English source content", md)
+		}
+	})
+
+	t.Run("build_agent_context", func(t *testing.T) {
+		res := callTool(t, session, "build_agent_context", map[string]any{"slug": "/posts/hello/", "lang": "en"})
+		if res.IsError {
+			t.Fatalf("build_agent_context returned error: %v", res.Content)
+		}
+		ctx := decodeContent(t, res)["context"].(map[string]any)
+		fm := ctx["frontmatter"].(map[string]any)
+		checkFrontmatter(t, fm)
+		if md, _ := ctx["markdown"].(string); !strings.Contains(md, "Hello from the English source.") {
+			t.Fatalf("markdown = %q, want English source content", md)
+		}
+	})
+}
+
+func TestReadToolsRejectContradictorySlugAndLang(t *testing.T) {
+	session, done := newMultilingualHelloReadSession(t)
+	defer done()
+
+	cases := []struct {
+		name string
+		tool string
+		args map[string]any
+	}{
+		{"frontmatter", "get_page_frontmatter", map[string]any{"slug": "/en/posts/hello/", "lang": "fr"}},
+		{"markdown", "get_page_markdown", map[string]any{"slug": "/en/posts/hello/", "lang": "fr"}},
+		{"context", "build_agent_context", map[string]any{"slug": "/en/posts/hello/", "lang": "fr"}},
+		{"for_edit", "get_page_for_edit", map[string]any{"slug": "/en/posts/hello/", "lang": "fr"}},
+		{"readiness", "check_ai_readiness", map[string]any{"slug": "/en/posts/hello/", "lang": "fr"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := callTool(t, session, tc.tool, tc.args)
+			if !res.IsError {
+				t.Fatalf("%s: contradictory slug/lang must fail", tc.tool)
+			}
+			raw, _ := json.Marshal(res.Content)
+			if !strings.Contains(string(raw), "invalid_params") || !strings.Contains(string(raw), "lang") {
+				t.Fatalf("%s contradictory slug/lang error = %s, want invalid_params naming lang", tc.tool, raw)
+			}
+		})
+	}
+}
+
+func TestReadToolsPreferDefaultLanguageForSourceOnlyMultilingualPage(t *testing.T) {
+	session, done := newSourceOnlyBilingualDefaultLangReadSession(t)
+	defer done()
+
+	t.Run("get_page_frontmatter", func(t *testing.T) {
+		res := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/posts/source-only/"})
+		if res.IsError {
+			t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+		}
+		fm := decodeContent(t, res)["frontmatter"].(map[string]any)
+		if got := fm["lang"]; got != "fr" {
+			t.Fatalf("frontmatter.lang = %v, want fr", got)
+		}
+		if got := fm["resolved_lang"]; got != "fr" {
+			t.Fatalf("frontmatter.resolved_lang = %v, want fr", got)
+		}
+		if got := asString(t, fm["resolved_source_path"]); got != "content/posts/source-only/index.fr.md" {
+			t.Fatalf("frontmatter.resolved_source_path = %q, want content/posts/source-only/index.fr.md", got)
+		}
+	})
+
+	t.Run("get_page_markdown", func(t *testing.T) {
+		res := callTool(t, session, "get_page_markdown", map[string]any{"slug": "/posts/source-only/"})
+		if res.IsError {
+			t.Fatalf("get_page_markdown returned error: %v", res.Content)
+		}
+		page := decodeContent(t, res)["page"].(map[string]any)
+		if got := page["resolved_lang"]; got != "fr" {
+			t.Fatalf("page.resolved_lang = %v, want fr", got)
+		}
+		if got := asString(t, page["resolved_source_path"]); got != "content/posts/source-only/index.fr.md" {
+			t.Fatalf("page.resolved_source_path = %q, want content/posts/source-only/index.fr.md", got)
+		}
+		if md, _ := page["markdown"].(string); !strings.Contains(md, "Bonjour depuis la source francaise.") {
+			t.Fatalf("markdown = %q, want French source body", md)
+		}
+	})
+
+	t.Run("get_page_for_edit", func(t *testing.T) {
+		res := callTool(t, session, "get_page_for_edit", map[string]any{"slug": "/posts/source-only/"})
+		if res.IsError {
+			t.Fatalf("get_page_for_edit returned error: %v", res.Content)
+		}
+		page := decodeContent(t, res)["page"].(map[string]any)
+		fm := page["frontmatter"].(map[string]any)
+		if got := fm["lang"]; got != "fr" {
+			t.Fatalf("frontmatter.lang = %v, want fr", got)
+		}
+		if got := fm["resolved_lang"]; got != "fr" {
+			t.Fatalf("frontmatter.resolved_lang = %v, want fr", got)
+		}
+		if got := asString(t, fm["resolved_source_path"]); got != "content/posts/source-only/index.fr.md" {
+			t.Fatalf("frontmatter.resolved_source_path = %q, want content/posts/source-only/index.fr.md", got)
+		}
+		if md, _ := page["markdown"].(string); !strings.Contains(md, "Bonjour depuis la source francaise.") {
+			t.Fatalf("markdown = %q, want French source body", md)
+		}
+	})
+}
+
+func TestLanguagePrefixedReadsNeverBorrowDefaultRenderedPage(t *testing.T) {
+	htmlDir := t.TempDir()
+	frPublic := filepath.Join(htmlDir, "posts", "hello", "index.html")
+	if err := os.MkdirAll(filepath.Dir(frPublic), 0o755); err != nil {
+		t.Fatalf("MkdirAll public: %v", err)
+	}
+	if err := os.WriteFile(frPublic, []byte(`<!DOCTYPE html><html lang="fr"><head>
+<link rel="canonical" href="https://example.test/posts/hello/">
+<meta property="og:title" content="Bonjour FR"></head>
+<body><article>French rendered body</article></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile public: %v", err)
+	}
+
+	contentRoot := t.TempDir()
+	for rel, raw := range map[string]string{
+		"posts/hello/index.fr.md": "---\ntitle: Bonjour FR\n---\nFrench source body\n",
+		"posts/hello/index.en.md": "---\ntitle: Hello EN\n---\nEnglish source body\n",
+	} {
+		full := filepath.Join(contentRoot, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll source: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatalf("WriteFile source: %v", err)
+		}
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.ContentRoot = contentRoot
+	cfg.DefaultLanguage = "fr"
+	cfg.MaxIndexEntries = 1000
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	session, done := newTestClientWithCfg(t, idx, cfg, srcIdx)
+	defer done()
+
+	t.Run("frontmatter remains English source-only", func(t *testing.T) {
+		res := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/en/posts/hello/"})
+		if res.IsError {
+			t.Fatalf("get_page_frontmatter returned error: %v", res.Content)
+		}
+		fm := decodeContent(t, res)["frontmatter"].(map[string]any)
+		if fm["title"] != "Hello EN" || fm["resolved_lang"] != "en" || fm["slug"] != "/en/posts/hello/" {
+			t.Fatalf("frontmatter identity/content mismatch: %#v", fm)
+		}
+		state := fm["state"].(map[string]any)
+		if state["public_state"] != "not_yet_available" || state["index_state"] != "source_only" {
+			t.Fatalf("frontmatter state = %#v, want source-only English", state)
+		}
+	})
+
+	t.Run("inspect_rendered refuses false public fallback", func(t *testing.T) {
+		res := callTool(t, session, "inspect_rendered", map[string]any{"slug": "/en/posts/hello/"})
+		if !res.IsError {
+			t.Fatalf("inspect_rendered returned success from the French public page: %#v", decodeContent(t, res))
+		}
+	})
+}
+
+func TestValidateFrontmatterSupportsExplicitLangFilter(t *testing.T) {
+	contentRoot := t.TempDir()
+	write := func(rel, raw string) {
+		t.Helper()
+		full := filepath.Join(contentRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/multi/index.en.md", "---\ntitle: Hello\ndate: 2026-01-01\n---\nEnglish body.\n")
+	write("posts/multi/index.fr.md", "---\ntitle: Bonjour\ndate: 2026-01-02\n---\nCorps francais.\n")
+
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("hugosite.NewSourceIndex() error = %v", err)
+	}
+	session, done := newTestClientWithSourceIndex(t, mustTestIndex(t), srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_frontmatter", map[string]any{
+		"slug":   "posts/multi",
+		"lang":   "en",
+		"limit":  10,
+		"offset": 0,
+	})
+	if res.IsError {
+		t.Fatalf("validate_frontmatter returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if got := data["pages_checked"]; got != float64(1) {
+		t.Fatalf("pages_checked = %v, want 1 when lang=en is explicit", got)
+	}
+	pages, _ := data["pages"].([]any)
+	if len(pages) != 1 {
+		t.Fatalf("pages = %#v, want one translation", pages)
+	}
+	page := pages[0].(map[string]any)
+	if got := page["slug"]; got != "/posts/multi/" {
+		t.Fatalf("page.slug = %v, want canonical shared slug /posts/multi/", got)
+	}
+	if got := page["lang"]; got != "en" {
+		t.Fatalf("page.lang = %v, want en", got)
+	}
+}
+
+func TestValidateFrontmatterSupportsExplicitLangFilterForPublicSlug(t *testing.T) {
+	contentRoot := t.TempDir()
+	write := func(rel, raw string) {
+		t.Helper()
+		full := filepath.Join(contentRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/multi/index.en.md", "---\ntitle: Hello\ndate: 2026-01-01\n---\nEnglish body.\n")
+	write("posts/multi/index.fr.md", "---\ntitle: Bonjour\ndate: 2026-01-02\n---\nCorps francais.\n")
+
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("hugosite.NewSourceIndex() error = %v", err)
+	}
+	session, done := newTestClientWithSourceIndex(t, mustTestIndex(t), srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_frontmatter", map[string]any{
+		"slug":   "/en/posts/multi/",
+		"lang":   "en",
+		"limit":  10,
+		"offset": 0,
+	})
+	if res.IsError {
+		t.Fatalf("validate_frontmatter returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if got := data["pages_checked"]; got != float64(1) {
+		t.Fatalf("pages_checked = %v, want 1 when public English slug and lang=en are explicit", got)
+	}
+	pages, _ := data["pages"].([]any)
+	if len(pages) != 1 {
+		t.Fatalf("pages = %#v, want one translation", pages)
+	}
+	page := pages[0].(map[string]any)
+	if got := page["lang"]; got != "en" {
+		t.Fatalf("page.lang = %v, want en", got)
+	}
+}
+
+func TestGetRelatedContentSeparatesTranslations(t *testing.T) {
+	session, done := newEditorialGraphSession(t)
+	defer done()
+
+	res := callTool(t, session, "get_related_content", map[string]any{"slug": "/posts/hello/", "limit": 10})
+	if res.IsError {
+		t.Fatalf("get_related_content returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	translations, ok := m["translations"].([]any)
+	if !ok || len(translations) != 1 {
+		t.Fatalf("translations = %#v, want one translation", m["translations"])
+	}
+	translation := translations[0].(map[string]any)
+	if got := translation["slug"]; got != "/en/posts/hello/" {
+		t.Fatalf("translation slug = %v, want /en/posts/hello/", got)
+	}
+	if got := translation["lang"]; got != "en" {
+		t.Fatalf("translation lang = %v, want en", got)
+	}
+
+	relatedPages, ok := m["related_pages"].([]any)
+	if !ok || len(relatedPages) == 0 {
+		t.Fatalf("related_pages = %#v, want at least one real related page", m["related_pages"])
+	}
+	backlinks, ok := m["backlinks"].([]any)
+	if !ok {
+		t.Fatalf("backlinks = %#v, want array field present", m["backlinks"])
+	}
+	if len(backlinks) != 0 {
+		t.Fatalf("backlinks = %#v, want empty array for fixture without inbound links", backlinks)
+	}
+	suggestedLinks, ok := m["suggested_links"].([]any)
+	if !ok || len(suggestedLinks) == 0 {
+		t.Fatalf("suggested_links = %#v, want populated editorial suggestions", m["suggested_links"])
+	}
+	// The deprecated "related" alias (#453) was removed once #433/#454 were
+	// resolved (related_pages is canonical and was never actually removed).
+	if _, ok := m["related"]; ok {
+		t.Fatalf("related = %#v, want the deprecated alias removed", m["related"])
+	}
+	for _, raw := range append(relatedPages, suggestedLinks...) {
+		related := raw.(map[string]any)
+		if got := related["slug"]; got == "/en/posts/hello/" {
+			t.Fatalf("translation leaked into related content: %#v", related)
+		}
+	}
+	if got := relatedPages[0].(map[string]any)["slug"]; got != "/posts/guide/" {
+		t.Fatalf("top related slug = %v, want /posts/guide/", got)
+	}
+	if got := suggestedLinks[0].(map[string]any)["slug"]; got != "/posts/guide/" {
+		t.Fatalf("top suggested link slug = %v, want /posts/guide/", got)
+	}
+}
+
+func TestRelationshipRecommendationsFilterLanguageAndCollapseTranslations(t *testing.T) {
+	session, done := newEditorialGraphSession(t)
+	defer done()
+
+	res := callTool(t, session, "get_related_content", map[string]any{
+		"slug":               "/posts/hello/",
+		"language":           "en",
+		"one_per_source_key": true,
+		"response_mode":      "compact",
+		"limit":              10,
+	})
+	if res.IsError {
+		t.Fatalf("get_related_content returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if translations, ok := data["translations"]; ok && translations != nil {
+		t.Fatalf("compact translations = %#v, want omitted", translations)
+	}
+	if backlinks, ok := data["backlinks"]; ok && backlinks != nil {
+		t.Fatalf("compact backlinks = %#v, want omitted", backlinks)
+	}
+	for _, key := range []string{"related_pages", "suggested_links"} {
+		rows, ok := data[key].([]any)
+		if !ok {
+			t.Fatalf("%s = %#v, want array", key, data[key])
+		}
+		seen := map[string]bool{}
+		for _, raw := range rows {
+			row := raw.(map[string]any)
+			if got := row["lang"]; got != "en" {
+				t.Fatalf("%s row language = %v, want en: %#v", key, got, row)
+			}
+			if got := row["shared_tags"]; got != nil {
+				t.Fatalf("compact %s shared_tags = %#v, want omitted", key, got)
+			}
+			slug := row["slug"].(string)
+			if seen[slug] {
+				t.Fatalf("%s contains duplicate source key for %q", key, slug)
+			}
+			seen[slug] = true
+		}
+	}
+
+	res = callTool(t, session, "suggest_links", map[string]any{
+		"slug":               "/posts/hello/",
+		"language":           "en",
+		"one_per_source_key": true,
+		"response_mode":      "compact",
+		"limit":              10,
+	})
+	if res.IsError {
+		t.Fatalf("suggest_links returned error: %v", res.Content)
+	}
+	data = decodeContent(t, res)
+	if translations, ok := data["translations"]; ok && translations != nil {
+		t.Fatalf("compact suggestion translations = %#v, want omitted", translations)
+	}
+	rows := data["suggested_links"].([]any)
+	for _, raw := range rows {
+		row := raw.(map[string]any)
+		if row["lang"] != "en" {
+			t.Fatalf("suggestion language = %v, want en", row["lang"])
+		}
+		if row["shared_tags"] != nil || row["shared_categories"] != nil {
+			t.Fatalf("compact suggestion taxonomy = %#v, want omitted", row)
+		}
+	}
+}
+
+// TestRelationshipRecommendationsFilterLanguageDefaultModeKeepsDetail is the
+// default-response-mode counterpart to
+// TestRelationshipRecommendationsFilterLanguageAndCollapseTranslations: the
+// language/one_per_source_key filtering behavior must not depend on
+// response_mode, and the default (standard) mode must keep returning
+// translations/shared_tags/backlinks detail alongside the filtered results.
+func TestRelationshipRecommendationsFilterLanguageDefaultModeKeepsDetail(t *testing.T) {
+	session, done := newEditorialGraphSession(t)
+	defer done()
+
+	res := callTool(t, session, "get_related_content", map[string]any{
+		"slug":               "/posts/hello/",
+		"language":           "en",
+		"one_per_source_key": true,
+		"limit":              10,
+	})
+	if res.IsError {
+		t.Fatalf("get_related_content returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if _, ok := data["translations"]; !ok {
+		t.Fatalf("default mode translations missing: %#v", data)
+	}
+	if _, ok := data["backlinks"]; !ok {
+		t.Fatalf("default mode backlinks missing: %#v", data)
+	}
+	seen := map[string]bool{}
+	for _, key := range []string{"related_pages", "suggested_links"} {
+		rows, ok := data[key].([]any)
+		if !ok {
+			t.Fatalf("%s = %#v, want array", key, data[key])
+		}
+		for _, raw := range rows {
+			row := raw.(map[string]any)
+			if got := row["lang"]; got != "en" {
+				t.Fatalf("%s row language = %v, want en: %#v", key, got, row)
+			}
+			if _, ok := row["shared_tags"]; !ok {
+				t.Fatalf("default mode %s shared_tags missing: %#v", key, row)
+			}
+			slug := row["slug"].(string)
+			key := key + slug
+			if seen[key] {
+				t.Fatalf("%s contains duplicate source key for %q", key, slug)
+			}
+			seen[key] = true
+		}
+	}
+
+	res = callTool(t, session, "suggest_links", map[string]any{
+		"slug":               "/posts/hello/",
+		"language":           "en",
+		"one_per_source_key": true,
+		"limit":              10,
+	})
+	if res.IsError {
+		t.Fatalf("suggest_links returned error: %v", res.Content)
+	}
+	data = decodeContent(t, res)
+	if _, ok := data["translations"]; !ok {
+		t.Fatalf("default mode suggestion translations missing: %#v", data)
+	}
+	rows := data["suggested_links"].([]any)
+	for _, raw := range rows {
+		row := raw.(map[string]any)
+		if row["lang"] != "en" {
+			t.Fatalf("suggestion language = %v, want en", row["lang"])
+		}
+		if _, ok := row["shared_tags"]; !ok {
+			t.Fatalf("default mode suggestion shared_tags missing: %#v", row)
+		}
+	}
+}
+
+func TestBuildAgentContextSeparatesTranslations(t *testing.T) {
+	session, done := newEditorialGraphSession(t)
+	defer done()
+
+	res := callTool(t, session, "build_agent_context", map[string]any{"slug": "/posts/hello/"})
+	if res.IsError {
+		t.Fatalf("build_agent_context returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	ctx, ok := m["context"].(map[string]any)
+	if !ok {
+		t.Fatalf("context type = %T", m["context"])
+	}
+	translations, ok := ctx["translations"].([]any)
+	if !ok || len(translations) != 1 {
+		t.Fatalf("translations = %#v, want one translation", ctx["translations"])
+	}
+	relatedPages, ok := ctx["related_pages"].([]any)
+	if !ok || len(relatedPages) == 0 {
+		t.Fatalf("related_pages = %#v, want at least one related page", ctx["related_pages"])
+	}
+	for _, raw := range relatedPages {
+		related := raw.(map[string]any)
+		if got := related["slug"]; got == "/en/posts/hello/" {
+			t.Fatalf("translation leaked into build_agent_context related_pages: %#v", related)
+		}
+	}
+}
+
+func TestSuggestInternalLinksSeparatesTranslations(t *testing.T) {
+	session, done := newEditorialGraphSession(t)
+	defer done()
+
+	res := callTool(t, session, "suggest_links", map[string]any{"slug": "/posts/hello/", "limit": 10})
+	if res.IsError {
+		t.Fatalf("suggest_links returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	translations, ok := data["translations"].([]any)
+	if !ok || len(translations) != 1 {
+		t.Fatalf("translations = %#v, want one translation", data["translations"])
+	}
+	suggestedLinks, ok := data["suggested_links"].([]any)
+	if !ok || len(suggestedLinks) == 0 {
+		t.Fatalf("suggested_links = %#v, want at least one suggestion", data["suggested_links"])
+	}
+	// The deprecated "suggestions" alias (#453) was removed once #433/#454
+	// were resolved (suggested_links is canonical and was never removed).
+	if _, ok := data["suggestions"]; ok {
+		t.Fatalf("suggestions = %#v, want the deprecated alias removed", data["suggestions"])
+	}
+	for _, raw := range suggestedLinks {
+		suggestion := raw.(map[string]any)
+		if got := suggestion["slug"]; got == "/en/posts/hello/" {
+			t.Fatalf("translation leaked into suggested links: %#v", suggestion)
+		}
+	}
+	if got := suggestedLinks[0].(map[string]any)["slug"]; got != "/posts/guide/" {
+		t.Fatalf("top suggestion slug = %v, want /posts/guide/", got)
+	}
+}
+
+// TestSuggestLinksEmptyResultIncludesExplanation is a regression test for
+// #458: when suggested_links comes back empty, the response must explain
+// why (candidates evaluated, minimum score required) instead of just an
+// empty array with no context.
+// TestRelatedContentEmptyResultDistinguishesFilterMissFromNoCandidates is a
+// regression test for the empty_reason misreport identified alongside the
+// #1041 overfetch fix: when scored candidates exist but a language filter
+// removes every one of them, empty_reason must say so instead of reporting
+// "no_candidates_with_sufficient_taxonomy_affinity" — a caller would
+// otherwise be told (wrongly) that nothing scores well enough, when the
+// real fix is to drop or change the language filter.
+func TestRelatedContentEmptyResultDistinguishesFilterMissFromNoCandidates(t *testing.T) {
+	session, done := newEditorialGraphSession(t)
+	defer done()
+
+	res := callTool(t, session, "get_related_content", map[string]any{
+		"slug":     "/posts/hello/",
+		"language": "de",
+		"limit":    10,
+	})
+	if res.IsError {
+		t.Fatalf("get_related_content returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	related, ok := data["related_pages"].([]any)
+	if !ok || len(related) != 0 {
+		t.Fatalf("related_pages = %#v, want empty (no de content)", data["related_pages"])
+	}
+	emptyReason, ok := data["empty_reason"].(map[string]any)
+	if !ok {
+		t.Fatalf("empty_reason = %#v, want present alongside empty related_pages", data["empty_reason"])
+	}
+	if got := emptyReason["reason"]; got != "no_candidates_matching_language_or_source_key_filter" {
+		t.Fatalf("empty_reason.reason = %v, want no_candidates_matching_language_or_source_key_filter", got)
+	}
+}
+
+func TestSuggestLinksEmptyResultIncludesExplanation(t *testing.T) {
+	htmlDir := t.TempDir()
+	writeHTML := func(rel, html string) {
+		t.Helper()
+		full := filepath.Join(htmlDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(html), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeHTML(filepath.Join("posts", "alpha", "index.html"), `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/posts/alpha/">
+<meta property="og:title" content="Alpha">
+<meta property="article:tag" content="go">
+</head><body><article>Alpha body</article></body></html>`)
+	writeHTML(filepath.Join("posts", "beta", "index.html"), `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/posts/beta/">
+<meta property="og:title" content="Beta">
+<meta property="article:tag" content="rust">
+</head><body><article>Beta body</article></body></html>`)
+
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "suggest_links", map[string]any{"tags": []string{"no-such-tag"}, "limit": 10})
+	if res.IsError {
+		t.Fatalf("suggest_links returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	suggestedLinks, ok := data["suggested_links"].([]any)
+	if !ok || len(suggestedLinks) != 0 {
+		t.Fatalf("suggested_links = %#v, want empty array", data["suggested_links"])
+	}
+	emptyReason, ok := data["empty_reason"].(map[string]any)
+	if !ok {
+		t.Fatalf("empty_reason = %#v, want present alongside empty suggested_links", data["empty_reason"])
+	}
+	if got := emptyReason["reason"]; got != "no_candidates_with_sufficient_taxonomy_affinity" {
+		t.Fatalf("empty_reason.reason = %v, want no_candidates_with_sufficient_taxonomy_affinity", got)
+	}
+	if got := emptyReason["candidates_evaluated"]; got != float64(2) {
+		t.Fatalf("empty_reason.candidates_evaluated = %v, want 2", got)
+	}
+	if got := emptyReason["minimum_score"]; got != float64(1) {
+		t.Fatalf("empty_reason.minimum_score = %v, want 1", got)
+	}
+}
+
+// TestSuggestLinksAcceptsResolvedSlugWithNoTaxonomy is a regression test: a
+// slug that resolves to a real, valid page satisfies suggest_links' own
+// documented contract ("Supply slug ... or tags/categories ... or both") even
+// when that page happens to carry no tags/categories of its own — a minimal
+// or newly-created site's only post is a realistic example. Previously this
+// hit the same "invalid_params: provide at least one of slug, tags, or
+// categories" error as supplying no input at all, even though a valid slug
+// was given and resolved successfully; it should instead fall through to the
+// normal empty_reason response used for "nothing to compare against".
+func TestSuggestLinksAcceptsResolvedSlugWithNoTaxonomy(t *testing.T) {
+	htmlDir := t.TempDir()
+	writeHTML := func(rel, html string) {
+		t.Helper()
+		full := filepath.Join(htmlDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(html), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeHTML(filepath.Join("posts", "untagged", "index.html"), `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/posts/untagged/">
+<meta property="og:title" content="Untagged">
+</head><body><article>Untagged body</article></body></html>`)
+
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "suggest_links", map[string]any{"slug": "/posts/untagged/", "limit": 10})
+	if res.IsError {
+		t.Fatalf("suggest_links returned error for a resolved slug with no taxonomy: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	suggestedLinks, ok := data["suggested_links"].([]any)
+	if !ok || len(suggestedLinks) != 0 {
+		t.Fatalf("suggested_links = %#v, want empty array", data["suggested_links"])
+	}
+	if _, ok := data["empty_reason"].(map[string]any); !ok {
+		t.Fatalf("empty_reason = %#v, want present alongside empty suggested_links", data["empty_reason"])
+	}
+}
+
+// TestSuggestLinksFallsBackToLexicalSignalsWhenTaxonomyIsEmpty covers #680:
+// when a draft body clearly names an existing topic but submitted
+// tags/categories have no overlap with any published page, suggest_links
+// should still surface a deterministic lexical fallback instead of only
+// returning an empty taxonomy-affinity explanation.
+func TestSuggestLinksFallsBackToLexicalSignalsWhenTaxonomyIsEmpty(t *testing.T) {
+	htmlDir := t.TempDir()
+	writeHTML := func(rel, html string) {
+		t.Helper()
+		full := filepath.Join(htmlDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(html), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	writeHTML(filepath.Join("posts", "release-gate", "index.html"), `<!DOCTYPE html><html lang="fr"><head>
+<link rel="canonical" href="https://example.test/posts/release-gate/">
+<meta property="og:title" content="Hugo Release Gate">
+<meta name="description" content="Guide de publication Hugo et validation MCP">
+<meta property="article:tag" content="release-engineering">
+<meta property="article:section" content="Operations">
+</head><body><article>Guide de publication Hugo et validation MCP.</article></body></html>`)
+	writeHTML(filepath.Join("posts", "observability", "index.html"), `<!DOCTYPE html><html lang="fr"><head>
+<link rel="canonical" href="https://example.test/posts/observability/">
+<meta property="og:title" content="Observability Notes">
+<meta name="description" content="Metrics and logs">
+<meta property="article:tag" content="observability">
+<meta property="article:section" content="Operations">
+</head><body><article>Metrics and logs.</article></body></html>`)
+
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "fr"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "suggest_links", map[string]any{
+		"tags": []string{"no-such-tag"},
+		"body": "Ce brouillon parle de Hugo, de publication MCP et de release gate.",
+	})
+	if res.IsError {
+		t.Fatalf("suggest_links returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	suggestedLinks, ok := data["suggested_links"].([]any)
+	if !ok || len(suggestedLinks) == 0 {
+		t.Fatalf("suggested_links = %#v, want lexical fallback candidate", data["suggested_links"])
+	}
+	if _, ok := data["empty_reason"]; ok {
+		t.Fatalf("empty_reason = %#v, want omitted when lexical fallback produced results", data["empty_reason"])
+	}
+	top := suggestedLinks[0].(map[string]any)
+	if got := top["slug"]; got != "/posts/release-gate/" {
+		t.Fatalf("top lexical fallback slug = %v, want /posts/release-gate/", got)
+	}
+}
+
+// TestSuggestLinksKeepsTaxonomyCandidatesWhenTheyExist locks the intended
+// sequencing for #680: lexical scoring is a fallback only, not a replacement
+// for the established taxonomy-based ranking.
+func TestSuggestLinksKeepsTaxonomyCandidatesWhenTheyExist(t *testing.T) {
+	session, done := newEditorialGraphSession(t)
+	defer done()
+
+	res := callTool(t, session, "suggest_links", map[string]any{
+		"slug": "/posts/hello/",
+		"body": "Texte hors sujet mentionnant release gate et MCP.",
+	})
+	if res.IsError {
+		t.Fatalf("suggest_links returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	suggestedLinks, ok := data["suggested_links"].([]any)
+	if !ok || len(suggestedLinks) == 0 {
+		t.Fatalf("suggested_links = %#v, want taxonomy-based suggestion", data["suggested_links"])
+	}
+	if got := suggestedLinks[0].(map[string]any)["slug"]; got != "/posts/guide/" {
+		t.Fatalf("top suggestion slug = %v, want taxonomy-based /posts/guide/", got)
+	}
+}
+
+// TestGetRelatedContentEmptyResultIncludesExplanationForSoleContentPage is a
+// regression test for #458's "no other content to compare" branch: with only
+// one published page in the whole site, related_pages must come back empty
+// with candidates_evaluated=0, distinguishing "nothing else exists" from
+// "other pages exist but none matched".
+func TestGetRelatedContentEmptyResultIncludesExplanationForSoleContentPage(t *testing.T) {
+	htmlDir := t.TempDir()
+	write := func(rel, html string) {
+		t.Helper()
+		full := filepath.Join(htmlDir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(html), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+	// A home page and a /posts/ section-list page are structural, not
+	// content candidates — they must NOT count toward candidates_evaluated
+	// (#458), so this fixture deliberately includes both alongside the sole
+	// real article to prove the classifier filter actually excludes them.
+	write(filepath.Join("index.html"), `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/">
+<meta property="og:title" content="Home">
+</head><body><article>Home body</article></body></html>`)
+	write(filepath.Join("posts", "index.html"), `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/posts/">
+<meta property="og:title" content="Posts">
+</head><body><article>Posts section list</article></body></html>`)
+	write(filepath.Join("posts", "solo", "index.html"), `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/posts/solo/">
+<meta property="og:title" content="Solo">
+<meta property="article:tag" content="go">
+</head><body><article>Solo body</article></body></html>`)
+
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_related_content", map[string]any{"slug": "/posts/solo/", "limit": 10})
+	if res.IsError {
+		t.Fatalf("get_related_content returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	relatedPages, ok := m["related_pages"].([]any)
+	if !ok || len(relatedPages) != 0 {
+		t.Fatalf("related_pages = %#v, want empty array", m["related_pages"])
+	}
+	emptyReason, ok := m["empty_reason"].(map[string]any)
+	if !ok {
+		t.Fatalf("empty_reason = %#v, want present alongside empty related_pages", m["empty_reason"])
+	}
+	if got := emptyReason["reason"]; got != "no_other_published_content_to_compare" {
+		t.Fatalf("empty_reason.reason = %v, want no_other_published_content_to_compare", got)
+	}
+	if got := emptyReason["candidates_evaluated"]; got != float64(0) {
+		t.Fatalf("empty_reason.candidates_evaluated = %v, want 0", got)
+	}
+}
+
+func TestSearchContent(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "search_content", map[string]any{
+		"query": "hello",
+		"limit": 5,
+		"sort":  "relevance",
+		"order": "desc",
+	})
+	if res.IsError {
+		t.Fatalf("search_content returned error: %v", res.Content)
+	}
+	envelope := decodeEnvelope(t, res)
+	if envelope["success"] != true {
+		t.Fatalf("search_content success = %v, want true", envelope["success"])
+	}
+	data, ok := envelope["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("search_content data type = %T", envelope["data"])
+	}
+	if data["total"] == nil {
+		t.Fatal("search_content missing total")
+	}
+	pages, ok := data["pages"].([]any)
+	if !ok {
+		t.Fatalf("search_content pages type = %T", data["pages"])
+	}
+	if len(pages) == 0 {
+		t.Fatal("search_content expected results")
+	}
+	var hello map[string]any
+	for _, raw := range pages {
+		page, _ := raw.(map[string]any)
+		if page["slug"] == "/posts/hello/" {
+			hello = page
+			break
+		}
+	}
+	if hello == nil {
+		t.Fatal("search_content expected /posts/hello/ result")
+	}
+	if got := hello["resolved_lang"]; got != "" {
+		t.Fatalf("search_content resolved_lang = %v, want empty default source lang for hello.md fixture", got)
+	}
+	if got := hello["resolved_source_path"]; got != "content/posts/hello.md" {
+		t.Fatalf("search_content resolved_source_path = %v, want content/posts/hello.md", got)
+	}
+	assertReadPageState(t, hello["state"], "present", "built", "available", "fresh")
+}
+
+func TestSearchContentCompactOmitsTermPayloads(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "search_content", map[string]any{
+		"query":         "hello",
+		"limit":         5,
+		"response_mode": "compact",
+	})
+	if res.IsError {
+		t.Fatalf("search_content returned error: %v", res.Content)
+	}
+	pages, ok := decodeContent(t, res)["pages"].([]any)
+	if !ok || len(pages) == 0 {
+		t.Fatalf("search_content pages = %#v, want non-empty array", decodeContent(t, res)["pages"])
+	}
+	page, ok := pages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("search_content first page type = %T", pages[0])
+	}
+	if _, present := page["tag_terms"]; present {
+		t.Fatal("search_content compact tag_terms present, want omitted")
+	}
+	if _, present := page["category_terms"]; present {
+		t.Fatal("search_content compact category_terms present, want omitted")
+	}
+	if _, present := page["tags"]; !present {
+		t.Fatal("search_content compact tags absent, want present")
+	}
+	if _, present := page["categories"]; !present {
+		t.Fatal("search_content compact categories absent, want present")
+	}
+}
+
+func TestSearchContentIncludeTermsFalseOmitsTermPayloads(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "search_content", map[string]any{
+		"query":         "hello",
+		"limit":         5,
+		"include_terms": false,
+	})
+	if res.IsError {
+		t.Fatalf("search_content returned error: %v", res.Content)
+	}
+	pages, ok := decodeContent(t, res)["pages"].([]any)
+	if !ok || len(pages) == 0 {
+		t.Fatalf("search_content pages = %#v, want non-empty array", decodeContent(t, res)["pages"])
+	}
+	page, ok := pages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("search_content first page type = %T", pages[0])
+	}
+	if _, present := page["tag_terms"]; present {
+		t.Fatal("search_content tag_terms present with include_terms=false, want omitted")
+	}
+	if _, present := page["category_terms"]; present {
+		t.Fatal("search_content category_terms present with include_terms=false, want omitted")
+	}
+}
+
+func TestSearchContentPaginationMetadata(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "search_content", map[string]any{
+		"query":  "hugo",
+		"limit":  1,
+		"offset": 0,
+		"sort":   "relevance",
+		"order":  "desc",
+	})
+	if res.IsError {
+		t.Fatalf("search_content returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	assertReadPaginationMetadata(t, data, 2, 1, 0, 1, true, 1, true)
+}
+
+func TestSearchContentInvalidTypeStructuredError(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "search_content", map[string]any{
+		"type": "wrong",
+	})
+	if !res.IsError {
+		t.Fatal("search_content with invalid type should return error result")
+	}
+	m := decodeErrorEnvelope(t, res)
+	if m["success"] != false {
+		t.Fatalf("search_content error success = %v, want false", m["success"])
+	}
+	errors, ok := m["errors"].([]any)
+	if !ok || len(errors) != 1 {
+		t.Fatalf("search_content errors = %#v", m["errors"])
+	}
+	err0 := errors[0].(map[string]any)
+	if got := err0["code"]; got != "invalid_params" {
+		t.Fatalf("search_content error code = %v, want invalid_params", got)
+	}
+	if got := err0["field"]; got != "type" {
+		t.Fatalf("search_content error field = %v, want type", got)
+	}
+	resolution, ok := err0["resolution"].(map[string]any)
+	if !ok {
+		t.Fatalf("search_content resolution = %T", err0["resolution"])
+	}
+	allowed, ok := resolution["allowed_values"].([]any)
+	if !ok || len(allowed) == 0 {
+		t.Fatalf("search_content allowed_values = %#v", resolution["allowed_values"])
+	}
+}
+
+func TestSearchContentRejectsInvalidSortOrderLanguageAndLimit(t *testing.T) {
+	idx := mustTestIndex(t)
+	cfg := config.Default()
+	cfg.DefaultLanguage = "en"
+	cfg.ConfiguredLanguages = []string{"en", "fr"}
+	session, done := newTestClientWithCfg(t, idx, cfg, nil)
+	defer done()
+
+	cases := []struct {
+		name          string
+		args          map[string]any
+		wantFieldHint string
+		wantSnippet   string
+	}{
+		{
+			name:          "invalid sort",
+			args:          map[string]any{"query": "hello", "sort": "nonsense"},
+			wantFieldHint: "sort",
+			wantSnippet:   "invalid_params",
+		},
+		{
+			name:          "invalid order",
+			args:          map[string]any{"query": "hello", "order": "sideways"},
+			wantFieldHint: "order",
+			wantSnippet:   "invalid_params",
+		},
+		{
+			name:          "invalid language",
+			args:          map[string]any{"query": "hello", "language": "zz"},
+			wantFieldHint: "language",
+			wantSnippet:   "invalid_params",
+		},
+		{
+			name:          "limit too high",
+			args:          map[string]any{"query": "hello", "limit": 101},
+			wantFieldHint: "limit",
+			wantSnippet:   "invalid_params",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := callTool(t, session, "search_content", tc.args)
+			if !res.IsError {
+				t.Fatalf("search_content(%s): expected invalid_params error, got success", tc.name)
+			}
+			raw, _ := json.Marshal(res.Content)
+			if !strings.Contains(string(raw), tc.wantSnippet) {
+				t.Fatalf("search_content(%s) error = %s, want snippet %q", tc.name, raw, tc.wantSnippet)
+			}
+			if !strings.Contains(strings.ToLower(string(raw)), tc.wantFieldHint) {
+				t.Fatalf("search_content(%s) error = %s, want field hint %q", tc.name, raw, tc.wantFieldHint)
+			}
+		})
+	}
+}
+
+// TestSearchContentCategoriesMatchGetPageFrontmatter is a regression test for
+// #463: search_content previously risked returning empty categories for a
+// page whose public/rendered HTML carries no category metadata (Hugo never
+// emits article:category), even when get_page_frontmatter correctly enriches
+// from the source index for the same slug. Both tools must agree — this is
+// the "shared regression test" #463's acceptance criteria asked for, so a
+// fifth endpoint doesn't need a fourth live audit to catch the same class of
+// bug (see #182/#264/#163 for the prior endpoint-by-endpoint recurrences).
+func TestSearchContentCategoriesMatchGetPageFrontmatter(t *testing.T) {
+	idx := mustTestIndex(t)
+	srcIdx := mustTestSourceIndex(t)
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	fm := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/posts/hello/"})
+	if fm.IsError {
+		t.Fatalf("get_page_frontmatter returned error: %v", fm.Content)
+	}
+	fmData := decodeContent(t, fm)
+	fmFrontmatter, ok := fmData["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_frontmatter frontmatter type = %T", fmData["frontmatter"])
+	}
+	fmCategories, _ := fmFrontmatter["categories"].([]any)
+	if len(fmCategories) == 0 {
+		t.Fatal("get_page_frontmatter categories empty — fixture content/posts/hello.md declares categories: [tutorials]")
+	}
+
+	res := callTool(t, session, "search_content", map[string]any{"query": "hello", "limit": 5})
+	if res.IsError {
+		t.Fatalf("search_content returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	pages, _ := data["pages"].([]any)
+	var hello map[string]any
+	for _, raw := range pages {
+		page, _ := raw.(map[string]any)
+		if page["slug"] == "/posts/hello/" {
+			hello = page
+			break
+		}
+	}
+	if hello == nil {
+		t.Fatalf("search_content expected /posts/hello/ result, got %v", pages)
+	}
+	searchCategories, _ := hello["categories"].([]any)
+	if len(searchCategories) == 0 {
+		t.Fatalf("search_content categories empty for /posts/hello/, want to match get_page_frontmatter's %v", fmCategories)
+	}
+	if len(searchCategories) != len(fmCategories) || searchCategories[0] != fmCategories[0] {
+		t.Fatalf("search_content categories = %v, get_page_frontmatter categories = %v — must match", searchCategories, fmCategories)
+	}
+}
+
+// TestSearchContentCategoriesMatchGetPageFrontmatterNonDefaultLang covers the
+// specific class of bug #463 originally reported: a non-default-language,
+// language-prefixed slug (e.g. /en/posts/foo/) where the source index stores
+// the page without the language prefix (posts/foo). This is the exact shape
+// that historically broke source enrichment (#182/#264/#163) — the fixture
+// used by TestSearchContentCategoriesMatchGetPageFrontmatter above uses a
+// default-language slug and would not catch a regression in the lang-prefix
+// stripping path.
+func TestSearchContentCategoriesMatchGetPageFrontmatterNonDefaultLang(t *testing.T) {
+	htmlDir := t.TempDir()
+	htmlPage := filepath.Join(htmlDir, "en", "posts", "hello")
+	if err := os.MkdirAll(htmlPage, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	const html = `<!DOCTYPE html><html lang="en"><head>
+<link rel="canonical" href="https://example.test/en/posts/hello/">
+<meta property="og:title" content="Hello">
+</head><body><article>Body</article></body></html>`
+	if err := os.WriteFile(filepath.Join(htmlPage, "index.html"), []byte(html), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	cfg := config.Default()
+	cfg.SiteRoot = htmlDir
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "fr"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	contentRoot := t.TempDir()
+	src := filepath.Join(contentRoot, "posts", "hello", "index.en.md")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(src, []byte("---\ntitle: Hello\ncategories: [tutorials, go]\n---\nBody\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	cfg.ContentRoot = contentRoot
+
+	session, done := newTestClientWithCfg(t, idx, cfg, srcIdx)
+	defer done()
+
+	fm := callTool(t, session, "get_page_frontmatter", map[string]any{"slug": "/en/posts/hello/"})
+	if fm.IsError {
+		t.Fatalf("get_page_frontmatter returned error: %v", fm.Content)
+	}
+	fmData := decodeContent(t, fm)
+	fmFrontmatter, ok := fmData["frontmatter"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_page_frontmatter frontmatter type = %T", fmData["frontmatter"])
+	}
+	fmCategories, _ := fmFrontmatter["categories"].([]any)
+	if len(fmCategories) == 0 {
+		t.Fatal("get_page_frontmatter categories empty — expected [tutorials, go] from source")
+	}
+
+	res := callTool(t, session, "search_content", map[string]any{"query": "hello", "limit": 5})
+	if res.IsError {
+		t.Fatalf("search_content returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	pages, _ := data["pages"].([]any)
+	var hello map[string]any
+	for _, raw := range pages {
+		page, _ := raw.(map[string]any)
+		if page["slug"] == "/en/posts/hello/" {
+			hello = page
+			break
+		}
+	}
+	if hello == nil {
+		t.Fatalf("search_content expected /en/posts/hello/ result, got %v", pages)
+	}
+	searchCategories, _ := hello["categories"].([]any)
+	if len(searchCategories) == 0 {
+		t.Fatalf("search_content categories empty for /en/posts/hello/, want to match get_page_frontmatter's %v", fmCategories)
+	}
+	if len(searchCategories) != len(fmCategories) || searchCategories[0] != fmCategories[0] {
+		t.Fatalf("search_content categories = %v, get_page_frontmatter categories = %v — must match", searchCategories, fmCategories)
+	}
+}
+
+func TestExplainSiteStructure(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "explain_structure", map[string]any{})
+	if res.IsError {
+		t.Fatalf("explain_structure returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if _, ok := data["sections"]; !ok {
+		t.Fatal("explain_structure missing sections")
+	}
+	if _, ok := data["summary"]; !ok {
+		t.Fatal("explain_structure missing summary")
+	}
+	recentPages, ok := data["recent_pages"].([]any)
+	if !ok || len(recentPages) == 0 {
+		t.Fatalf("explain_structure recent_pages = %#v, want at least one page", data["recent_pages"])
+	}
+	assertReadPageState(t, recentPages[0].(map[string]any)["state"], "present", "built", "available", "fresh")
+}
+
+func TestValidateFrontMatter(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "validate_frontmatter", map[string]any{"limit": 10, "offset": 0})
+	if res.IsError {
+		t.Fatalf("validate_frontmatter returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if _, ok := data["pages"]; !ok {
+		t.Fatal("validate_frontmatter missing pages")
+	}
+}
+
+func TestValidateFrontMatterReturnsCanonicalSlugs(t *testing.T) {
+	idx, srcIdx := mustSiteWithOneInvalidPage(t)
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_frontmatter", map[string]any{"limit": 10, "offset": 0})
+	if res.IsError {
+		t.Fatalf("validate_frontmatter returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	pages, _ := data["pages"].([]any)
+	if len(pages) == 0 {
+		t.Fatal("validate_frontmatter returned no pages")
+	}
+	page, ok := pages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("validate_frontmatter page type = %T", pages[0])
+	}
+	if got := page["slug"]; got != "/posts/broken/" {
+		t.Fatalf("validate_frontmatter slug = %v, want canonical /posts/broken/", got)
+	}
+}
+
+func TestValidateFrontMatterSlugIncludesAllTranslations(t *testing.T) {
+	contentRoot := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(contentRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/multi/index.en.md", "---\ntitle: Hello\ndate: 2026-01-01\n---\nEnglish body.\n")
+	write("posts/multi/index.fr.md", "---\ntitle: Bonjour\ndate: 2026-01-02\n---\nCorps francais.\n")
+
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("hugosite.NewSourceIndex() error = %v", err)
+	}
+	session, done := newTestClientWithSourceIndex(t, mustTestIndex(t), srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_frontmatter", map[string]any{"slug": "posts/multi", "limit": 10, "offset": 0})
+	if res.IsError {
+		t.Fatalf("validate_frontmatter returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if got := data["pages_checked"]; got != float64(2) {
+		t.Fatalf("pages_checked = %v, want 2 translations validated", got)
+	}
+	pages, _ := data["pages"].([]any)
+	if len(pages) != 2 {
+		t.Fatalf("pages = %#v, want both translations", pages)
+	}
+	langs := map[string]bool{}
+	for _, raw := range pages {
+		page, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("validate_frontmatter page type = %T", raw)
+		}
+		if got := page["slug"]; got != "/posts/multi/" {
+			t.Fatalf("page.slug = %v, want canonical shared slug /posts/multi/", got)
+		}
+		lang, _ := page["lang"].(string)
+		langs[lang] = true
+	}
+	if !langs["en"] || !langs["fr"] {
+		t.Fatalf("validated langs = %v, want en and fr", langs)
+	}
+}
+
+func TestValidateFrontMatterGlobalPaginationDistinguishesScanFromDetailPage(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "validate_frontmatter", map[string]any{"limit": 1, "offset": 0})
+	if res.IsError {
+		t.Fatalf("validate_frontmatter returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	pagesChecked, _ := data["pages_checked"].(float64)
+	returnedCount, _ := data["returned_count"].(float64)
+	pages, _ := data["pages"].([]any)
+	if pagesChecked < 2 {
+		t.Fatalf("validate_frontmatter limit=1: pages_checked = %v, want the full scan scope (>=2), not capped by limit", pagesChecked)
+	}
+	if returnedCount != 1 || len(pages) != 1 {
+		t.Fatalf("validate_frontmatter limit=1: returned_count=%v len(pages)=%d, want exactly 1 detail row", returnedCount, len(pages))
+	}
+	if int(pagesChecked) <= int(returnedCount) {
+		t.Fatalf("validate_frontmatter limit=1: pages_checked (%v) should exceed returned_count (%v) so has_more is meaningful", pagesChecked, returnedCount)
+	}
+	hasMore, _ := data["has_more"].(bool)
+	if !hasMore {
+		t.Fatal("validate_frontmatter limit=1: has_more = false, want true (more detail rows exist beyond this page)")
+	}
+	if data["next_offset"] == nil {
+		t.Fatal("validate_frontmatter limit=1: next_offset missing, want a value to continue pagination")
+	}
+}
+
+func TestValidateSite(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "validate_site", map[string]any{})
+	if res.IsError {
+		t.Fatalf("validate_site returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if _, ok := data["pages_checked"]; !ok {
+		t.Fatal("validate_site missing pages_checked")
+	}
+	if data["status"] != "valid" {
+		t.Fatalf("validate_site data.status = %v, want %q (fixture has no invalid pages)", data["status"], "valid")
+	}
+}
+
+// TestValidateSiteStatusFieldInvalid is a regression test for #568: a
+// caller should be able to branch on a single data.status field instead of
+// deriving validity from an empty pages list plus the invalid counter.
+func TestValidateSiteStatusFieldInvalid(t *testing.T) {
+	idx, srcIdx := mustSiteWithOneInvalidPage(t)
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_site", map[string]any{"include_valid": true})
+	if res.IsError {
+		t.Fatalf("validate_site returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if data["status"] != "invalid" {
+		t.Fatalf("validate_site data.status = %v, want %q (fixture has one broken page)", data["status"], "invalid")
+	}
+}
+
+// TestValidateSiteTestContentSlugsIsAdvisoryOnly is a regression test for
+// #584: a page whose slug matches a reserved test/audit prefix but is
+// otherwise valid frontmatter must surface in data.test_content_slugs
+// without being counted as invalid or flipping data.status.
+func TestValidateSiteTestContentSlugsIsAdvisoryOnly(t *testing.T) {
+	contentRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "mcp-audit-v159-20260720"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "mcp-audit-v159-20260720", "index.md"), []byte("---\ntitle: Audit run\ndate: 2026-07-20\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "audit-securite-modsecurity-crowdsec"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "audit-securite-modsecurity-crowdsec", "index.md"), []byte("---\ntitle: Security audit\ndate: 2026-07-01\n---\nReal article.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	// Bilingual test bundle (#584 review finding): ListPages returns one
+	// SourcePage per (slug, lang), so this must dedup to a single entry in
+	// test_content_slugs, not one per language variant.
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "test-audit-bilingual"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "test-audit-bilingual", "index.en.md"), []byte("---\ntitle: Bilingual audit run\ndate: 2026-07-20\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "test-audit-bilingual", "index.fr.md"), []byte("---\ntitle: Audit bilingue\ndate: 2026-07-20\n---\nContenu.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "ordinary-slug"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "ordinary-slug", "index.md"), []byte("---\ntitle: Explicit marker\ndate: 2026-07-20\ntest_content: true\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	root := filepath.Join("testdata", "public", "minimal")
+	cfg := config.Default()
+	cfg.SiteRoot = root
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("site.NewIndex() error = %v", err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("hugosite.NewSourceIndex() error = %v", err)
+	}
+
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_site", map[string]any{"include_valid": true})
+	if res.IsError {
+		t.Fatalf("validate_site returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if data["status"] != "valid" {
+		t.Fatalf("data.status = %v, want %q — both pages have valid frontmatter, the reserved-prefix match must not flip status", data["status"], "valid")
+	}
+	if data["invalid"] != float64(0) {
+		t.Fatalf("data.invalid = %v, want 0 — test-content match is advisory only", data["invalid"])
+	}
+	testContentSlugs, ok := data["test_content_slugs"].([]any)
+	if !ok || len(testContentSlugs) != 3 {
+		t.Fatalf("data.test_content_slugs = %#v, want exactly 3 entries (reserved-prefix single, deduped bilingual, explicit test_content marker)", data["test_content_slugs"])
+	}
+	var sawSingleLang, sawBilingualCount, sawExplicitMarker int
+	for _, s := range testContentSlugs {
+		str, _ := s.(string)
+		if strings.Contains(str, "mcp-audit-v159-20260720") {
+			sawSingleLang++
+		}
+		if strings.Contains(str, "test-audit-bilingual") {
+			sawBilingualCount++
+		}
+		if strings.Contains(str, "ordinary-slug") {
+			sawExplicitMarker++
+		}
+		// The real security-audit article ("audit-securite-...") must NOT be
+		// flagged — bare "audit-" is deliberately excluded from the reserved
+		// prefix list to avoid misclassifying legitimate content.
+		if strings.Contains(str, "modsecurity-crowdsec") {
+			t.Fatalf("data.test_content_slugs incorrectly flagged the real security-audit article: %v", testContentSlugs)
+		}
+	}
+	if sawSingleLang != 1 {
+		t.Fatalf("expected exactly 1 entry for mcp-audit-v159-20260720, got %d in %v", sawSingleLang, testContentSlugs)
+	}
+	if sawBilingualCount != 1 {
+		t.Fatalf("expected exactly 1 deduped entry for test-audit-bilingual (en+fr variants), got %d in %v", sawBilingualCount, testContentSlugs)
+	}
+	if sawExplicitMarker != 1 {
+		t.Fatalf("expected explicit test_content page outside reserved prefixes to be flagged once, got %d in %v", sawExplicitMarker, testContentSlugs)
+	}
+}
+
+// mustSiteWithOneInvalidPage builds a small fixture with one page missing
+// title/date (invalid) and one clean page, for #431's pagination/invalid_only
+// tests below.
+func mustSiteWithOneInvalidPage(t *testing.T) (*site.Index, *hugosite.SourceIndex) {
+	t.Helper()
+	contentRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "valid"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "valid", "index.md"), []byte("---\ntitle: Valid\ndate: 2026-01-01\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "broken"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "broken", "index.md"), []byte("---\n---\nNo title or date.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	root := filepath.Join("testdata", "public", "minimal")
+	cfg := config.Default()
+	cfg.SiteRoot = root
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("site.NewIndex() error = %v", err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("hugosite.NewSourceIndex() error = %v", err)
+	}
+	return idx, srcIdx
+}
+
+func TestValidateSiteInvalidOnlyFiltersPassingPages(t *testing.T) {
+	idx, srcIdx := mustSiteWithOneInvalidPage(t)
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_site", map[string]any{"invalid_only": true})
+	if res.IsError {
+		t.Fatalf("validate_site returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if pagesChecked, _ := data["pages_checked"].(float64); pagesChecked != 2 {
+		t.Fatalf("pages_checked = %v, want 2 (full scan scope unaffected by invalid_only)", pagesChecked)
+	}
+	if invalid, _ := data["invalid"].(float64); invalid != 1 {
+		t.Fatalf("invalid = %v, want 1", invalid)
+	}
+	pages, _ := data["pages"].([]any)
+	if len(pages) != 1 {
+		t.Fatalf("pages = %v, want exactly the 1 invalid page's detail row", pages)
+	}
+	page, ok := pages[0].(map[string]any)
+	if !ok || page["slug"] != "/posts/broken/" {
+		t.Fatalf("pages[0] = %v, want the broken page", pages[0])
+	}
+	if hasMore, _ := data["has_more"].(bool); hasMore {
+		t.Fatalf("has_more = true, want false (only 1 invalid page total, all returned)")
+	}
+}
+
+// TestValidateSiteDefaultsToInvalidOnly is a regression test for #456: with
+// no arguments at all, validate_site's default flipped from "return every
+// page's detail row" to "return only invalid ones" — the common case (most
+// pages pass) no longer pays full response cost to confirm nothing is wrong.
+func TestValidateSiteDefaultsToInvalidOnly(t *testing.T) {
+	idx, srcIdx := mustSiteWithOneInvalidPage(t)
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_site", map[string]any{})
+	if res.IsError {
+		t.Fatalf("validate_site returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if pagesChecked, _ := data["pages_checked"].(float64); pagesChecked != 2 {
+		t.Fatalf("pages_checked = %v, want 2 (full scan scope unaffected by the invalid-only default)", pagesChecked)
+	}
+	if pagesPassed, _ := data["pages_passed"].(float64); pagesPassed != 1 {
+		t.Fatalf("pages_passed = %v, want 1 (full scan scope unaffected by the invalid-only default)", pagesPassed)
+	}
+	pages, _ := data["pages"].([]any)
+	if len(pages) != 1 {
+		t.Fatalf("pages = %v, want only the 1 invalid page by default (#456)", pages)
+	}
+	page, ok := pages[0].(map[string]any)
+	if !ok || page["slug"] != "/posts/broken/" {
+		t.Fatalf("pages[0] = %v, want the broken page", pages[0])
+	}
+}
+
+// TestValidateSiteIncludeValidOptsIntoFullListing is a regression test for
+// #456: include_valid=true is the new opt-in for the pre-#456 behavior of
+// returning every page's detail row, not just the invalid ones.
+func TestValidateSiteIncludeValidOptsIntoFullListing(t *testing.T) {
+	idx, srcIdx := mustSiteWithOneInvalidPage(t)
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_site", map[string]any{"include_valid": true})
+	if res.IsError {
+		t.Fatalf("validate_site returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	pages, _ := data["pages"].([]any)
+	if len(pages) != 2 {
+		t.Fatalf("pages = %v, want both pages when include_valid=true", pages)
+	}
+}
+
+// TestValidateSiteExplicitInvalidOnlyFalsePreservesFullListing is a
+// regression test for #456: a caller that already explicitly passed
+// invalid_only=false under the old default must keep getting the full
+// listing after the default flip — only omitting the field entirely picks
+// up the new default.
+func TestValidateSiteExplicitInvalidOnlyFalsePreservesFullListing(t *testing.T) {
+	idx, srcIdx := mustSiteWithOneInvalidPage(t)
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_site", map[string]any{"invalid_only": false})
+	if res.IsError {
+		t.Fatalf("validate_site returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	pages, _ := data["pages"].([]any)
+	if len(pages) != 2 {
+		t.Fatalf("pages = %v, want both pages when invalid_only is explicitly false", pages)
+	}
+}
+
+func TestValidateSitePaginatesDetailRows(t *testing.T) {
+	idx, srcIdx := mustSiteWithOneInvalidPage(t)
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "validate_site", map[string]any{"limit": 1, "offset": 0, "include_valid": true})
+	if res.IsError {
+		t.Fatalf("validate_site returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if pagesChecked, _ := data["pages_checked"].(float64); pagesChecked != 2 {
+		t.Fatalf("pages_checked = %v, want 2 (full scan scope unaffected by limit)", pagesChecked)
+	}
+	pages, _ := data["pages"].([]any)
+	if len(pages) != 1 {
+		t.Fatalf("pages = %v, want exactly 1 detail row for limit=1", pages)
+	}
+	if hasMore, _ := data["has_more"].(bool); !hasMore {
+		t.Fatal("has_more = false, want true (1 more page beyond limit=1)")
+	}
+}
+
+func TestValidateSiteCanonicalizesSectionIndexSlugs(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("content/_index.en.md", "---\n---\n")
+	write("content/posts/_index.fr.md", "---\n---\n")
+
+	src, err := hugosite.NewSourceIndex(filepath.Join(root, "content"))
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	idx := mustTestIndex(t)
+	cfg := config.Default()
+	cfg.ContentRoot = filepath.Join(root, "content")
+	cfg.HugoRoot = root
+	session, done := newTestClientWithCfg(t, idx, cfg, src)
+	defer done()
+
+	res := callTool(t, session, "validate_site", map[string]any{"include_valid": true, "limit": 10, "offset": 0})
+	if res.IsError {
+		t.Fatalf("validate_site returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	pages, _ := data["pages"].([]any)
+	if len(pages) != 2 {
+		t.Fatalf("validate_site pages = %v, want 2", pages)
+	}
+	got := map[string]bool{}
+	for _, raw := range pages {
+		page, _ := raw.(map[string]any)
+		got[asString(t, page["slug"])] = true
+	}
+	if !got["/"] {
+		t.Fatalf("validate_site slugs = %v, want canonical root slug /", got)
+	}
+	if !got["/posts/"] {
+		t.Fatalf("validate_site slugs = %v, want canonical section slug /posts/", got)
+	}
+}
+
+func TestGetSiteHealthTaxonomyInconsistencyDetailsIncludeAffectedPages(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/a/index.md", "---\ntitle: A\ncategories: [security]\n---\n")
+	write("posts/b/index.md", "---\ntitle: B\ncategories: [securite]\n---\n")
+	src, err := hugosite.NewSourceIndex(root)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	idx := mustTestIndex(t)
+	session, done := newTestClientWithSourceIndex(t, idx, src)
+	defer done()
+
+	res := callTool(t, session, "get_site_health", map[string]any{})
+	if res.IsError {
+		t.Fatalf("get_site_health returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	strs, ok := data["taxonomy_inconsistencies"].([]any)
+	if !ok || len(strs) == 0 {
+		t.Fatalf("get_site_health: taxonomy_inconsistencies = %#v, want at least one legacy string entry (#210/#328 backward compat)", data["taxonomy_inconsistencies"])
+	}
+	details, ok := data["taxonomy_inconsistency_details"].([]any)
+	if !ok || len(details) == 0 {
+		t.Fatalf("get_site_health: taxonomy_inconsistency_details = %#v, want at least one structured entry (#324)", data["taxonomy_inconsistency_details"])
+	}
+	if len(details) != len(strs) {
+		t.Fatalf("get_site_health: %d structured details vs %d legacy strings, want same count and order", len(details), len(strs))
+	}
+	detail, ok := details[0].(map[string]any)
+	if !ok {
+		t.Fatalf("get_site_health: taxonomy_inconsistency_details[0] = %T, want map", details[0])
+	}
+	for _, field := range []string{"message", "term_a", "term_b", "pages_with_term_a", "pages_with_term_b"} {
+		if _, present := detail[field]; !present {
+			t.Errorf("get_site_health: taxonomy_inconsistency_details[0] missing %q", field)
+		}
+	}
+	pagesA, _ := detail["pages_with_term_a"].([]any)
+	pagesB, _ := detail["pages_with_term_b"].([]any)
+	if len(pagesA) == 0 && len(pagesB) == 0 {
+		t.Fatal("get_site_health: taxonomy_inconsistency_details[0] has no affected pages on either side — the actionability #324 asked for")
+	}
+}
+
+// TestGetSiteHealthTranslationPairInfoFindingDoesNotMoveScore covers #419:
+// a translation_pair finding (info severity) must not affect score or
+// score_breakdown.taxonomy.issues at all — only score_breakdown.taxonomy.
+// advisories, which exists precisely so an agent can see the finding was
+// counted but intentionally excluded from the score.
+func TestGetSiteHealthTranslationPairInfoFindingDoesNotMoveScore(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/a/index.en.md", "---\ntitle: A\ndate: 2026-07-01\ntags: [security]\n---\n")
+	write("posts/a/index.fr.md", "---\ntitle: A\ndate: 2026-07-01\ntags: [sécurité]\n---\n")
+	src, err := hugosite.NewSourceIndex(root)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	idx := mustTestIndex(t)
+	session, done := newTestClientWithSourceIndex(t, idx, src)
+	defer done()
+
+	res := callTool(t, session, "get_site_health", map[string]any{})
+	if res.IsError {
+		t.Fatalf("get_site_health returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+
+	score, _ := data["score"].(float64)
+	if score != 100 {
+		t.Fatalf("score = %v, want 100 (a translation_pair finding must not penalize score)", score)
+	}
+	details, _ := data["taxonomy_inconsistency_details"].([]any)
+	if len(details) == 0 {
+		t.Fatal("taxonomy_inconsistency_details is empty, want the security/sécurité translation_pair finding")
+	}
+	detail := details[0].(map[string]any)
+	if detail["kind"] != "translation_pair" {
+		t.Fatalf("taxonomy_inconsistency_details[0].kind = %v, want translation_pair", detail["kind"])
+	}
+	if detail["severity"] != "info" {
+		t.Fatalf("taxonomy_inconsistency_details[0].severity = %v, want info", detail["severity"])
+	}
+	breakdown, ok := data["score_breakdown"].(map[string]any)
+	if !ok {
+		t.Fatalf("score_breakdown missing or wrong type: %#v", data["score_breakdown"])
+	}
+	taxonomy := breakdown["taxonomy"].(map[string]any)
+	if issues, _ := taxonomy["issues"].(float64); issues != 0 {
+		t.Fatalf("score_breakdown.taxonomy.issues = %v, want 0 (info findings aren't issues)", issues)
+	}
+	if advisories, _ := taxonomy["advisories"].(float64); advisories != 1 {
+		t.Fatalf("score_breakdown.taxonomy.advisories = %v, want 1", advisories)
+	}
+	if taxScore, _ := taxonomy["score"].(float64); taxScore != 100 {
+		t.Fatalf("score_breakdown.taxonomy.score = %v, want 100", taxScore)
+	}
+	// #591/#761: the same info-severity finding must also surface at the top
+	// level via advisories_count, so an agent reading only status/score
+	// doesn't miss it without drilling into score_breakdown. The score stays
+	// 100, but a pure translation_pair is informational only and must not
+	// degrade the top-level health wording.
+	if advisoriesCount, _ := data["advisories_count"].(float64); advisoriesCount != 1 {
+		t.Fatalf("data.advisories_count = %v, want 1", advisoriesCount)
+	}
+	if actionable, _ := data["actionable_taxonomy_findings_count"].(float64); actionable != 0 {
+		t.Fatalf("actionable_taxonomy_findings_count = %v, want 0 for translation_pair", actionable)
+	}
+	if translations, _ := data["translation_pairs_detected"].(float64); translations != 1 {
+		t.Fatalf("translation_pairs_detected = %v, want 1", translations)
+	}
+	if data["content_status"] != "healthy" {
+		t.Fatalf("data.content_status = %v, want healthy", data["content_status"])
+	}
+	if data["status"] != "degraded" {
+		t.Fatalf("data.status = %v, want degraded because this taxonomy-only fixture has no matching public output", data["status"])
+	}
+}
+
+// TestGetSiteHealthPossibleDuplicateWarningReducesCategoryScoreOnly covers
+// #419: a warning-severity finding (possible_duplicate) applies a real,
+// visible penalty within score_breakdown.taxonomy.score — proving the
+// field isn't decorative — but per the issue's own scope note ("not a
+// scoring algorithm change") must NOT move the top-level `score`, which is
+// still computed exactly as it was before #419 (frontmatter signals only).
+func TestGetSiteHealthPossibleDuplicateWarningReducesCategoryScoreOnly(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/a/index.md", "---\ntitle: A\ndate: 2026-07-01\ntags: [postmortem]\n---\n")
+	write("posts/b/index.md", "---\ntitle: B\ndate: 2026-07-01\ntags: [post-mortems]\n---\n")
+	src, err := hugosite.NewSourceIndex(root)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	idx := mustTestIndex(t)
+	session, done := newTestClientWithSourceIndex(t, idx, src)
+	defer done()
+
+	res := callTool(t, session, "get_site_health", map[string]any{})
+	if res.IsError {
+		t.Fatalf("get_site_health returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+
+	contentStatus, _ := data["content_status"].(string)
+	if contentStatus != "healthy_with_advisories" {
+		t.Fatalf("content_status = %q, want healthy_with_advisories", contentStatus)
+	}
+	if status, _ := data["status"].(string); status != "degraded" {
+		t.Fatalf("status = %q, want degraded because this taxonomy-only fixture has no matching public output", status)
+	}
+	score, _ := data["score"].(float64)
+	if score != 99 {
+		t.Fatalf("score = %v, want 99 — actionable taxonomy warnings must no longer coexist with a perfect score (#719)", score)
+	}
+	breakdown := data["score_breakdown"].(map[string]any)
+	taxonomy := breakdown["taxonomy"].(map[string]any)
+	if issues, _ := taxonomy["issues"].(float64); issues != 1 {
+		t.Fatalf("score_breakdown.taxonomy.issues = %v, want 1", issues)
+	}
+	if weight, _ := taxonomy["weight"].(float64); weight != 0 {
+		t.Fatalf("score_breakdown.taxonomy.weight = %v, want 0 (taxonomy never contributes to the top-level score)", weight)
+	}
+	if taxScore, _ := taxonomy["score"].(float64); taxScore >= 100 {
+		t.Fatalf("score_breakdown.taxonomy.score = %v, want < 100 (the finding must show up somewhere, even though it doesn't move the top-level score)", taxScore)
+	}
+	// #591: advisories_count counts ALL taxonomy findings regardless of
+	// severity (unlike score_breakdown.taxonomy.advisories, which is
+	// info-only) — a warning-severity possible_duplicate finding must still
+	// be counted here, since it's just as invisible to status/score as an
+	// info-severity one.
+	if advisoriesCount, _ := data["advisories_count"].(float64); advisoriesCount != 1 {
+		t.Fatalf("data.advisories_count = %v, want 1 (this fixture's warning-severity finding must still be counted)", advisoriesCount)
+	}
+	if actionable, _ := data["actionable_taxonomy_findings_count"].(float64); actionable != 1 {
+		t.Fatalf("actionable_taxonomy_findings_count = %v, want 1 for a warning-severity finding", actionable)
+	}
+	if translations, present := data["translation_pairs_detected"]; present && translations != float64(0) {
+		t.Fatalf("translation_pairs_detected = %v, want omitted or 0 without translation pairs", translations)
+	}
+}
+
+// TestGetSiteHealthAdvisoriesCountIncludesCasingVariant is a regression test
+// for the #591 review finding that an info-only definition of
+// advisories_count would report 0 for a site with only casing-drift
+// findings — exactly the "3 casing advisories" motivating case this field
+// exists to surface (Infrastructure/infrastructure same-language drift).
+func TestGetSiteHealthAdvisoriesCountIncludesCasingVariant(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/a/index.md", "---\ntitle: A\ndate: 2026-07-01\ncategories: [Infrastructure]\n---\n")
+	write("posts/b/index.md", "---\ntitle: B\ndate: 2026-07-01\ncategories: [infrastructure]\n---\n")
+	src, err := hugosite.NewSourceIndex(root)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	idx := mustTestIndex(t)
+	session, done := newTestClientWithSourceIndex(t, idx, src)
+	defer done()
+
+	res := callTool(t, session, "get_site_health", map[string]any{})
+	if res.IsError {
+		t.Fatalf("get_site_health returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+
+	details, _ := data["taxonomy_inconsistency_details"].([]any)
+	if len(details) == 0 {
+		t.Fatal("taxonomy_inconsistency_details is empty, want the Infrastructure/infrastructure casing_variant finding")
+	}
+	detail := details[0].(map[string]any)
+	if detail["kind"] != "casing_variant" {
+		t.Fatalf("taxonomy_inconsistency_details[0].kind = %v, want casing_variant", detail["kind"])
+	}
+	if data["content_status"] != "healthy_with_advisories" {
+		t.Fatalf("data.content_status = %v, want healthy_with_advisories", data["content_status"])
+	}
+	if data["status"] != "degraded" {
+		t.Fatalf("data.status = %v, want degraded because this taxonomy-only fixture has no matching public output", data["status"])
+	}
+	advisoriesCount, _ := data["advisories_count"].(float64)
+	if advisoriesCount != 1 {
+		t.Fatalf("data.advisories_count = %v, want 1 — a casing_variant (warning-severity) finding must be counted, not just info-severity translation_pair findings", advisoriesCount)
+	}
+
+	// response_mode=compact only reshapes meta (ShapeSuccessOutput) — a
+	// populated top-level scalar like advisories_count must survive it.
+	compactRes := callTool(t, session, "get_site_health", map[string]any{"response_mode": "compact"})
+	if compactRes.IsError {
+		t.Fatalf("get_site_health (compact) returned error: %v", compactRes.Content)
+	}
+	compactData := decodeContent(t, compactRes)
+	compactAdvisoriesCount, _ := compactData["advisories_count"].(float64)
+	if compactAdvisoriesCount != 1 {
+		t.Fatalf("compact mode: data.advisories_count = %v, want 1 (must survive response_mode=compact)", compactAdvisoriesCount)
+	}
+}
+
+// TestGetSiteHealthFrontmatterIssueReducesScore covers #419's acceptance
+// criterion of "an error/critical finding that changes status": a
+// frontmatter validation error is this server's only category that has
+// ever driven `status` (unchanged by #419), and one missing-date page
+// already drops it from "healthy" to "degraded" under the pre-existing
+// formula (a missing field is flagged twice — once by the free-text check,
+// once by the raw front-matter-key check — for 20 points of penalty);
+// that's pre-existing behavior this PR doesn't touch.
+func TestGetSiteHealthFrontmatterIssueReducesScore(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/a/index.md", "---\ntitle: A\ndate: 2026-07-01\n---\n")
+	write("posts/b/index.md", "---\ntitle: B\n---\n") // missing date: a real frontmatter finding
+	src, err := hugosite.NewSourceIndex(root)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	idx := mustTestIndex(t)
+	session, done := newTestClientWithSourceIndex(t, idx, src)
+	defer done()
+
+	res := callTool(t, session, "get_site_health", map[string]any{})
+	if res.IsError {
+		t.Fatalf("get_site_health returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+
+	status, _ := data["status"].(string)
+	if status != "degraded" {
+		t.Fatalf("status = %q, want degraded (one missing-date finding is enough to change status under the pre-existing formula)", status)
+	}
+	score, _ := data["score"].(float64)
+	if score >= 100 {
+		t.Fatalf("score = %v, want < 100 (a frontmatter finding must apply a real penalty)", score)
+	}
+	breakdown := data["score_breakdown"].(map[string]any)
+	frontmatter := breakdown["frontmatter"].(map[string]any)
+	if weight, _ := frontmatter["weight"].(float64); weight != 100 {
+		t.Fatalf("score_breakdown.frontmatter.weight = %v, want 100 (it's the sole driver of the top-level score)", weight)
+	}
+	if fmScore, _ := frontmatter["score"].(float64); fmScore != score {
+		t.Fatalf("score_breakdown.frontmatter.score = %v, want to equal top-level score %v (weight=100 means they must reconcile exactly)", fmScore, score)
+	}
+}
+
+// TestGetSiteHealthURLShapedTitleNeverReportsHealthy is the #1105 regression
+// test for the incident that prompted it: during a live v1.8.6 verification
+// sweep, a page's title field was corrupted to its own raw canonical URL
+// (#1099), and get_site_health kept reporting status:"healthy", score:100
+// through it, because a non-empty title already satisfies the pre-existing
+// "missing title" frontmatter check — nothing else ever looked at what the
+// title's own text actually was. This pins that a URL-shaped title now
+// surfaces as its own score_breakdown category and forces status away from
+// "healthy"/"healthy_with_advisories" regardless of the numeric score,
+// exactly the case that reported clean before.
+func TestGetSiteHealthURLShapedTitleNeverReportsHealthy(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Every other signal is perfect: valid frontmatter, no taxonomy findings
+	// — the only defect is the corrupted title, exactly #1099's shape.
+	write("posts/a/index.md", "---\ntitle: \"https://www.arleo.eu/en/posts/a/\"\ndate: 2026-07-01\n---\n")
+	src, err := hugosite.NewSourceIndex(root)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	idx := mustTestIndex(t)
+	session, done := newTestClientWithSourceIndex(t, idx, src)
+	defer done()
+
+	res := callTool(t, session, "get_site_health", map[string]any{})
+	if res.IsError {
+		t.Fatalf("get_site_health returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+
+	// content_status (not the top-level status) isolates the source/content
+	// health signal from this fixture's unrelated public_output_incomplete
+	// baseline (mustTestIndex's public index doesn't contain this test's
+	// source page) — see contentEnvelopeData.ContentStatus's doc comment.
+	contentStatus, _ := data["content_status"].(string)
+	if contentStatus == "healthy" || contentStatus == "healthy_with_advisories" {
+		t.Fatalf("content_status = %q, want anything but healthy/healthy_with_advisories while a title is a raw URL (#1099's exact incident shape)", contentStatus)
+	}
+	// #719/#1066 established that a perfect 100 alongside a real content
+	// defect is misleading; a URL-shaped title is at least as severe as the
+	// cases those precedents cover, so it must cap score the same way.
+	if score, _ := data["score"].(float64); score >= 100 {
+		t.Fatalf("score = %v, want < 100 while a title is a raw URL", score)
+	}
+
+	badPages, _ := data["bad_title_shape_pages"].([]any)
+	if len(badPages) != 1 || badPages[0] != "posts/a" {
+		t.Fatalf("bad_title_shape_pages = %v, want [posts/a]", badPages)
+	}
+
+	breakdown := data["score_breakdown"].(map[string]any)
+	titleShape, ok := breakdown["title_shape"].(map[string]any)
+	if !ok {
+		t.Fatal("score_breakdown.title_shape missing")
+	}
+	if score, _ := titleShape["score"].(float64); score != 0 {
+		t.Fatalf("score_breakdown.title_shape.score = %v, want 0", score)
+	}
+	if issues, _ := titleShape["issues"].(float64); issues != 1 {
+		t.Fatalf("score_breakdown.title_shape.issues = %v, want 1", issues)
+	}
+}
+
+// TestGetSiteHealthOrdinaryTitleDoesNotTriggerTitleShapeFinding guards
+// against a too-broad detector: an ordinary title that merely contains a
+// URL-like substring, or mentions "http" in prose, must not be flagged —
+// only a title that IS a bare URL (the #1099 shape) should be.
+func TestGetSiteHealthOrdinaryTitleDoesNotTriggerTitleShapeFinding(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/a/index.md", "---\ntitle: \"How to self-host at https://example.com safely\"\ndate: 2026-07-01\n---\n")
+	src, err := hugosite.NewSourceIndex(root)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	idx := mustTestIndex(t)
+	session, done := newTestClientWithSourceIndex(t, idx, src)
+	defer done()
+
+	res := callTool(t, session, "get_site_health", map[string]any{})
+	if res.IsError {
+		t.Fatalf("get_site_health returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+
+	if _, present := data["bad_title_shape_pages"]; present {
+		t.Fatalf("bad_title_shape_pages = %v, want omitted for a title that merely mentions a URL", data["bad_title_shape_pages"])
+	}
+	contentStatus, _ := data["content_status"].(string)
+	if contentStatus != "healthy" {
+		t.Fatalf("content_status = %q, want healthy — a title mentioning a URL is not the #1099 defect shape", contentStatus)
+	}
+}
+
+// TestCheckAIReadinessDescriptionScopeCaveat is the #865 contract test for
+// aligning check_ai_readiness's name with its actual (structural, not
+// editorial) scope: the description must state that a pass means the page is
+// structurally well-formed, NOT substantive, so an agent does not over-read
+// a positive result. This wording fix must not silently regress.
+func TestCheckAIReadinessDescriptionScopeCaveat(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+	for i := range tools.Tools {
+		if tools.Tools[i].Name != "check_ai_readiness" {
+			continue
+		}
+		desc := tools.Tools[i].Description
+		for _, want := range []string{"structurally", "NOT that it is substantive", "not editorial"} {
+			if !strings.Contains(desc, want) {
+				t.Errorf("check_ai_readiness description missing %q:\n%s", want, desc)
+			}
+		}
+		return
+	}
+	t.Fatal("check_ai_readiness tool not found")
+}
+
+func TestExtendedReadAnnotations(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+	got := map[string]*mcp.Tool{}
+	for i := range tools.Tools {
+		got[tools.Tools[i].Name] = tools.Tools[i]
+	}
+	for _, name := range []string{"search_content", "explain_structure", "get_site_health", "get_broken_links", "diff_page", "validate_frontmatter", "validate_site"} {
+		tool, ok := got[name]
+		if !ok {
+			t.Fatalf("missing tool %q", name)
+		}
+		assertObjectSchema(t, tool, "inputSchema")
+		assertObjectSchema(t, tool, "outputSchema")
+		assertSchemaHasProperties(t, tool, "outputSchema", "success", "data", "errors", "warnings", "meta")
+		if tool.Annotations == nil || !tool.Annotations.ReadOnlyHint {
+			t.Fatalf("tool %q: ReadOnlyHint not set", name)
+		}
+		if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint {
+			t.Fatalf("tool %q: DestructiveHint should be false", name)
+		}
+		if !tool.Annotations.IdempotentHint {
+			t.Fatalf("tool %q: IdempotentHint should be true", name)
+		}
+		if tool.Annotations.OpenWorldHint == nil || *tool.Annotations.OpenWorldHint {
+			t.Fatalf("tool %q: OpenWorldHint should be false", name)
+		}
+	}
+	for _, tc := range []struct {
+		tool       string
+		keys       []string
+		noTopLevel []string
+	}{
+		{tool: "get_page_markdown", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"page"}},
+		{tool: "get_page_frontmatter", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"frontmatter"}},
+		{tool: "get_related_content", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"translations", "related_pages", "backlinks", "suggested_links", "empty_reason", "impact"}},
+		{tool: "build_agent_context", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"context"}},
+		{tool: "export_agent_context", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"export", "pages", "total", "limit", "offset", "returned_count", "has_more", "next_offset", "include_body"}},
+		{tool: "search_content", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"pages", "total", "limit", "offset", "returned_count", "has_more", "next_offset", "sort", "order", "query", "type", "tag", "category", "language"}},
+		{tool: "explain_structure", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"summary", "sections", "languages", "recent_pages", "notes"}},
+		{tool: "get_site_health", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"status", "score", "score_breakdown", "published_pages", "source_pages", "draft_pages", "tags", "categories", "missing_titles", "missing_dates", "validation_errors", "taxonomy_inconsistencies", "taxonomy_inconsistency_details", "orphan_pages"}},
+		{tool: "get_broken_links", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"links", "broken_links", "total_pages", "limit", "offset"}},
+		{tool: "get_backlinks", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"slug", "count", "backlinks"}},
+		{tool: "suggest_links", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"slug", "total", "translations", "suggested_links", "empty_reason"}},
+		{tool: "diff_page", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"slug", "path", "resolved_lang", "resolved_source_path", "status", "diff_available", "fallback_mode", "base_commit", "head_commit", "diff", "source_content"}},
+		{tool: "validate_frontmatter", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"pages", "pages_checked", "pages_passed", "invalid", "returned_count", "limit", "offset", "has_more", "next_offset"}},
+		{tool: "validate_site", keys: []string{"success", "data", "errors", "warnings", "meta"}, noTopLevel: []string{"pages", "pages_checked", "pages_passed", "invalid", "returned_count", "limit", "offset", "has_more", "next_offset"}},
+	} {
+		tool, ok := got[tc.tool]
+		if !ok {
+			t.Fatalf("missing tool %q", tc.tool)
+		}
+		assertSchemaHasProperties(t, tool, "outputSchema", tc.keys...)
+		assertSchemaHasProperties(t, tool, "outputSchema.meta", "generated_at", "release_version", "content_provenance")
+		assertSchemaLacksProperties(t, tool, "outputSchema", tc.noTopLevel...)
+	}
+	assertSchemaHasProperties(t, got["get_site_health"], "outputSchema.data",
+		"status", "content_status", "runtime_degraded", "runtime_degraded_reasons",
+		"published_pages", "source_pages", "publishable_source_pages", "publishable_content_pages", "section_index_pages",
+		"missing_public_pages", "public_output_complete", "publication_coverage")
+	assertSchemaHasProperties(t, got["get_site_health"], "outputSchema.data.publication_coverage",
+		"source_documents", "publishable_content_sources", "section_index_sources", "other_excluded_sources",
+		"published_content_pages", "missing_publishable_content_pages", "completeness_basis",
+		"counters_directly_comparable", "complete")
+	for _, path := range []string{
+		"outputSchema.data.source_pages",
+		"outputSchema.data.publishable_source_pages",
+		"outputSchema.data.publishable_content_pages",
+		"outputSchema.data.section_index_pages",
+		"outputSchema.data.published_pages",
+		"outputSchema.data.public_output_complete",
+		"outputSchema.data.publication_coverage",
+		"outputSchema.data.publication_coverage.completeness_basis",
+		"outputSchema.data.publication_coverage.counters_directly_comparable",
+		"outputSchema.data.publication_coverage.complete",
+	} {
+		assertSchemaHasDescription(t, got["get_site_health"], path)
+	}
+}
+
+func assertReadPageState(t *testing.T, raw any, source, build, public, index string) {
+	t.Helper()
+	state, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("state type = %T", raw)
+	}
+	if got := state["source_state"]; got != source {
+		t.Fatalf("source_state = %v, want %q", got, source)
+	}
+	if got := state["build_state"]; got != build {
+		t.Fatalf("build_state = %v, want %q", got, build)
+	}
+	if got := state["public_state"]; got != public {
+		t.Fatalf("public_state = %v, want %q", got, public)
+	}
+	if got := state["index_state"]; got != index {
+		t.Fatalf("index_state = %v, want %q", got, index)
+	}
+}
+
+func assertObjectSchema(t *testing.T, tool *mcp.Tool, field string) {
+	t.Helper()
+	var schema any
+	switch field {
+	case "inputSchema":
+		schema = tool.InputSchema
+	case "outputSchema":
+		schema = tool.OutputSchema
+	default:
+		t.Fatalf("unknown schema field %q", field)
+	}
+	if schema == nil {
+		t.Fatalf("tool %q: %s is nil", tool.Name, field)
+	}
+	m, ok := schema.(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q: %s type = %T, want map[string]any", tool.Name, field, schema)
+	}
+	if m["type"] != "object" {
+		t.Fatalf("tool %q: %s.type = %v, want object", tool.Name, field, m["type"])
+	}
+}
+
+func assertSchemaHasProperties(t *testing.T, tool *mcp.Tool, field string, want ...string) {
+	t.Helper()
+	schema := schemaAt(t, tool, field)
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q: %s.properties type = %T, want map[string]any", tool.Name, field, schema["properties"])
+	}
+	for _, key := range want {
+		if _, ok := props[key]; !ok {
+			t.Fatalf("tool %q: %s.properties missing %q", tool.Name, field, key)
+		}
+	}
+}
+
+func assertSchemaLacksProperties(t *testing.T, tool *mcp.Tool, field string, wantAbsent ...string) {
+	t.Helper()
+	schema := schemaAt(t, tool, field)
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q: %s.properties type = %T, want map[string]any", tool.Name, field, schema["properties"])
+	}
+	for _, key := range wantAbsent {
+		if _, ok := props[key]; ok {
+			t.Fatalf("tool %q: %s.properties unexpectedly contains %q", tool.Name, field, key)
+		}
+	}
+}
+
+func assertSchemaHasDescription(t *testing.T, tool *mcp.Tool, field string) {
+	t.Helper()
+	schema := schemaAt(t, tool, field)
+	if description, _ := schema["description"].(string); strings.TrimSpace(description) == "" {
+		t.Fatalf("tool %q: %s has no published description", tool.Name, field)
+	}
+}
+
+func schemaAt(t *testing.T, tool *mcp.Tool, field string) map[string]any {
+	t.Helper()
+	parts := strings.Split(field, ".")
+	var current any
+	switch parts[0] {
+	case "inputSchema":
+		current = tool.InputSchema
+	case "outputSchema":
+		current = tool.OutputSchema
+	default:
+		t.Fatalf("unknown schema field %q", field)
+	}
+	for _, part := range parts[1:] {
+		m, ok := current.(map[string]any)
+		if !ok {
+			t.Fatalf("tool %q: schema path %q type = %T, want map[string]any", tool.Name, field, current)
+		}
+		props, ok := m["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("tool %q: schema path %q missing properties map", tool.Name, field)
+		}
+		current, ok = props[part]
+		if !ok {
+			t.Fatalf("tool %q: schema path %q missing property %q", tool.Name, field, part)
+		}
+	}
+	m, ok := current.(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q: schema path %q final type = %T, want map[string]any", tool.Name, field, current)
+	}
+	return m
+}
+
+func TestExplainSiteStructureUsesSourceIndexCategories(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	srcIdx := mustTestSourceIndex(t)
+	wantCats := len(srcIdx.AllCategories())
+	if wantCats == 0 {
+		t.Fatal("test precondition: source index must have at least one category")
+	}
+
+	res := callTool(t, session, "explain_structure", map[string]any{})
+	if res.IsError {
+		t.Fatalf("explain_structure returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	gotCats, ok := data["categories"].(float64)
+	if !ok {
+		t.Fatalf("explain_structure categories type = %T, value = %v", data["categories"], data["categories"])
+	}
+	if int(gotCats) != wantCats {
+		t.Fatalf("explain_structure categories = %d, want %d (source index count)", int(gotCats), wantCats)
+	}
+}
+
+func TestExplainSiteStructureRecentPagesUseSourceCategories(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "explain_structure", map[string]any{})
+	if res.IsError {
+		t.Fatalf("explain_structure returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	recentPages, ok := data["recent_pages"].([]any)
+	if !ok {
+		t.Fatalf("recent_pages type = %T", data["recent_pages"])
+	}
+	for _, raw := range recentPages {
+		page, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("recent page type = %T", raw)
+		}
+		if page["slug"] != "/posts/hello/" {
+			continue
+		}
+		cats, ok := page["categories"].([]any)
+		if !ok {
+			t.Fatalf("categories type = %T", page["categories"])
+		}
+		if len(cats) != 1 || cats[0] != "tutorials" {
+			t.Fatalf("recent page categories = %#v, want [tutorials]", cats)
+		}
+		terms, ok := page["category_terms"].([]any)
+		if !ok {
+			t.Fatalf("category_terms type = %T", page["category_terms"])
+		}
+		if len(terms) != 1 {
+			t.Fatalf("category_terms = %#v, want one normalized term", terms)
+		}
+		term := terms[0].(map[string]any)
+		if term["slug"] != "tutorials" || term["label"] != "Tutorials" || term["source"] != "tutorials" {
+			t.Fatalf("category_terms[0] = %#v, want tutorials normalized term", term)
+		}
+		return
+	}
+	t.Fatal("recent_pages does not include /posts/hello/ test fixture")
+}
+
+func TestExplainSiteStructureCompactOmitsRecentPagesExamples(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "explain_structure", map[string]any{"response_mode": "compact"})
+	if res.IsError {
+		t.Fatalf("explain_structure compact returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if _, present := data["recent_pages"]; present {
+		t.Fatalf("explain_structure compact unexpectedly includes recent_pages: %#v", data["recent_pages"])
+	}
+	if _, present := data["notes"]; present {
+		t.Fatalf("explain_structure compact unexpectedly includes notes: %#v", data["notes"])
+	}
+	if _, ok := data["summary"].(string); !ok {
+		t.Fatalf("explain_structure compact summary missing: %#v", data["summary"])
+	}
+}
+
+func TestExplainSiteStructureRecentPagesUseSourceCategoriesForLanguagePrefixedSlug(t *testing.T) {
+	contentRoot := t.TempDir()
+	pageDir := filepath.Join(contentRoot, "posts", "hello")
+	if err := os.MkdirAll(pageDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pageDir, "index.md"), []byte("---\ntitle: Hello\ntags:\n  - Hugo\ncategories:\n  - tutorials\n---\nBody\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+	siteRoot := t.TempDir()
+	publicDir := filepath.Join(siteRoot, "en", "posts", "hello")
+	if err := os.MkdirAll(publicDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll publicDir: %v", err)
+	}
+	publicHTML := `<!doctype html>
+<html lang="en">
+<head>
+  <title>Hello</title>
+  <meta name="description" content="Rendered summary">
+  <link rel="canonical" href="https://example.test/en/posts/hello/">
+</head>
+<body><article>Hello</article></body>
+</html>`
+	if err := os.WriteFile(filepath.Join(publicDir, "index.html"), []byte(publicHTML), 0o644); err != nil {
+		t.Fatalf("WriteFile public HTML: %v", err)
+	}
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "explain_structure", map[string]any{})
+	if res.IsError {
+		t.Fatalf("explain_structure returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	recentPages, ok := data["recent_pages"].([]any)
+	if !ok || len(recentPages) != 1 {
+		t.Fatalf("recent_pages = %#v, want one page", data["recent_pages"])
+	}
+	page := recentPages[0].(map[string]any)
+	cats, ok := page["categories"].([]any)
+	if !ok {
+		t.Fatalf("categories type = %T", page["categories"])
+	}
+	if len(cats) != 1 || cats[0] != "tutorials" {
+		t.Fatalf("language-prefixed recent page categories = %#v, want [tutorials]", cats)
+	}
+}
+
+// TestExplainSiteStructureSectionsExcludeLanguagePrefix is a regression test
+// for #459: a non-default-language page's slug carries its language route
+// prefix (e.g. /en/posts/hello/ on an fr-default site), which must not be
+// reported as if "en" were itself a content section.
+func TestExplainSiteStructureSectionsExcludeLanguagePrefix(t *testing.T) {
+	siteRoot := t.TempDir()
+	write := func(rel, raw string) {
+		full := filepath.Join(siteRoot, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(raw), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("posts/bonjour/index.html", `<!doctype html><html lang="fr"><head>
+<title>Bonjour</title>
+<link rel="canonical" href="https://example.test/posts/bonjour/">
+</head><body><article>Bonjour</article></body></html>`)
+	write("en/posts/hello/index.html", `<!doctype html><html lang="en"><head>
+<title>Hello</title>
+<link rel="canonical" href="https://example.test/en/posts/hello/">
+</head><body><article>Hello</article></body></html>`)
+
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "fr"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "explain_structure", map[string]any{})
+	if res.IsError {
+		t.Fatalf("explain_structure returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	sections, ok := data["sections"].([]any)
+	if !ok {
+		t.Fatalf("explain_structure sections type = %T", data["sections"])
+	}
+	var sawPosts, sawEn bool
+	var postsCount float64
+	for _, raw := range sections {
+		sec, _ := raw.(map[string]any)
+		switch sec["name"] {
+		case "posts":
+			sawPosts = true
+			postsCount, _ = sec["count"].(float64)
+		case "en":
+			sawEn = true
+		}
+	}
+	if sawEn {
+		t.Fatalf("explain_structure sections = %v, must not report the language prefix 'en' as a section", sections)
+	}
+	if !sawPosts {
+		t.Fatalf("explain_structure sections = %v, want 'posts' counted for both the fr and en pages", sections)
+	}
+	if postsCount != 2 {
+		t.Fatalf("explain_structure posts count = %v, want 2 (fr + en pages both merged under posts)", postsCount)
+	}
+	languages, _ := data["languages"].([]any)
+	var sawEnLang bool
+	for _, l := range languages {
+		if l == "en" {
+			sawEnLang = true
+		}
+	}
+	if !sawEnLang {
+		t.Fatalf("explain_structure languages = %v, want 'en' surfaced there instead", languages)
+	}
+}
+
+func TestExplainSiteStructureRecentPagesPreferSourceCategoriesOverStalePublicCategories(t *testing.T) {
+	contentRoot := t.TempDir()
+	pageDir := filepath.Join(contentRoot, "posts", "hello")
+	if err := os.MkdirAll(pageDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pageDir, "index.md"), []byte("---\ntitle: Hello\ncategories:\n  - tutorials\n---\nBody\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	siteRoot := t.TempDir()
+	publicDir := filepath.Join(siteRoot, "posts", "hello")
+	if err := os.MkdirAll(publicDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll publicDir: %v", err)
+	}
+	publicHTML := `<!doctype html>
+<html lang="en">
+<head>
+  <title>Hello</title>
+  <meta name="description" content="Rendered summary">
+  <meta name="keywords" content="LegacyCat">
+  <link rel="canonical" href="https://example.test/posts/hello/">
+</head>
+<body><article>Hello</article></body>
+</html>`
+	if err := os.WriteFile(filepath.Join(publicDir, "index.html"), []byte(publicHTML), 0o644); err != nil {
+		t.Fatalf("WriteFile public HTML: %v", err)
+	}
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "explain_structure", map[string]any{})
+	if res.IsError {
+		t.Fatalf("explain_structure returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	recentPages, ok := data["recent_pages"].([]any)
+	if !ok || len(recentPages) != 1 {
+		t.Fatalf("recent_pages = %#v, want one page", data["recent_pages"])
+	}
+	page := recentPages[0].(map[string]any)
+	cats, ok := page["categories"].([]any)
+	if !ok {
+		t.Fatalf("categories type = %T", page["categories"])
+	}
+	if len(cats) != 1 || cats[0] != "tutorials" {
+		t.Fatalf("stale public categories should be overridden by source categories, got %#v", cats)
+	}
+}
+
+func TestExplainSiteStructureRecentPagesPreferEmptySourceCategoriesOverStalePublicCategories(t *testing.T) {
+	contentRoot := t.TempDir()
+	pageDir := filepath.Join(contentRoot, "posts", "hello")
+	if err := os.MkdirAll(pageDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pageDir, "index.md"), []byte("---\ntitle: Hello\n---\nBody\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex: %v", err)
+	}
+
+	siteRoot := t.TempDir()
+	publicDir := filepath.Join(siteRoot, "posts", "hello")
+	if err := os.MkdirAll(publicDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll publicDir: %v", err)
+	}
+	publicHTML := `<!doctype html>
+<html lang="en">
+<head>
+  <title>Hello</title>
+  <meta name="description" content="Rendered summary">
+  <meta name="keywords" content="LegacyCat">
+  <link rel="canonical" href="https://example.test/posts/hello/">
+</head>
+<body><article>Hello</article></body>
+</html>`
+	if err := os.WriteFile(filepath.Join(publicDir, "index.html"), []byte(publicHTML), 0o644); err != nil {
+		t.Fatalf("WriteFile public HTML: %v", err)
+	}
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+	cfg.MaxIndexEntries = 1000
+	cfg.RejectSymlinks = true
+	cfg.RejectHiddenPath = true
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+
+	session, done := newTestClientWithSourceIndex(t, idx, srcIdx)
+	defer done()
+
+	res := callTool(t, session, "explain_structure", map[string]any{})
+	if res.IsError {
+		t.Fatalf("explain_structure returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	recentPages, ok := data["recent_pages"].([]any)
+	if !ok || len(recentPages) != 1 {
+		t.Fatalf("recent_pages = %#v, want one page", data["recent_pages"])
+	}
+	page := recentPages[0].(map[string]any)
+	cats, ok := page["categories"].([]any)
+	if !ok {
+		t.Fatalf("categories type = %T", page["categories"])
+	}
+	if len(cats) != 0 {
+		t.Fatalf("empty source categories should override stale public categories, got %#v", cats)
+	}
+}
+
+func TestBuildAgentContextRelatedPagesMatchSitemap(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	// /posts/hello has HTML-indexed tags ["Hugo", "Read-only"]; /posts/bonjour also has "Hugo".
+	// Without the fix, build_agent_context would use source-merged tags (["go", "hugo"]) which
+	// do not case-match the HTML-indexed "Hugo" in the sitemap, yielding empty related_pages.
+	// With the fix, the raw public tags are used for matching, so bonjour is found.
+	res := callTool(t, session, "build_agent_context", map[string]any{"slug": "/posts/hello"})
+	if res.IsError {
+		t.Fatalf("build_agent_context returned error: %v", res.Content)
+	}
+	m := decodeContent(t, res)
+	ctx, ok := m["context"].(map[string]any)
+	if !ok {
+		t.Fatalf("build_agent_context context type = %T", m["context"])
+	}
+	related, ok := ctx["related_pages"].([]any)
+	if !ok {
+		t.Fatalf("build_agent_context related_pages type = %T", ctx["related_pages"])
+	}
+	if len(related) == 0 {
+		t.Fatal("build_agent_context: expected non-empty related_pages (bonjour shares 'Hugo' tag via HTML index)")
+	}
+}
+
+func TestGetBrokenLinks(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_broken_links", map[string]any{"limit": 5, "offset": 0})
+	if res.IsError {
+		t.Fatalf("get_broken_links returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if _, ok := data["total_pages"]; !ok {
+		t.Fatal("get_broken_links missing total_pages")
+	}
+	if _, ok := data["broken_links"]; !ok {
+		t.Fatal("get_broken_links missing broken_links")
+	}
+}
+
+func TestGetBrokenLinksPublishesDocumentsScannedAsCanonicalCount(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "get_broken_links", map[string]any{"limit": 5, "offset": 0})
+	if res.IsError {
+		t.Fatalf("get_broken_links returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	documentsScanned, ok := data["documents_scanned"]
+	if !ok {
+		t.Fatal("get_broken_links missing documents_scanned")
+	}
+	if got, want := documentsScanned, data["total_pages"]; got != want {
+		t.Fatalf("get_broken_links documents_scanned = %v, want alias-equal total_pages %v", got, want)
+	}
+	if _, ok := data["content_pages"]; !ok {
+		t.Fatal("get_broken_links missing content_pages")
+	}
+	if _, ok := data["taxonomy_pages"]; !ok {
+		t.Fatal("get_broken_links missing taxonomy_pages")
+	}
+	if _, ok := data["section_pages"]; !ok {
+		t.Fatal("get_broken_links missing section_pages")
+	}
+	if _, ok := data["other_documents"]; !ok {
+		t.Fatal("get_broken_links missing other_documents")
+	}
+}
+
+func TestValidateFrontMatterOutputFields(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "validate_frontmatter", map[string]any{"limit": 1, "offset": 0})
+	if res.IsError {
+		t.Fatalf("validate_frontmatter returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if _, ok := data["pages_checked"]; !ok {
+		t.Fatal("validate_frontmatter: pages_checked field missing (was 'total')")
+	}
+	if _, ok := data["pages_passed"]; !ok {
+		t.Fatal("validate_frontmatter: pages_passed field missing (was 'valid')")
+	}
+	if _, ok := data["invalid"]; !ok {
+		t.Fatal("validate_frontmatter: invalid field missing")
+	}
+	if _, ok := data["total"]; ok {
+		t.Fatal("validate_frontmatter: old 'total' field must not be present")
+	}
+	if _, ok := data["valid"]; ok {
+		t.Fatal("validate_frontmatter: old 'valid' field must not be present")
+	}
+	pagesChecked := int(data["pages_checked"].(float64))
+	pagesPassed := int(data["pages_passed"].(float64))
+	invalid := int(data["invalid"].(float64))
+	if pagesPassed+invalid != pagesChecked {
+		t.Fatalf("aggregate counters are paginated: pages_passed(%d)+invalid(%d) != pages_checked(%d)", pagesPassed, invalid, pagesChecked)
+	}
+	pages := data["pages"].([]any)
+	if len(pages) != 1 {
+		t.Fatalf("limit=1 should return exactly one page detail, got %d", len(pages))
+	}
+}
+
+func TestValidateFrontMatterDTOHasLangField(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "validate_frontmatter", map[string]any{})
+	if res.IsError {
+		t.Fatalf("validate_frontmatter returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	pages, ok := data["pages"].([]any)
+	if !ok || len(pages) == 0 {
+		t.Skip("no pages in validate_frontmatter output; cannot check DTO shape")
+	}
+	firstDTO, ok := pages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("validate_frontmatter pages[0] type = %T", pages[0])
+	}
+	if _, ok := firstDTO["lang"]; !ok {
+		t.Fatal("validate_frontmatter page DTO: 'lang' field missing")
+	}
+}
+
+func TestValidateFrontMatterValidPageReturnsEmptyIssuesArray(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	res := callTool(t, session, "validate_frontmatter", map[string]any{"limit": 10, "offset": 0})
+	if res.IsError {
+		t.Fatalf("validate_frontmatter returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	pages, ok := data["pages"].([]any)
+	if !ok || len(pages) == 0 {
+		t.Fatal("validate_frontmatter missing page rows")
+	}
+	firstDTO, ok := pages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("validate_frontmatter pages[0] type = %T", pages[0])
+	}
+	issues, ok := firstDTO["issues"].([]any)
+	if !ok {
+		t.Fatalf("validate_frontmatter pages[0].issues type = %T, want []any", firstDTO["issues"])
+	}
+	if len(issues) != 0 {
+		t.Fatalf("validate_frontmatter pages[0].issues = %#v, want empty array", issues)
+	}
+}
+
+func assertReadPaginationMetadata(t *testing.T, m map[string]any, total, limit, offset, returned int, hasMore bool, nextOffset int, hasNextOffset bool) {
+	t.Helper()
+
+	if got := int(m["total"].(float64)); got != total {
+		t.Fatalf("total = %d, want %d", got, total)
+	}
+	if got := int(m["limit"].(float64)); got != limit {
+		t.Fatalf("limit = %d, want %d", got, limit)
+	}
+	if got := int(m["offset"].(float64)); got != offset {
+		t.Fatalf("offset = %d, want %d", got, offset)
+	}
+	if got := int(m["returned_count"].(float64)); got != returned {
+		t.Fatalf("returned_count = %d, want %d", got, returned)
+	}
+	if got := m["has_more"].(bool); got != hasMore {
+		t.Fatalf("has_more = %v, want %v", got, hasMore)
+	}
+	gotNext, ok := m["next_offset"]
+	if hasNextOffset {
+		if !ok {
+			t.Fatal("next_offset missing")
+		}
+		if got := int(gotNext.(float64)); got != nextOffset {
+			t.Fatalf("next_offset = %d, want %d", got, nextOffset)
+		}
+		return
+	}
+	if ok {
+		t.Fatalf("next_offset = %v, want omitted", gotNext)
+	}
+}
+
+// TestNegativeLimitRejectedAcrossReadTools mirrors
+// internal/tools/anonymous.TestNegativeLimitRejectedAcrossTools for the
+// read package's own limit-accepting tools (#641): a negative limit must
+// be rejected with invalid_params, while limit: 0 must keep meaning "use
+// the default" (clampLimit's existing, documented behavior) rather than
+// becoming an error too.
+func TestNegativeLimitRejectedAcrossReadTools(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	cases := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"get_related_content", map[string]any{"slug": "/posts/hello", "limit": -1}},
+		{"export_agent_context", map[string]any{"limit": -1}},
+		{"search_content", map[string]any{"query": "hello", "limit": -1}},
+		{"get_broken_links", map[string]any{"limit": -1}},
+		{"suggest_links", map[string]any{"tags": []any{"hugo"}, "limit": -1}},
+	}
+	for _, tc := range cases {
+		res := callTool(t, session, tc.tool, tc.args)
+		if !res.IsError {
+			t.Errorf("%s limit=-1: expected invalid_params error, got success", tc.tool)
+			continue
+		}
+		raw, _ := json.Marshal(res.Content)
+		if !strings.Contains(string(raw), "invalid_params") {
+			t.Errorf("%s limit=-1 error = %s, want invalid_params", tc.tool, raw)
+		}
+	}
+
+	zeroCases := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"get_related_content", map[string]any{"slug": "/posts/hello", "limit": 0}},
+		{"export_agent_context", map[string]any{"limit": 0}},
+		{"search_content", map[string]any{"query": "hello", "limit": 0}},
+		{"get_broken_links", map[string]any{"limit": 0}},
+		{"suggest_links", map[string]any{"tags": []any{"hugo"}, "limit": 0}},
+	}
+	for _, tc := range zeroCases {
+		res := callTool(t, session, tc.tool, tc.args)
+		if res.IsError {
+			t.Errorf("%s limit=0: expected success (0 means use default), got error: %v", tc.tool, res.Content)
+		}
+	}
+}
+
+// TestNegativeOffsetRejectedAcrossReadTools is the offset counterpart (#885)
+// of TestNegativeLimitRejectedAcrossReadTools: a negative offset was silently
+// clamped to the first page instead of surfacing the caller's likely
+// pagination-arithmetic bug. offset: 0 stays valid (it is the first page).
+func TestNegativeOffsetRejectedAcrossReadTools(t *testing.T) {
+	idx := mustTestIndex(t)
+	session, done := newTestClient(t, idx)
+	defer done()
+
+	cases := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"export_agent_context", map[string]any{"offset": -1}},
+		{"search_content", map[string]any{"query": "hello", "offset": -1}},
+		{"get_broken_links", map[string]any{"offset": -1}},
+		{"validate_frontmatter", map[string]any{"offset": -1}},
+		{"validate_site", map[string]any{"offset": -1}},
+	}
+	for _, tc := range cases {
+		res := callTool(t, session, tc.tool, tc.args)
+		if !res.IsError {
+			t.Errorf("%s offset=-1: expected invalid_params error, got success", tc.tool)
+			continue
+		}
+		raw, _ := json.Marshal(res.Content)
+		if !strings.Contains(string(raw), "invalid_params") {
+			t.Errorf("%s offset=-1 error = %s, want invalid_params", tc.tool, raw)
+		}
+	}
+
+	zeroCases := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"export_agent_context", map[string]any{"offset": 0}},
+		{"search_content", map[string]any{"query": "hello", "offset": 0}},
+		{"get_broken_links", map[string]any{"offset": 0}},
+		{"validate_frontmatter", map[string]any{"offset": 0}},
+		{"validate_site", map[string]any{"offset": 0}},
+	}
+	for _, tc := range zeroCases {
+		res := callTool(t, session, tc.tool, tc.args)
+		if res.IsError {
+			t.Errorf("%s offset=0: expected success (first page), got error: %v", tc.tool, res.Content)
+		}
+	}
+}

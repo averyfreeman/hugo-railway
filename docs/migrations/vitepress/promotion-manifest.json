@@ -1,0 +1,42 @@
+{
+  "completed_on": "2026-10-08",
+  "source_repository": "../merged-portfolio-blog-site",
+  "source_repository_modified": false,
+  "public_content": {
+    "published_posts": 71,
+    "recovered_published_posts": 70,
+    "later_explicitly_published_posts": 1,
+    "case_studies": 5,
+    "public_repositories": 60,
+    "pinned_repositories": 6,
+    "repository_previews": 57,
+    "about_and_skills_pages": 2
+  },
+  "canonical_routes": {
+    "blog": "/posts/",
+    "case_studies": "/case-studies/<slug>/",
+    "portfolio": "/portfolio/",
+    "profile": ["/about/", "/skills/"],
+    "policy_stub": "/policy/"
+  },
+  "preserved_media_paths": [
+    "/wp-content/uploads/",
+    "/post-thumbnails/",
+    "/repository-previews/"
+  ],
+  "excluded_public_content": [
+    "Three policy notes pending an explicit content decision",
+    "Policy thumbnail assets"
+  ],
+  "removed_temporary_public_routes": [
+    "/articles_2/",
+    "/projects_2/",
+    "/about_2/",
+    "/skills_2/",
+    "/policy_2/",
+    "/vitepress-migration/"
+  ],
+  "research_demo_preserved_at": "themes/railway-cv/examples/signal-cv-research-demo/",
+  "repository_projection": "data/portfolio/repositories.json",
+  "content_boundary_decision": "Source docs/adr/0003-public-content-boundary.md; target docs/adr/0005-hiring-first-hugo-portfolio.md"
+}

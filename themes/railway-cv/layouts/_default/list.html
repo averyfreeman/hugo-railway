@@ -1,0 +1,21 @@
+{{ define "main" }}
+  <section class="archive page-shell">
+    <header class="archive__header">
+      <p class="eyebrow">INDEX / {{ .Section | upper }}</p>
+      <h1>{{ .Title }}</h1>
+      {{ with .Description }}<p class="lede">{{ . }}</p>{{ end }}
+    </header>
+    {{ if .Pages }}
+      <div class="archive__grid">
+        {{ range .Pages.ByDate.Reverse }}
+          {{ partial "content-card.html" . }}
+        {{ end }}
+      </div>
+    {{ else }}
+      <div class="empty-state card signal-surface">
+        <span class="status-dot"></span>
+        <p>No research resources have been published here yet.</p>
+      </div>
+    {{ end }}
+  </section>
+{{ end }}

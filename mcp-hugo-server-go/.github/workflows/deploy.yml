@@ -1,0 +1,384 @@
+name: Deploy to Production
+
+# Manual promotion workflow. Triggered by the maintainer after CI passes.
+# Requires approval from the production environment's configured reviewer
+# before the self-hosted deployment step runs.
+#
+# Two modes, selected by whether `release_version` is set:
+#   - release_version empty: ad-hoc mainline deploy only (a hotfix ahead of
+#     the next release, for example). Behavior unchanged from before this
+#     workflow absorbed release.yml — build, test, deploy, smoke test, done.
+#   - release_version set: a full release. Gates on CHANGELOG.md/
+#     npm/package.json/manifest.json already carrying that version *before*
+#     touching anything (that prep — writing the release notes — is a
+#     separate, normally-reviewed PR merged to main first, not something
+#     this workflow generates), then builds, tests, deploys, and — once the
+#     deploy succeeds — tags, publishes the GitHub release, attaches
+#     binaries + the .mcpb bundle, and publishes to npm (publish-npm.yml,
+#     invoked as a reusable workflow once the release's binaries are
+#     confirmed attached). One `workflow_dispatch` call now produces a
+#     fully consistent release: binary live, tag pushed, GitHub release
+#     published, npm package published, version numbers matching everywhere.
+#
+# Required secrets (configure in repo Settings → Secrets → Actions):
+#   PRODUCTION_URL       — Base URL of the MCP server (e.g. https://mcp.arleo.eu)
+#   MCP_ACCESS_TOKEN     — Bearer token for post-deploy smoke test
+#   DEPLOY_HEARTBEAT_URL — Optional. A heartbeat monitor URL (e.g. BetterStack)
+#                          pinged after this deploy — unsuffixed on success,
+#                          with /fail appended on any failure in the deploy
+#                          job. Treat it as a secret: anyone holding it can
+#                          spam pings and mask real incidents or trigger false
+#                          ones, so it lives only here, never in a committed
+#                          file or a public doc. Leave unset to skip pinging.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to deploy (branch, tag, or SHA). Default: main'
+        required: true
+        default: main
+        type: string
+      release_version:
+        description: 'Release to cut (e.g. v1.7.9). Leave empty for an ad-hoc mainline deploy with no tag/GitHub release. When set, CHANGELOG.md/npm/package.json/manifest.json must already carry this version on the target ref, checked before anything else runs.'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Dry run — build and validate only, skip production deployment and release'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Build and test
+    runs-on: ubuntu-latest
+    outputs:
+      build_version: ${{ steps.meta.outputs.build_version }}
+      build_sha: ${{ steps.meta.outputs.build_sha }}
+      release_version: ${{ steps.meta.outputs.release_version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      build_channel: ${{ steps.meta.outputs.build_channel }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Fetch main for ancestry check
+        run: git fetch origin main --tags --prune
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      # Fail fast, before any build/deploy work, when cutting a real release:
+      # the release-notes PR (CHANGELOG.md entry + version bumps) must already
+      # be merged. This workflow deliberately never writes that content itself
+      # — release notes need a human/agent's judgment about what actually
+      # shipped, not commit-message concatenation, and auto-committing version
+      # bumps mid-deploy would be a bigger blast radius than this gate.
+      - name: Release-notes gate
+        if: inputs.release_version != ''
+        run: |
+          VERSION="${{ inputs.release_version }}"
+          go run ./cmd/check-changelog -version "$VERSION"
+          go run ./cmd/check-readme-release
+          WANT_BARE="${VERSION#v}"
+          PKG_VERSION="$(node -p "require('./npm/package.json').version")"
+          if [ "$PKG_VERSION" != "$WANT_BARE" ]; then
+            echo "npm/package.json version ($PKG_VERSION) does not match release_version ($VERSION) — merge the changelog/version-bump PR first." >&2
+            exit 1
+          fi
+          MANIFEST_VERSION="$(node -p "require('./manifest.json').version")"
+          if [ "$MANIFEST_VERSION" != "$WANT_BARE" ]; then
+            echo "manifest.json version ($MANIFEST_VERSION) does not match release_version ($VERSION) — merge the changelog/version-bump PR first." >&2
+            exit 1
+          fi
+
+      - name: Resolve build metadata
+        id: meta
+        run: |
+          BUILD_SHA="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$BUILD_SHA" "origin/main"; then
+            echo "Ref ${BUILD_SHA} is not reachable from origin/main; production deploys must target a main commit" >&2
+            exit 1
+          fi
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          EXPLICIT_RELEASE="${{ inputs.release_version }}"
+          if [ -n "$EXPLICIT_RELEASE" ]; then
+            # Deploy-before-tag: the release-notes gate above already
+            # confirmed CHANGELOG.md/package.json/manifest.json agree on
+            # this version; the tag itself is created by the release job
+            # below, after this deploy succeeds.
+            BUILD_VERSION="$EXPLICIT_RELEASE"
+            RELEASE_VERSION="$EXPLICIT_RELEASE"
+            BUILD_CHANNEL="release"
+          elif TAG_NAME="$(git describe --tags --exact-match 2>/dev/null)"; then
+            BUILD_VERSION="$TAG_NAME"
+            RELEASE_VERSION="$TAG_NAME"
+            BUILD_CHANNEL="release"
+          else
+            BUILD_VERSION="main-$SHORT_SHA"
+            # Ad-hoc mainline deploy: no release_version input and no exact
+            # tag on this ref. Reports build_channel=main / release_version
+            # empty rather than guessing a release identity.
+            RELEASE_VERSION=""
+            BUILD_CHANNEL="main"
+          fi
+          COMMIT="$SHORT_SHA"
+          echo "build_sha=$BUILD_SHA" >> "$GITHUB_OUTPUT"
+          echo "build_version=$BUILD_VERSION" >> "$GITHUB_OUTPUT"
+          echo "release_version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "build_channel=$BUILD_CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "Resolved build_sha=$BUILD_SHA"
+          echo "Resolved build_version=$BUILD_VERSION"
+
+      - name: Build binary (linux/amd64)
+        run: |
+          GOOS=linux GOARCH=amd64 go build \
+            -ldflags "-X github.com/jmrGrav/mcp-hugo-server-go/internal/buildinfo.Version=${{ steps.meta.outputs.build_version }} -X github.com/jmrGrav/mcp-hugo-server-go/internal/buildinfo.ReleaseVersion=${{ steps.meta.outputs.release_version }} -X github.com/jmrGrav/mcp-hugo-server-go/internal/buildinfo.Commit=${{ steps.meta.outputs.commit }} -X github.com/jmrGrav/mcp-hugo-server-go/internal/buildinfo.BuildChannel=${{ steps.meta.outputs.build_channel }}" \
+            -o mcp-hugo-server-go \
+            ./cmd/mcp-hugo-server-go/
+
+      - name: Unit tests
+        run: go test ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mcp-hugo-server-go-linux-amd64
+          path: mcp-hugo-server-go
+          retention-days: 1
+
+  deploy:
+    name: Deploy to production server
+    if: inputs.dry_run == 'false'
+    runs-on: self-hosted
+    needs: validate
+    timeout-minutes: 15
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Download binary
+        uses: actions/download-artifact@v8
+        with:
+          name: mcp-hugo-server-go-linux-amd64
+
+      - name: Deploy binary + restart service
+        run: |
+          chmod 755 mcp-hugo-server-go
+          sudo mv mcp-hugo-server-go /usr/local/bin/mcp-hugo-server-go
+          sudo chmod 755 /usr/local/bin/mcp-hugo-server-go
+          sudo systemctl restart mcp-hugo-server-go
+          echo "Waiting for service to stabilise..."
+          sleep 5
+          sudo systemctl is-active mcp-hugo-server-go
+          echo "Deployed SHA: ${{ needs.validate.outputs.build_sha }}"
+          echo "Version: $(/usr/local/bin/mcp-hugo-server-go --version)"
+          {
+            echo "## Production deployment"
+            echo ""
+            echo "- build_sha: \`${{ needs.validate.outputs.build_sha }}\`"
+            echo "- build_version: \`${{ needs.validate.outputs.build_version }}\`"
+            echo "- service_version: \`$(/usr/local/bin/mcp-hugo-server-go --version)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post-deploy smoke (build and edge integrity)
+        env:
+          MCP_SMOKE_LIVE: "1"
+          MCP_BASE_URL: ${{ secrets.PRODUCTION_URL }}
+          MCP_ACCESS_TOKEN: ${{ secrets.MCP_ACCESS_TOKEN }}
+          MCP_WRITE_ACCESS_TOKEN: ${{ secrets.MCP_WRITE_ACCESS_TOKEN }}
+          MCP_SMOKE_VERIFY_WRITE_CATALOGUE: "1"
+          MCP_SMOKE_DELAY: "3"
+          # This workflow runs after the binary has been installed and the
+          # production environment approval has been granted. Exercise the
+          # real systemd sandbox, atomic output swap, callbacks, public index,
+          # and Cloudflare-facing EN/FR routes rather than stopping at a
+          # read-only MCP handshake (#986).
+          MCP_SMOKE_VERIFY_DEPLOY: "1"
+        run: bash scripts/smoke-mcp-live.sh
+
+  # Reports pipeline health, not just the deploy job's own steps: an
+  # `if: failure()` step *inside* deploy only ever sees deploy's own steps —
+  # if `validate` fails (unit tests, go vet, release-notes gate — the most
+  # likely failure modes) or the production environment approval is never
+  # granted, `deploy` is skipped entirely and such a step would never run,
+  # leaving the monitor to go red on its own dead-man's-switch timer with no
+  # explanation. This job runs unconditionally (`if: always()`) and reads
+  # both upstream jobs' results explicitly instead.
+  #
+  # Scope: covers validate+deploy, i.e. "did the binary reach production and
+  # pass its smoke test" — not the downstream `release` job (tag push,
+  # GitHub release, npm publish). A deploy that lands cleanly but fails to
+  # publish an npm package is not what this heartbeat is watching for.
+  heartbeat_report:
+    name: Heartbeat — report pipeline result
+    if: always() && inputs.dry_run == 'false'
+    needs: [validate, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping heartbeat monitor
+        env:
+          HEARTBEAT_URL: ${{ secrets.DEPLOY_HEARTBEAT_URL }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: |
+          set +x
+          if [ -z "$HEARTBEAT_URL" ]; then
+            exit 0
+          fi
+          url="${HEARTBEAT_URL%/}"
+          if [ "$VALIDATE_RESULT" = "success" ] && [ "$DEPLOY_RESULT" = "success" ]; then
+            curl -fsS --max-time 10 -o /dev/null "$url" || echo "heartbeat ping failed (non-blocking)"
+          else
+            curl -fsS --max-time 10 -o /dev/null "$url/fail" || echo "heartbeat fail-ping failed (non-blocking)"
+          fi
+
+  release:
+    name: Tag and publish release
+    if: inputs.dry_run == 'false' && inputs.release_version != ''
+    needs: [validate, deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Extract release notes from changelog
+        run: go run ./cmd/extract-changelog-release -version "${{ inputs.release_version }}" > /tmp/release-notes.md
+
+      - name: Ensure tag state is valid
+        env:
+          VERSION: ${{ inputs.release_version }}
+          BUILD_SHA: ${{ needs.validate.outputs.build_sha }}
+        run: |
+          REMOTE_TAG_SHA="$(git ls-remote --tags origin "refs/tags/${VERSION}^{}" | awk '{print $1}')"
+          if [[ -n "$REMOTE_TAG_SHA" && "$REMOTE_TAG_SHA" != "$BUILD_SHA" ]]; then
+            echo "Tag ${VERSION} already exists on a different commit: ${REMOTE_TAG_SHA}" >&2
+            exit 1
+          fi
+
+      - name: Create and push annotated tag if missing
+        env:
+          VERSION: ${{ inputs.release_version }}
+          BUILD_SHA: ${{ needs.validate.outputs.build_sha }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "Tag ${VERSION} already exists on the correct commit; skipping tag creation."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${VERSION}" "${BUILD_SHA}" -m "${VERSION}"
+          git push origin "refs/tags/${VERSION}"
+
+      - name: Create GitHub release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.release_version }}
+        run: |
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "GitHub release ${VERSION} already exists; skipping release creation."
+            exit 0
+          fi
+          gh release create "${VERSION}" \
+            --verify-tag \
+            --title "${VERSION}" \
+            --notes-file /tmp/release-notes.md
+
+      # Builds and attaches macOS/Windows/Linux binaries (#782 Phase 2/4) to
+      # the release created above. .goreleaser.yaml's release.mode is
+      # keep-existing, so this only uploads artifacts to that already-created
+      # release — it never writes its own release notes or creates a second
+      # release.
+      - name: Build and attach release binaries via GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GORELEASER_CURRENT_TAG: ${{ inputs.release_version }}
+
+      # Packs and attaches a .mcpb bundle (#782 Phase 2/5) to the release,
+      # so nobody ever needs to build one locally again. Uses the darwin
+      # and windows binaries GoReleaser just attached above (not a local
+      # build), and .mcpbignore (repo root) to keep the bundle scoped to
+      # exactly what manifest.json references — without it, `mcpb pack`
+      # bundles the entire repo (~340 files) instead of the 5 it needs.
+      # manifest.json's version was already verified to match by the
+      # release-notes gate in the validate job, so no patching needed here.
+      #
+      # Not signed: `mcpb sign --self-signed` was confirmed broken as of
+      # mcpb@2.1.2 (reports success but writes nothing to the file; a
+      # manually-crafted cert.pem/key.pem does get a signature block
+      # appended, but `mcpb verify`/`mcpb info` still report "not signed"
+      # on that same file — a real upstream bug, not something fixable
+      # here). Revisit once that's fixed upstream. A self-signed cert
+      # wouldn't remove Claude Desktop's "unverified publisher" warning
+      # anyway — only Directory submission (Phase 5) does that.
+      - name: Pack .mcpb bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.release_version }}
+        run: |
+          mkdir -p server
+          curl -sSL -o server/mcp-hugo-server-go \
+            "https://github.com/${{ github.repository }}/releases/download/${VERSION}/mcp-hugo-server-go_darwin_amd64"
+          curl -sSL -o server/mcp-hugo-server-go.exe \
+            "https://github.com/${{ github.repository }}/releases/download/${VERSION}/mcp-hugo-server-go_windows_amd64.exe"
+          chmod +x server/mcp-hugo-server-go
+          npm install -g @anthropic-ai/mcpb
+          mcpb pack . "mcp-hugo-server-go-${VERSION#v}.mcpb"
+          gh release upload "${VERSION}" "mcp-hugo-server-go-${VERSION#v}.mcpb" --repo "${{ github.repository }}"
+
+  publish-npm:
+    name: Publish npm package
+    if: inputs.dry_run == 'false' && inputs.release_version != ''
+    needs: release
+    uses: ./.github/workflows/publish-npm.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      version: ${{ inputs.release_version }}
+    secrets: inherit
+
+  dry-run:
+    name: Dry-run validation
+    if: inputs.dry_run == 'true'
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Dry-run notice
+        run: echo "Dry run requested — production deployment skipped. Binary validated successfully."

@@ -1,0 +1,14 @@
+{{ define "main" }}
+  <article class="content-page page-shell">
+    <header class="content-page__header">
+      <a class="back-link" href="{{ .Section | relURL }}">← Back to {{ .Section | title }}</a>
+      <p class="eyebrow">{{ .Section | upper }} / {{ .Date.Format "02 JAN 2006" }}</p>
+      <h1>{{ .Title }}</h1>
+      {{ with .Params.summary }}<p class="lede">{{ . }}</p>{{ end }}
+      {{ partial "content-meta.html" . }}
+    </header>
+    <div class="content-page__body prose">
+      {{ .Content }}
+    </div>
+  </article>
+{{ end }}

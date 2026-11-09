@@ -1,0 +1,524 @@
+{
+  "schema_version": "1.0",
+  "prepared": "2026-10-08",
+  "profile": {
+    "name": "Avery Freeman",
+    "positioning": "Systems-minded software builder connecting AI tools, infrastructure, data, business operations, and human workflows.",
+    "target_context": "AI software development and adjacent product engineering roles",
+    "summary": "Combines current self-directed work on agent workflows and developer tools with hands-on systems consulting, software and data projects, AV operations, business study, and client-facing team work.",
+    "evidence_refs": [
+      "github_profile",
+      "private_current_professional_records",
+      "private_education_records",
+      "private_owner_summary"
+    ]
+  },
+  "evidence_types": [
+    "operational_work",
+    "public_project",
+    "published_writing",
+    "coursework",
+    "self_directed_practice",
+    "transferable_experience"
+  ],
+  "top_ten": [
+    {
+      "rank": 1,
+      "skill": "Turn human needs into buildable scope",
+      "claim": "Connects a specific user need to product behavior, technical choices, and useful limits.",
+      "evidence_types": ["public_project", "coursework", "transferable_experience"],
+      "evidence_refs": ["repo_pleasevote", "private_business_and_research_work"],
+      "boundaries": ["Use project and coursework evidence; do not claim user counts, election outcomes, or measured impact without a source."]
+    },
+    {
+      "rank": 2,
+      "skill": "Design architecture teams can carry forward",
+      "claim": "Creates durable project context, architecture records, workflow rules, and validation paths for coding-agent projects.",
+      "evidence_types": ["public_project", "self_directed_practice"],
+      "evidence_refs": ["repo_git_bbq", "post_git_bbq_long_running"],
+      "boundaries": ["Git-BBQ is the direct public project example. Do not infer sole authorship of related repositories whose README credits another maintainer."]
+    },
+    {
+      "rank": 3,
+      "skill": "Shape multi-step agent workflows",
+      "claim": "Explores explicit task state, checkpoints, verification, recovery, and human control across work that spans multiple steps.",
+      "evidence_types": ["public_project", "self_directed_practice", "published_writing"],
+      "evidence_refs": ["repo_codex_long_running_tasks", "post_git_bbq_long_running"],
+      "boundaries": ["Describe as project work; do not imply enterprise-scale deployment."]
+    },
+    {
+      "rank": 4,
+      "skill": "Connect AI tools to real systems",
+      "claim": "Builds or adapts tool interfaces that connect coding assistants with operating-system and browser workflows.",
+      "evidence_types": ["public_project", "self_directed_practice"],
+      "evidence_refs": ["repo_ubuntu_mcp", "repo_devtools_mcp"],
+      "boundaries": ["codex-mcp-for-ubuntu is a fork adapted to Codex; describe the repair and adaptation, not original authorship of its upstream code."]
+    },
+    {
+      "rank": 5,
+      "skill": "Build software across languages and layers",
+      "claim": "Has public project examples spanning Go, Python, Rust, TypeScript, and application, service, CLI, and tool-integration surfaces.",
+      "evidence_types": ["public_project", "coursework"],
+      "evidence_refs": ["repo_git_bbq", "repo_airflow", "repo_nu_plugin_ipscan", "repo_devtools_mcp", "repo_cloudflare_inbox", "private_education_records"],
+      "boundaries": ["Projects establish hands-on breadth; they do not establish equal depth in every language."]
+    },
+    {
+      "rank": 6,
+      "skill": "Turn data into useful outputs",
+      "claim": "Builds data workflows and communicates analysis through validated publishing steps, maps, and charts.",
+      "evidence_types": ["public_project", "published_writing", "coursework"],
+      "evidence_refs": ["repo_airflow", "repo_geospatial", "post_geospatial", "private_education_records"],
+      "boundaries": ["The geospatial project supports analysis and visualization claims; do not claim policy impact."]
+    },
+    {
+      "rank": 7,
+      "skill": "Work across application and infrastructure boundaries",
+      "claim": "Connects application behavior, external APIs, operating systems, networks, storage, and deployment constraints.",
+      "evidence_types": ["public_project", "operational_work", "self_directed_practice"],
+      "evidence_refs": ["repo_pleasevote", "repo_cloudflare_inbox", "private_eastside_work"],
+      "boundaries": ["Public repositories show project architecture; infrastructure experience is owner-reported professional work."]
+    },
+    {
+      "rank": 8,
+      "skill": "Troubleshoot with reliability and security controls in view",
+      "claim": "Combines dependency repair and explicit tool permissions in software projects with operational infrastructure and PCI/DSS experience.",
+      "evidence_types": ["public_project", "operational_work", "self_directed_practice"],
+      "evidence_refs": ["repo_ubuntu_mcp", "private_eastside_work"],
+      "boundaries": ["PCI/DSS experience is owner-reported implementation and self-assessment work, not QSA certification or a security-audit credential."]
+    },
+    {
+      "rank": 9,
+      "skill": "Model business processes and practical value",
+      "claim": "Connects process design, staffing, scheduling, equipment, billing, pricing assumptions, and delivery requirements.",
+      "evidence_types": ["operational_work", "coursework", "transferable_experience"],
+      "evidence_refs": ["private_mayflower_work", "private_education_records", "repo_pleasevote"],
+      "boundaries": ["The AV rental estimate is potential annual revenue modeled from assumptions; it is not realized revenue. Scheduling savings are owner-reported."]
+    },
+    {
+      "rank": 10,
+      "skill": "Explain, teach, and support adoption",
+      "claim": "Writes practical procedures and guides, trains staff, coordinates customer-facing delivery, and adapts explanations to the audience.",
+      "evidence_types": ["operational_work", "published_writing", "transferable_experience"],
+      "evidence_refs": ["post_projector_guide", "post_sound_system_guide", "private_mayflower_work", "private_gaba_work"],
+      "boundaries": ["Prefer examples of a guide, training material, or audience adaptation over generic communication claims."]
+    }
+  ],
+  "skill_clusters": [
+    {
+      "name": "Product framing and requirements",
+      "capabilities": [
+        "Translate user and business needs into product behavior",
+        "Clarify requirements, use cases, assumptions, and operational constraints",
+        "Consider accessibility, source quality, adoption, cost, and support"
+      ],
+      "evidence_refs": ["repo_pleasevote", "repo_git_bbq", "private_business_and_research_work", "private_mayflower_work"]
+    },
+    {
+      "name": "Agent architecture and workflow design",
+      "capabilities": [
+        "Use project context, architecture decisions, and explicit workflow rules",
+        "Structure multi-step work around checkpoints, verification, and recovery",
+        "Design local-first and human-controlled developer tooling"
+      ],
+      "evidence_refs": ["repo_git_bbq", "repo_codex_long_running_tasks", "post_git_bbq_long_running"]
+    },
+    {
+      "name": "Software and tool integration",
+      "capabilities": [
+        "Build or adapt MCP servers, CLIs, API integrations, and browser tooling",
+        "Work across Go, Python, Rust, JavaScript, TypeScript, Bash, and SQL contexts",
+        "Connect application features to external data and operating-system capabilities"
+      ],
+      "evidence_refs": ["repo_ubuntu_mcp", "repo_devtools_mcp", "repo_git_bbq", "repo_nu_plugin_ipscan", "repo_pleasevote"]
+    },
+    {
+      "name": "Data engineering, analysis, and communication",
+      "capabilities": [
+        "Ingest, normalize, validate, and transform data",
+        "Use Pandas, GeoPandas, Matplotlib, SQL, and Airflow in project or coursework contexts",
+        "Present findings through maps, charts, and reviewed written outputs"
+      ],
+      "evidence_refs": ["repo_airflow", "repo_geospatial", "post_geospatial", "private_education_records"]
+    },
+    {
+      "name": "Infrastructure and operations",
+      "capabilities": [
+        "Support Linux and networked small-business systems",
+        "Work with virtualization, storage, networking, surveillance, remote support, and containers",
+        "Automate recurring system and data workflows"
+      ],
+      "evidence_refs": ["private_eastside_work", "post_old_tech", "post_router", "post_zfs_recovery"]
+    },
+    {
+      "name": "Security and reliability practices",
+      "capabilities": [
+        "Use explicit command and privilege boundaries in agent tools",
+        "Troubleshoot dependencies and legacy-system constraints",
+        "Implement PCI/DSS practices and complete owner-reported self-assessment cycles"
+      ],
+      "evidence_refs": ["repo_ubuntu_mcp", "private_eastside_work"]
+    },
+    {
+      "name": "Business operations and management",
+      "capabilities": [
+        "Develop procedures, training, schedules, pricing models, and equipment plans",
+        "Coordinate staffing, billing, inventory, clients, venues, and event requirements",
+        "Connect operational improvements to costs, capacity, and adoption"
+      ],
+      "evidence_refs": ["private_mayflower_work", "private_event_work", "private_education_records"]
+    },
+    {
+      "name": "Communication and learning",
+      "capabilities": [
+        "Explain complex financial, technical, and operational material for different audiences",
+        "Write reproducible technical and AV guides",
+        "Learn across business, audio, systems, software, and data domains"
+      ],
+      "evidence_refs": ["private_gaba_work", "private_owner_summary", "post_akai_audio", "post_projector_guide", "post_sound_system_guide"]
+    }
+  ],
+  "technology_inventory": [
+    {
+      "category": "AI, agent, and integration tools",
+      "items": ["OpenAI Codex", "Agent Skills", "Model Context Protocol", "Cloudflare Agents SDK", "Workers AI", "Playwright", "Apache Airflow", "local inference"],
+      "evidence_types": ["public_project", "self_directed_practice"],
+      "evidence_refs": ["repo_git_bbq", "repo_codex_long_running_tasks", "repo_ubuntu_mcp", "repo_devtools_mcp", "repo_cloudflare_inbox", "repo_airflow", "repo_local_inference"]
+    },
+    {
+      "category": "Programming and application development",
+      "items": ["Go", "Python", "Rust", "Nushell", "JavaScript", "TypeScript", "Node.js", "SQL", "PostgreSQL", "REST APIs"],
+      "evidence_types": ["public_project", "coursework"],
+      "evidence_refs": ["repo_git_bbq", "repo_airflow", "repo_geospatial", "repo_nu_plugin_ipscan", "repo_devtools_mcp", "repo_cloudflare_inbox", "repo_pleasevote", "private_education_records"]
+    },
+    {
+      "category": "Data analysis and visualization",
+      "items": ["Pandas", "GeoPandas", "Matplotlib", "Jupyter", "Excel/SQL data mining", "SAS statistical analysis"],
+      "evidence_types": ["public_project", "published_writing", "coursework"],
+      "evidence_refs": ["repo_geospatial", "post_geospatial", "private_education_records"]
+    },
+    {
+      "category": "Systems, networking, and delivery",
+      "items": ["Bash", "Linux", "SSH", "VMware vSphere", "Debian qemu-kvm", "Nginx", "OCI containers", "iSCSI", "wireless networking", "firewalls", "GitHub Actions", "CI/CD", "infrastructure automation"],
+      "evidence_types": ["operational_work", "public_project", "published_writing", "coursework"],
+      "evidence_refs": ["private_eastside_work", "private_education_records", "repo_git_bbq", "repo_codex_long_running_tasks", "post_old_tech", "post_router", "post_zfs_recovery", "post_nginx_devserver"]
+    },
+    {
+      "category": "Business, risk, and service operations",
+      "items": ["requirements analysis", "business analysis", "financial modeling", "process improvement", "PCI/DSS controls", "AV deployment", "event operations", "employee training", "client coordination", "adoption planning"],
+      "evidence_types": ["operational_work", "coursework", "transferable_experience"],
+      "evidence_refs": ["private_current_professional_records", "private_mayflower_work", "private_event_work", "private_education_records", "post_projector_guide", "post_sound_system_guide"]
+    }
+  ],
+  "career_timeline": [
+    {
+      "period": "Childhood / before college",
+      "milestone": "Early computer and audio interests; owner-authored summary says first desktop PC was assembled at age eight.",
+      "evidence_refs": ["private_owner_summary"],
+      "evidence_types": ["transferable_experience"],
+      "scope_note": "Personal origin context; not professional experience at that age."
+    },
+    {
+      "period": "1998–2002",
+      "milestone": "Studied liberal arts with an audio-engineering and electronic-music composition focus at The Evergreen State College.",
+      "evidence_refs": ["private_education_records", "private_early_timeline"],
+      "evidence_types": ["coursework", "transferable_experience"]
+    },
+    {
+      "period": "2001–2002",
+      "milestone": "Early campus IT support included workstation migration and Exchange transition tasks, according to the archival timeline.",
+      "evidence_refs": ["private_early_timeline"],
+      "evidence_types": ["operational_work"],
+      "scope_note": "Owner-reported archival timeline; keep distinct from later formal programming study."
+    },
+    {
+      "period": "2008–2009",
+      "milestone": "Worked as an executive language consultant in Tokyo, adapting financial and economic explanations for multinational business audiences.",
+      "evidence_refs": ["private_early_timeline", "private_owner_summary"],
+      "evidence_types": ["operational_work", "transferable_experience"]
+    },
+    {
+      "period": "2008–2011",
+      "milestone": "Completed MBA study in Management, including operations, marketing research, econometrics, and finance coursework.",
+      "evidence_refs": ["private_education_records", "private_early_timeline"],
+      "evidence_types": ["coursework"]
+    },
+    {
+      "period": "2010–2012",
+      "milestone": "Completed marketing-research and software-adoption analysis work, then additional accounting, SQL, data-architecture, Excel, and SAS study.",
+      "evidence_refs": ["private_early_timeline", "private_education_records", "private_owner_summary"],
+      "evidence_types": ["operational_work", "coursework"]
+    },
+    {
+      "period": "2016–present",
+      "milestone": "Owner-reported IT systems consulting across POS and payment systems, wireless, surveillance, virtualization, storage, remote access, controls, and automation.",
+      "evidence_refs": ["private_current_professional_records"],
+      "evidence_types": ["operational_work"],
+      "scope_note": "Dates and outcomes are owner-reported professional records."
+    },
+    {
+      "period": "2018 onward",
+      "milestone": "On-call banquet and event work involving event-order interpretation, staff coordination, customer needs, and changing delivery requirements.",
+      "evidence_refs": ["private_current_professional_records", "private_early_timeline"],
+      "evidence_types": ["operational_work", "transferable_experience"]
+    },
+    {
+      "period": "2021–2022",
+      "milestone": "Completed Full Stack JavaScript Web + Mobile Development coursework.",
+      "evidence_refs": ["private_education_records"],
+      "evidence_types": ["coursework"]
+    },
+    {
+      "period": "2023–2024",
+      "milestone": "Hotel banquet management and AV segment work included equipment and rate planning, billing, scheduling, inventory, procedures, and staff instruction.",
+      "evidence_refs": ["private_current_professional_records", "post_projector_guide", "post_sound_system_guide"],
+      "evidence_types": ["operational_work", "published_writing"],
+      "scope_note": "The $45,000 annual rental figure was a modeled potential based on $150 average rental/event × 25 events/month × 12; the 3–8 hours/week scheduling reduction is owner-reported."
+    },
+    {
+      "period": "2024",
+      "milestone": "Completed backend, SQL, and DevOps with Python coursework; the geospatial project is identified as an honors project.",
+      "evidence_refs": ["private_education_records", "repo_geospatial", "post_geospatial"],
+      "evidence_types": ["coursework", "public_project", "published_writing"]
+    },
+    {
+      "period": "2025–present",
+      "milestone": "Licensed process-service work and high-touch club dining keep careful procedure, trust, and reliable customer service part of current day-to-day work.",
+      "evidence_refs": ["private_current_professional_records"],
+      "evidence_types": ["operational_work", "transferable_experience"],
+      "scope_note": "Include as current human-facing operational experience; omit client identities, case details, and other private information."
+    },
+    {
+      "period": "2026–present",
+      "milestone": "Current public project and writing activity includes developer-agent workflows, MCP integrations, architecture context, and automation.",
+      "evidence_refs": ["repo_git_bbq", "repo_codex_long_running_tasks", "repo_ubuntu_mcp", "post_git_bbq_long_running"],
+      "evidence_types": ["public_project", "published_writing", "self_directed_practice"],
+      "scope_note": "Current self-directed AI development practice; no reviewed evidence of prior production AI employment."
+    }
+  ],
+  "claim_boundaries": [
+    "Describe AI and agent-tool work as current self-directed practice, not prior production AI employment.",
+    "Describe the Mayflower Park $45,000 figure as modeled potential annual revenue based on stated assumptions; do not claim it was realized.",
+    "Keep the reported 3–8 hours per week scheduling reduction attributed to owner records, not independent measurement.",
+    "Keep coursework and honors projects distinct from paid production software work.",
+    "Describe PCI/DSS work as owner-reported implementation and self-assessment experience, not QSA certification or a security-audit credential.",
+    "Describe codex-mcp-for-ubuntu as a fork repaired and adapted for Codex; do not claim authorship of upstream code.",
+    "Do not infer sole authorship of related repositories whose README credits another maintainer.",
+    "Do not publish contact details, private file names or paths, reference information, background or credit-check material, signatures, or third-party personal information."
+  ],
+  "sources": [
+    {
+      "id": "github_profile",
+      "type": "public_project",
+      "label": "Avery Freeman public repository profile",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman?tab=repositories"
+    },
+    {
+      "id": "repo_pleasevote",
+      "type": "public_project",
+      "label": "pleasevote README and repository",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/pleasevote"
+    },
+    {
+      "id": "repo_git_bbq",
+      "type": "public_project",
+      "label": "Git-BBQ README and repository",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/Git-BBQ"
+    },
+    {
+      "id": "repo_codex_long_running_tasks",
+      "type": "public_project",
+      "label": "Codex Long-Running Tasks repository",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/Codex-long-running-task-plugin"
+    },
+    {
+      "id": "repo_ubuntu_mcp",
+      "type": "public_project",
+      "label": "Codex-adapted Ubuntu MCP fork and README",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/codex-mcp-for-ubuntu"
+    },
+    {
+      "id": "repo_devtools_mcp",
+      "type": "public_project",
+      "label": "DevTools MCP LinkedIn Post repository",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/devtools-mcp-linkedin-post"
+    },
+    {
+      "id": "repo_airflow",
+      "type": "public_project",
+      "label": "Airflow AI/Search-to-Blog Article Pipeline repository",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/Airflow-AI_Search-to-Blog-Article-Pipeline"
+    },
+    {
+      "id": "repo_geospatial",
+      "type": "public_project",
+      "label": "Geospatial map of lobby funders repository",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/Geospatial-map-of-lobby-funders"
+    },
+    {
+      "id": "repo_nu_plugin_ipscan",
+      "type": "public_project",
+      "label": "Rust/Nushell IP scan plugin repository",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/nu_plugin_ipscan"
+    },
+    {
+      "id": "repo_cloudflare_inbox",
+      "type": "public_project",
+      "label": "Cloudflare Agentic Inbox repository",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/cloudflare-agentic-inbox",
+      "scope_note": "Describe as project work; do not imply deployment or production usage without separate evidence."
+    },
+    {
+      "id": "repo_local_inference",
+      "type": "public_project",
+      "label": "MLX-LM local inference server repository",
+      "visibility": "public",
+      "url": "https://github.com/averyfreeman/mlx-lm-ai",
+      "scope_note": "The profile description identifies it as a local inference server; do not imply production deployment."
+    },
+    {
+      "id": "post_git_bbq_long_running",
+      "type": "published_writing",
+      "label": "Git BBQ and Long-Running Tasks for Codex article",
+      "visibility": "public",
+      "url": "https://unixgreybeard.org/posts/2026/09/git-bbq-and-long-running-tasks-for-codex/"
+    },
+    {
+      "id": "post_geospatial",
+      "type": "published_writing",
+      "label": "Geospatial data visualization walkthrough",
+      "visibility": "public",
+      "url": "https://unixgreybeard.org/posts/2024/06/graphing-numbers-with-geospatial-boundaries-using-geopandas-and-matplotlib/"
+    },
+    {
+      "id": "post_old_tech",
+      "type": "published_writing",
+      "label": "Old Tech, New Tricks infrastructure article",
+      "visibility": "public",
+      "url": "https://unixgreybeard.org/posts/2024/11/old-tech-new-tricks/"
+    },
+    {
+      "id": "post_projector_guide",
+      "type": "published_writing",
+      "label": "Projector and sound-system setup guide",
+      "visibility": "public",
+      "url": "https://unixgreybeard.org/posts/2024/01/using-the-projector-connecting-projector-to-a-sound-system/"
+    },
+    {
+      "id": "post_sound_system_guide",
+      "type": "published_writing",
+      "label": "Plymouth Room sound-system guide",
+      "visibility": "public",
+      "url": "https://unixgreybeard.org/posts/2024/01/using-the-sound-system-in-plymouth-room/"
+    },
+    {
+      "id": "post_akai_audio",
+      "type": "published_writing",
+      "label": "AKAI sample CD workflow article",
+      "visibility": "public",
+      "url": "https://unixgreybeard.org/posts/2012/02/burn-akai-format-sample-cds-scd-akaiso-from-images-on-a-mac-works-with-emu-roland-kurtzweil-etc-too/"
+    },
+    {
+      "id": "post_router",
+      "type": "published_writing",
+      "label": "Linux router operations article",
+      "visibility": "public",
+      "url": "https://unixgreybeard.org/posts/2024/07/running-an-arch-linux-router-for-about-a-year/"
+    },
+    {
+      "id": "post_zfs_recovery",
+      "type": "published_writing",
+      "label": "ZFS recovery article",
+      "visibility": "public",
+      "url": "https://unixgreybeard.org/posts/2022/05/mount-ubuntu-22-04-zfs-partitions-using-live-iso-for-disaster-recovery/"
+    },
+    {
+      "id": "post_nginx_devserver",
+      "type": "published_writing",
+      "label": "Nginx and Certbot development-server article",
+      "visibility": "public",
+      "url": "https://unixgreybeard.org/posts/2021/06/raw-notes-from-creating-a-local-dev-and-build-https-server-for-create-react-app-using-nginx-and-certbot/"
+    },
+    {
+      "id": "private_current_professional_records",
+      "type": "operational_work",
+      "label": "Owner-supplied current professional records",
+      "visibility": "private",
+      "url": null,
+      "usage_note": "Career dates, responsibilities, and owner-reported operational outcomes. Source filenames and local paths are intentionally omitted."
+    },
+    {
+      "id": "private_early_timeline",
+      "type": "operational_work",
+      "label": "Owner-supplied early professional timeline",
+      "visibility": "private",
+      "url": null,
+      "usage_note": "Early work and education chronology; source filenames and local paths are intentionally omitted."
+    },
+    {
+      "id": "private_owner_summary",
+      "type": "transferable_experience",
+      "label": "Owner-authored professional summary",
+      "visibility": "private",
+      "url": null,
+      "usage_note": "Selected career-origin and learning-history details; private personal information excluded."
+    },
+    {
+      "id": "private_education_records",
+      "type": "coursework",
+      "label": "Owner-supplied education records",
+      "visibility": "private",
+      "url": null,
+      "usage_note": "Degree, course, and credential chronology; contact and student-identification details excluded."
+    },
+    {
+      "id": "private_business_and_research_work",
+      "type": "transferable_experience",
+      "label": "Owner-supplied business and research experience records",
+      "visibility": "private",
+      "url": null,
+      "usage_note": "Business education, survey research, software adoption, and operational context."
+    },
+    {
+      "id": "private_eastside_work",
+      "type": "operational_work",
+      "label": "Owner-supplied Eastside Big Tom systems work record",
+      "visibility": "private",
+      "url": null,
+      "usage_note": "Infrastructure, PCI/DSS, storage, network, and automation experience; outcomes are owner-reported."
+    },
+    {
+      "id": "private_mayflower_work",
+      "type": "operational_work",
+      "label": "Owner-supplied Mayflower Park AV and management record",
+      "visibility": "private",
+      "url": null,
+      "usage_note": "AV segment, pricing assumptions, procedures, training, and scheduling outcomes."
+    },
+    {
+      "id": "private_event_work",
+      "type": "operational_work",
+      "label": "Owner-supplied event operations records",
+      "visibility": "private",
+      "url": null,
+      "usage_note": "Client, venue, staffing, and event-order coordination."
+    },
+    {
+      "id": "private_gaba_work",
+      "type": "transferable_experience",
+      "label": "Owner-supplied executive language consulting record",
+      "visibility": "private",
+      "url": null,
+      "usage_note": "Audience adaptation and explanation of financial and economic material."
+    }
+  ]
+}

@@ -1,0 +1,430 @@
+package read_test
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/config"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/hugosite"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/tools/read"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+func newDiffPageClient(t *testing.T, contentRoot string) (*mcp.ClientSession, func()) {
+	t.Helper()
+	idx := mustTestIndex(t)
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex() error = %v", err)
+	}
+	s := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.1"}, nil)
+	cfg := config.Default()
+	cfg.ContentRoot = contentRoot
+	read.Register(s, idx, cfg, srcIdx)
+	read.RegisterWithSourceIndex(s, idx, srcIdx, cfg)
+
+	ctx := context.Background()
+	t1, t2 := mcp.NewInMemoryTransports()
+	if _, err := s.Connect(ctx, t1, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1"}, nil)
+	session, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	return session, func() { _ = session.Close() }
+}
+
+func TestDiffPage(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	pagePath := filepath.Join(contentRoot, "posts", "hello", "index.md")
+	if err := os.MkdirAll(filepath.Dir(pagePath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: Hello\ndate: 2026-07-03\n---\nHello world.\n"), 0o644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.test")
+	runGit(t, root, "config", "user.name", "Test User")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "initial")
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: Hello\ndate: 2026-07-03\n---\nHello brave new world.\n"), 0o644); err != nil {
+		t.Fatalf("rewrite page: %v", err)
+	}
+
+	session, done := newDiffPageClient(t, contentRoot)
+	defer done()
+
+	res := callTool(t, session, "diff_page", map[string]any{"slug": "/posts/hello/"})
+	if res.IsError {
+		t.Fatalf("diff_page returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if got := data["slug"]; got != "/posts/hello/" {
+		t.Fatalf("diff_page slug = %v, want canonical /posts/hello/", got)
+	}
+	if got := data["status"]; got != "modified" {
+		t.Fatalf("diff_page status = %v, want modified", got)
+	}
+	if got := data["diff_available"]; got != true {
+		t.Fatalf("diff_page diff_available = %v, want true", got)
+	}
+	if got := data["path"]; got != "posts/hello/index.md" {
+		t.Fatalf("diff_page path = %v, want posts/hello/index.md", got)
+	}
+	if got := data["resolved_source_path"]; got != "content/posts/hello/index.md" {
+		t.Fatalf("diff_page resolved_source_path = %v, want content/posts/hello/index.md", got)
+	}
+	if got := data["source_key"]; got != "posts/hello" {
+		t.Fatalf("diff_page source_key = %v, want posts/hello", got)
+	}
+	if got := data["resolved_lang"]; got != "" {
+		t.Fatalf("diff_page resolved_lang = %v, want empty default lang", got)
+	}
+	diffText, _ := data["diff"].(string)
+	if !strings.Contains(diffText, "Hello brave new world.") {
+		t.Fatalf("diff_page diff missing updated text: %s", diffText)
+	}
+	if strings.TrimSpace(asString(t, data["base_commit"])) == "" {
+		t.Fatal("diff_page missing base_commit")
+	}
+	if strings.TrimSpace(asString(t, data["head_commit"])) == "" {
+		t.Fatal("diff_page missing head_commit")
+	}
+	assertReadPageState(t, data["state"], "present", "built", "available", "fresh")
+}
+
+func TestDiffPageCompactOmitsFullDiffAndReturnsSummary(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	pagePath := filepath.Join(contentRoot, "posts", "hello", "index.md")
+	if err := os.MkdirAll(filepath.Dir(pagePath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: Hello\ndate: 2026-07-03\n---\nHello world.\n"), 0o644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.test")
+	runGit(t, root, "config", "user.name", "Test User")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "initial")
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: Hello\ndate: 2026-07-03\n---\nHello brave new world.\n"), 0o644); err != nil {
+		t.Fatalf("rewrite page: %v", err)
+	}
+
+	session, done := newDiffPageClient(t, contentRoot)
+	defer done()
+
+	res := callTool(t, session, "diff_page", map[string]any{"slug": "/posts/hello/", "response_mode": "compact"})
+	if res.IsError {
+		t.Fatalf("diff_page compact returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if _, present := data["diff"]; present {
+		t.Fatalf("diff_page compact unexpectedly includes full diff: %#v", data["diff"])
+	}
+	summary, _ := data["diff_summary"].(string)
+	if !strings.Contains(summary, "added") {
+		t.Fatalf("diff_page compact diff_summary = %q, want line-count summary", summary)
+	}
+}
+
+func TestDiffPageResolvesMultilingualBundleFromSourceIndex(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	pagePath := filepath.Join(contentRoot, "posts", "bonjour", "index.fr.md")
+	if err := os.MkdirAll(filepath.Dir(pagePath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: Bonjour\ndate: 2026-07-03\n---\nBonjour monde.\n"), 0o644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.test")
+	runGit(t, root, "config", "user.name", "Test User")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "initial")
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: Bonjour\ndate: 2026-07-03\n---\nBonjour tout le monde.\n"), 0o644); err != nil {
+		t.Fatalf("rewrite page: %v", err)
+	}
+
+	session, done := newDiffPageClient(t, contentRoot)
+	defer done()
+
+	res := callTool(t, session, "diff_page", map[string]any{"slug": "/posts/bonjour/"})
+	if res.IsError {
+		t.Fatalf("diff_page multilingual returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if got := data["slug"]; got != "/posts/bonjour/" {
+		t.Fatalf("diff_page multilingual slug = %v, want canonical /posts/bonjour/", got)
+	}
+	if got := data["path"]; got != "posts/bonjour/index.fr.md" {
+		t.Fatalf("diff_page multilingual path = %v, want posts/bonjour/index.fr.md", got)
+	}
+	if got := data["resolved_source_path"]; got != "content/posts/bonjour/index.fr.md" {
+		t.Fatalf("diff_page multilingual resolved_source_path = %v, want content/posts/bonjour/index.fr.md", got)
+	}
+	if got := data["resolved_lang"]; got != "fr" {
+		t.Fatalf("diff_page multilingual resolved_lang = %v, want fr", got)
+	}
+	assertReadPageState(t, data["state"], "present", "built", "available", "fresh")
+}
+
+func TestDiffPageWithoutGitReturnsSourceContent(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	pagePath := filepath.Join(contentRoot, "posts", "nogit", "index.md")
+	if err := os.MkdirAll(filepath.Dir(pagePath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: No Git\ndate: 2026-07-03\n---\nNo git source body.\n"), 0o644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+
+	session, done := newDiffPageClient(t, contentRoot)
+	defer done()
+
+	res := callTool(t, session, "diff_page", map[string]any{"slug": "/posts/nogit/"})
+	if res.IsError {
+		t.Fatalf("diff_page without git returned MCP error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if got := data["slug"]; got != "/posts/nogit/" {
+		t.Fatalf("diff_page no-git slug = %v, want canonical /posts/nogit/", got)
+	}
+	if got := data["status"]; got != "git_unavailable" {
+		t.Fatalf("diff_page status = %v, want git_unavailable", got)
+	}
+	if got := data["diff_available"]; got != false {
+		t.Fatalf("diff_page diff_available = %v, want false", got)
+	}
+	if got := data["fallback_mode"]; got != "source_content" {
+		t.Fatalf("diff_page fallback_mode = %v, want source_content", got)
+	}
+	if got := data["source_content"]; got != "No git source body." {
+		t.Fatalf("source_content = %q, want source body", got)
+	}
+	if got := data["resolved_source_path"]; got != "content/posts/nogit/index.md" {
+		t.Fatalf("diff_page no-git resolved_source_path = %v, want content/posts/nogit/index.md", got)
+	}
+	assertReadPageState(t, data["state"], "present", "pending", "not_yet_available", "source_only")
+	envelope := decodeEnvelope(t, res)
+	warnings := envelope["warnings"].([]any)
+	if len(warnings) == 0 {
+		t.Fatal("expected warning explaining git is unavailable")
+	}
+	// git_unavailable now surfaces the underlying probe error (acceptance
+	// criterion of #322); it must never leak the absolute content_root path.
+	if strings.Contains(warnings[0].(string), contentRoot) {
+		t.Fatalf("warning leaks absolute content_root path: %v", warnings[0])
+	}
+}
+
+func TestDiffPageUntrackedFileReturnsGitUntrackedStatus(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	if err := os.MkdirAll(contentRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.test")
+	runGit(t, root, "config", "user.name", "Test User")
+	seedPath := filepath.Join(contentRoot, ".gitkeep")
+	if err := os.WriteFile(seedPath, []byte(""), 0o644); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "initial")
+
+	pagePath := filepath.Join(contentRoot, "posts", "untracked", "index.md")
+	if err := os.MkdirAll(filepath.Dir(pagePath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: Untracked\ndate: 2026-07-03\n---\nJust created, not committed.\n"), 0o644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+
+	session, done := newDiffPageClient(t, contentRoot)
+	defer done()
+
+	res := callTool(t, session, "diff_page", map[string]any{"slug": "/posts/untracked/"})
+	if res.IsError {
+		t.Fatalf("diff_page untracked returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if got := data["slug"]; got != "/posts/untracked/" {
+		t.Fatalf("diff_page untracked slug = %v, want canonical /posts/untracked/", got)
+	}
+	if got := data["status"]; got != "git_untracked" {
+		t.Fatalf("diff_page status = %v, want git_untracked", got)
+	}
+	if got := data["diff_available"]; got != false {
+		t.Fatalf("diff_page diff_available = %v, want false", got)
+	}
+	if got := data["fallback_mode"]; got != "source_content" {
+		t.Fatalf("diff_page fallback_mode = %v, want source_content", got)
+	}
+	if got, want := data["source_content"], "---\ntitle: Untracked\ndate: 2026-07-03\n---\nJust created, not committed.\n"; got != want {
+		t.Fatalf("source_content = %q, want %q", got, want)
+	}
+	warnings := decodeEnvelope(t, res)["warnings"].([]any)
+	if len(warnings) == 0 || !strings.Contains(warnings[0].(string), "not yet tracked by git") {
+		t.Fatalf("expected actionable git_untracked warning, got %v", warnings)
+	}
+}
+
+// TestGetSiteHealthCountsUntrackedSourcePages is a regression test for
+// #819: get_site_health previously had no way to surface published content
+// with no git-tracked source file, only discoverable per-page via
+// diff_page's own git_untracked status. One tracked page + one untracked
+// page must report untracked_source_pages: 1, not 0 or 2.
+func TestGetSiteHealthCountsUntrackedSourcePages(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	if err := os.MkdirAll(contentRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.test")
+	runGit(t, root, "config", "user.name", "Test User")
+
+	trackedPath := filepath.Join(contentRoot, "posts", "tracked", "index.md")
+	if err := os.MkdirAll(filepath.Dir(trackedPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(trackedPath, []byte("---\ntitle: Tracked\ndate: 2026-07-03\n---\nCommitted.\n"), 0o644); err != nil {
+		t.Fatalf("write tracked page: %v", err)
+	}
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "initial")
+
+	untrackedPath := filepath.Join(contentRoot, "posts", "untracked", "index.md")
+	if err := os.MkdirAll(filepath.Dir(untrackedPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(untrackedPath, []byte("---\ntitle: Untracked\ndate: 2026-07-03\n---\nNot committed.\n"), 0o644); err != nil {
+		t.Fatalf("write untracked page: %v", err)
+	}
+
+	session, done := newDiffPageClient(t, contentRoot)
+	defer done()
+
+	res := callTool(t, session, "get_site_health", map[string]any{})
+	if res.IsError {
+		t.Fatalf("get_site_health returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	got, ok := data["untracked_source_pages"].(float64)
+	if !ok {
+		t.Fatalf("get_site_health untracked_source_pages = %v (%T), want a number", data["untracked_source_pages"], data["untracked_source_pages"])
+	}
+	if got != 1 {
+		t.Fatalf("get_site_health untracked_source_pages = %v, want 1 (only the untracked page)", got)
+	}
+}
+
+// TestGetSiteHealthOmitsUntrackedSourcePagesWithoutGit proves the field is
+// omitted entirely (not a misleading 0) when git status can't be determined
+// at all — e.g. content root outside any git repository.
+func TestGetSiteHealthOmitsUntrackedSourcePagesWithoutGit(t *testing.T) {
+	contentRoot := t.TempDir()
+	pagePath := filepath.Join(contentRoot, "posts", "hello", "index.md")
+	if err := os.MkdirAll(filepath.Dir(pagePath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: Hello\ndate: 2026-07-03\n---\nHello.\n"), 0o644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+
+	session, done := newDiffPageClient(t, contentRoot)
+	defer done()
+
+	res := callTool(t, session, "get_site_health", map[string]any{})
+	if res.IsError {
+		t.Fatalf("get_site_health returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if _, present := data["untracked_source_pages"]; present {
+		t.Fatalf("get_site_health untracked_source_pages = %v, want omitted (no git repo)", data["untracked_source_pages"])
+	}
+}
+
+func TestDiffPageGitBaselineDisabledSkipsHostProbing(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	pagePath := filepath.Join(contentRoot, "posts", "hello", "index.md")
+	if err := os.MkdirAll(filepath.Dir(pagePath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(pagePath, []byte("---\ntitle: Hello\ndate: 2026-07-03\n---\nHello world.\n"), 0o644); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+	runGit(t, root, "init")
+	runGit(t, root, "config", "user.email", "test@example.test")
+	runGit(t, root, "config", "user.name", "Test User")
+	runGit(t, root, "add", ".")
+	runGit(t, root, "commit", "-m", "initial")
+
+	idx := mustTestIndex(t)
+	srcIdx, err := hugosite.NewSourceIndex(contentRoot)
+	if err != nil {
+		t.Fatalf("NewSourceIndex() error = %v", err)
+	}
+	s := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "0.1"}, nil)
+	cfg := config.Default()
+	cfg.ContentRoot = contentRoot
+	cfg.GitBaseline.Mode = "disabled"
+	read.Register(s, idx, cfg, srcIdx)
+	read.RegisterWithSourceIndex(s, idx, srcIdx, cfg)
+
+	ctx := context.Background()
+	t1, t2 := mcp.NewInMemoryTransports()
+	if _, err := s.Connect(ctx, t1, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0.1"}, nil)
+	session, err := client.Connect(ctx, t2, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res := callTool(t, session, "diff_page", map[string]any{"slug": "/posts/hello/"})
+	if res.IsError {
+		t.Fatalf("diff_page disabled baseline returned error: %v", res.Content)
+	}
+	data := decodeContent(t, res)
+	if got := data["status"]; got != "git_unavailable" {
+		t.Fatalf("diff_page status = %v, want git_unavailable", got)
+	}
+	warnings := decodeEnvelope(t, res)["warnings"].([]any)
+	if len(warnings) == 0 || !strings.Contains(warnings[0].(string), "disabled by configuration") {
+		t.Fatalf("expected warning explaining git_baseline is disabled, got %v", warnings)
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func asString(t *testing.T, v any) string {
+	t.Helper()
+	s, ok := v.(string)
+	if !ok {
+		t.Fatalf("value %T is not string", v)
+	}
+	return s
+}

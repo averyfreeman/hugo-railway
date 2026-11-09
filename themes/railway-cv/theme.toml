@@ -1,0 +1,11 @@
+name = 'railway-cv'
+license = 'MIT'
+licenselink = 'https://opensource.org/license/mit/'
+description = 'A signal-driven academic CV theme with terminal motion and research content primitives.'
+homepage = 'https://github.com/HugoBlox/hugo-theme-academic-cv'
+tags = ['academic', 'cv', 'portfolio', 'research', 'terminal']
+features = ['responsive', 'notebooks', 'markdown', 'latex', 'progressive-motion']
+min_version = '0.122.0'
+
+[author]
+name = 'Signal CV contributors'

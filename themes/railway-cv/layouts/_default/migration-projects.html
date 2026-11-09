@@ -1,0 +1,37 @@
+{{ define "main" }}
+  {{ $repositoryData := hugo.Data.vitepress_2.repositories | default (dict) }}
+  {{ $repositories := $repositoryData.repositories | default (slice) }}
+  <section class="migration-shell page-shell">
+    <header class="migration-header">
+      <a class="back-link" href="{{ "/vitepress-migration/" | relURL }}">← Back to migration review</a>
+      <p class="eyebrow">STAGED IMPORT / PROJECTS</p>
+      <h1>{{ .Title }}</h1>
+      {{ with .Description }}<p class="lede">{{ . }}</p>{{ end }}
+      <p class="migration-notice">{{ len $repositories }} public GitHub repositories captured as lightweight links. No repository pages were fabricated.</p>
+    </header>
+    {{ if $repositories }}
+      <div class="migration-project-grid">
+        {{ range $repository := $repositories }}
+          <article class="migration-project signal-surface">
+            {{ $name := index $repository "name" }}
+            {{ with index $repository "preview" }}<img class="migration-project__preview" src="{{ . | relURL }}" alt="{{ $name }} README preview" loading="lazy">{{ end }}
+            <div class="migration-project__body">
+              <div class="migration-card__top"><span>{{ index $repository "language" | default "repository" }}</span>{{ if index $repository "pinned" }}<span class="migration-badge">pinned</span>{{ end }}</div>
+              <h2>{{ $name }}</h2>
+              <p>{{ index $repository "description" | default "No description provided." }}</p>
+              <div class="migration-project__meta">
+                <span>★ {{ index $repository "stargazers_count" }}</span><span>⑂ {{ index $repository "forks_count" }}</span>
+              </div>
+              <div class="migration-project__links">
+                {{ with index $repository "html_url" }}<a class="text-link" href="{{ . }}" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a>{{ end }}
+                {{ with index $repository "homepage" }}<a class="text-link" href="{{ . }}" target="_blank" rel="noopener noreferrer">Live site <span aria-hidden="true">↗</span></a>{{ end }}
+              </div>
+            </div>
+          </article>
+        {{ end }}
+      </div>
+    {{ else }}
+      <div class="empty-state signal-surface"><span class="status-dot"></span><p>The repository snapshot is not available yet.</p></div>
+    {{ end }}
+  </section>
+{{ end }}

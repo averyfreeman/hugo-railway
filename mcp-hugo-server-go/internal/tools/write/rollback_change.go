@@ -1,0 +1,623 @@
+package write
+
+// rollback_change (#438, #340, amended #379 — see docs/transactional-edit-
+// design.md §4 and the comment thread on #379). Restores a page's source to
+// a state this server's own apply_content_plan, update_page, or prior
+// rollback_change captured, guarded by the same expected_revision
+// optimistic-concurrency check every other write tool uses. Deliberately
+// narrower than git-commit-based rollback: only server-created content
+// snapshots are rollback-able, never arbitrary Git history.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/changeset"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/config"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/contentmodel"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/db"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/fileutil"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/hugosite"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/security"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/site"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/toolcontract"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/tools"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/time/rate"
+)
+
+// snapshotTTL/snapshotMaxEntries are deliberately more generous than the
+// plan store's: a plan is a short-lived preview handle, but a snapshot is
+// the actual undo history for a page — a caller may reasonably want to roll
+// back something applied hours ago, not just seconds ago.
+const snapshotTTL = 24 * time.Hour
+const snapshotMaxEntries = 512
+
+type snapshotEntry struct {
+	CallerKey string
+	Content   string
+	CreatedAt time.Time
+}
+
+type snapshotListing struct {
+	Revision  string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+
+// snapshotStore mirrors idempotencyStore/planStore's shape (map + mutex +
+// TTL prune + max-entries eviction). Unlike planStore, get does not consume
+// — a snapshot is idempotent-safe to roll back to more than once (matching
+// rollback_change's IdempotentHint), not a single-use preview.
+type snapshotStore struct {
+	mu         sync.Mutex
+	ttl        time.Duration
+	maxEntries int
+	entries    map[string]snapshotEntry
+	persistent *db.DB
+}
+
+func newSnapshotStore(ttl time.Duration, maxEntries int, persistent ...*db.DB) *snapshotStore {
+	var journal *db.DB
+	if len(persistent) > 0 {
+		journal = persistent[0]
+	}
+	return &snapshotStore{
+		ttl:        ttl,
+		maxEntries: maxEntries,
+		entries:    make(map[string]snapshotEntry),
+		persistent: journal,
+	}
+}
+
+func snapshotKey(filePath, revision string) string {
+	return filePath + "\x00" + revision
+}
+
+func (s *snapshotStore) put(filePath, revision, callerKey, content string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.pruneLocked(now)
+	entry := snapshotEntry{CallerKey: callerKey, Content: content, CreatedAt: now}
+	if s.persistent != nil {
+		raw, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		if err := s.persistent.PutEphemeralRecord("content_snapshot", snapshotKey(filePath, revision), callerKey, raw, now); err != nil {
+			return err
+		}
+	}
+	s.entries[snapshotKey(filePath, revision)] = entry
+	s.trimLocked()
+	return nil
+}
+
+func (s *snapshotStore) get(filePath, revision, callerKey string) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(time.Now())
+	entry, ok := s.entries[snapshotKey(filePath, revision)]
+	if !ok && s.persistent != nil {
+		raw, found, err := s.persistent.GetEphemeralRecord("content_snapshot", snapshotKey(filePath, revision), callerKey, s.ttl)
+		if err != nil {
+			return "", false, fmt.Errorf("read persisted content snapshot: %w", err)
+		}
+		if found {
+			if err := json.Unmarshal(raw, &entry); err != nil {
+				return "", false, fmt.Errorf("decode persisted content snapshot: %w", err)
+			}
+			ok = true
+			s.entries[snapshotKey(filePath, revision)] = entry
+		}
+	}
+	if !ok {
+		return "", false, nil
+	}
+	if entry.CallerKey != "" && entry.CallerKey != callerKey {
+		return "", false, nil
+	}
+	return entry.Content, true, nil
+}
+
+func (s *snapshotStore) list(filePath, callerKey string) ([]snapshotListing, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.pruneLocked(now)
+	items := make([]snapshotListing, 0)
+	prefix := filePath + "\x00"
+	if s.persistent != nil {
+		records, err := s.persistent.ListEphemeralRecords("content_snapshot", callerKey, s.ttl)
+		if err != nil {
+			return nil, fmt.Errorf("list persisted content snapshots: %w", err)
+		}
+		for _, record := range records {
+			if !strings.HasPrefix(record.ID, prefix) {
+				continue
+			}
+			var entry snapshotEntry
+			if err := json.Unmarshal(record.Payload, &entry); err != nil {
+				return nil, fmt.Errorf("decode persisted content snapshot: %w", err)
+			}
+			s.entries[record.ID] = entry
+		}
+	}
+	for key, entry := range s.entries {
+		if !strings.HasPrefix(key, prefix) || (entry.CallerKey != "" && entry.CallerKey != callerKey) {
+			continue
+		}
+		items = append(items, snapshotListing{Revision: strings.TrimPrefix(key, prefix), CreatedAt: entry.CreatedAt, ExpiresAt: entry.CreatedAt.Add(s.ttl)})
+	}
+	slices.SortFunc(items, func(a, b snapshotListing) int { return b.CreatedAt.Compare(a.CreatedAt) })
+	return items, nil
+}
+
+func (s *snapshotStore) pruneLocked(now time.Time) {
+	if s.ttl <= 0 {
+		return
+	}
+	for key, entry := range s.entries {
+		if now.Sub(entry.CreatedAt) > s.ttl {
+			delete(s.entries, key)
+		}
+	}
+}
+
+func (s *snapshotStore) trimLocked() {
+	if s.maxEntries <= 0 || len(s.entries) <= s.maxEntries {
+		return
+	}
+	for len(s.entries) > s.maxEntries {
+		var oldestKey string
+		var oldest time.Time
+		first := true
+		for key, entry := range s.entries {
+			if first || entry.CreatedAt.Before(oldest) {
+				oldestKey = key
+				oldest = entry.CreatedAt
+				first = false
+			}
+		}
+		delete(s.entries, oldestKey)
+	}
+}
+
+type rollbackChangeInput struct {
+	Slug             string `json:"slug"`
+	Lang             string `json:"lang,omitempty"`
+	ToRevision       string `json:"to_revision"`
+	ExpectedRevision string `json:"expected_revision,omitempty"`
+	IdempotencyKey   string `json:"idempotency_key,omitempty"`
+	// ChangeSetID (#1135) — see createPageInput's field of the same name.
+	ChangeSetID string `json:"change_set_id,omitempty"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+}
+
+type listPageSnapshotsInput struct {
+	Slug string `json:"slug"`
+	Lang string `json:"lang,omitempty"`
+}
+
+type pageSnapshotDTO struct {
+	RevisionKind string `json:"revision_kind"`
+	Revision     string `json:"revision"`
+	CreatedAt    string `json:"created_at"`
+	ExpiresAt    string `json:"expires_at"`
+}
+
+type listPageSnapshotsData struct {
+	Slug      string            `json:"slug"`
+	SourceKey string            `json:"source_key"`
+	Lang      string            `json:"lang,omitempty"`
+	Snapshots []pageSnapshotDTO `json:"snapshots"`
+}
+
+type listPageSnapshotsOutput struct {
+	toolcontract.ToolResponse[listPageSnapshotsData]
+}
+
+type rollbackChangeData struct {
+	Status         string               `json:"status,omitempty"`
+	Slug           string               `json:"slug,omitempty"`
+	DryRun         bool                 `json:"dry_run,omitempty"`
+	Diff           string               `json:"diff,omitempty"`
+	BeforeRevision string               `json:"before_revision,omitempty"`
+	AfterRevision  string               `json:"after_revision,omitempty"`
+	Warning        string               `json:"warning,omitempty"`
+	State          *site.LifecycleState `json:"state,omitempty"`
+	RateLimit      *rateLimitBucket     `json:"rate_limit,omitempty"`
+	// RateLimitRemaining — see the comment on createPageData's field of the
+	// same name (#520, #605).
+	RateLimitRemaining int `json:"rate_limit_remaining,omitempty"`
+}
+
+type rollbackChangeOutput struct {
+	toolcontract.ToolResponse[rollbackChangeData]
+	RequestContext     *toolcontract.RequestContext `json:"request_context,omitempty"`
+	RateLimitRemaining int                          `json:"rate_limit_remaining"`
+}
+
+// newRollbackChangeOutput — see the comment on newCreatePageOutput (#520,
+// #605): rateLimitRemaining is an explicit parameter, not read off data.
+func newRollbackChangeOutput(data rollbackChangeData, rateLimitRemaining int) rollbackChangeOutput {
+	return rollbackChangeOutput{
+		ToolResponse:       writeSuccessEnvelopeWithWarning(data, data.Warning),
+		RateLimitRemaining: rateLimitRemaining,
+	}
+}
+
+func registerRollbackChange(
+	s *mcp.Server,
+	pg *security.PathGuard,
+	idx *hugosite.SourceIndex,
+	cfg config.Config,
+	siteDB *db.DB,
+	siteIdx *site.Index,
+	mutationMu *sync.Mutex,
+	mutationLimiters map[string]*rate.Limiter,
+	idem *idempotencyStore,
+	snapshots *snapshotStore,
+	changeSets *changeset.Registry,
+) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name:  "rollback_change",
+		Title: "Rollback change",
+		Description: "Restore a page's source to a prior content snapshot captured by this server. " +
+			"`to_revision` must be a `content_snapshot` returned by list_page_snapshots; Git commits from list_page_revisions are not accepted. Snapshots may be produced by apply_content_plan, update_page, or rollback_change, are caller-isolated, and retain for 24 hours. " +
+			"Fails with `snapshot_not_found` if no matching snapshot exists or the resolved file/language doesn't match what the snapshot was captured for. " +
+			"Non-dry-run calls require `expected_revision`, the page's *current* revision — a stale value fails with `revision_conflict`, the same optimistic-concurrency guard every other write tool uses, so this can never silently undo a newer, unrelated change. " +
+			"Callers may provide `idempotency_key` to safely replay the exact same non-dry-run rollback after a timeout or uncertain delivery. " +
+			"`dry_run` previews the diff without writing. " +
+			"Writes source only — like apply_content_plan, does not build/publish; call publish_changes afterward. " +
+			"`slug` must not carry a language prefix when `lang` is also given — passing both (e.g. `slug:\"fr/posts/x\", lang:\"fr\"`) fails fast with `language_prefixed_slug_with_explicit_lang` naming the slug to use instead, rather than double-applying the language and surfacing a confusing not_found. " +
+			"`rate_limit_remaining` reports the caller's remaining budget on the shared create/update/upload quota (#466).",
+		InputSchema:  tools.MustSchema[rollbackChangeInput](),
+		OutputSchema: tools.MustSchema[rollbackChangeOutput](),
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    false,
+			DestructiveHint: fileutil.BoolPtr(false),
+			IdempotentHint:  true,
+			OpenWorldHint:   fileutil.BoolPtr(true),
+		},
+	}, toolcontract.WrapTool(func(ctx context.Context, _ *mcp.CallToolRequest, in rollbackChangeInput) (*mcp.CallToolResult, rollbackChangeOutput, error) {
+		if cfg.ForceDryRunAll {
+			in.DryRun = true
+		}
+		in.Slug = normalizeInputSlug(in.Slug)
+		wrapErr := func(err error) error {
+			return toolcontract.WithRequestContext(err, toolcontract.RequestContext{Slug: in.Slug, RequestedLang: in.Lang})
+		}
+		callerKey := mutationCallerKey(ctx)
+		limiter := callerLimiter(mutationMu, mutationLimiters, callerKey, cfg.RateLimit.CreateUpdatePerMin)
+		wrapErrWithLimiter := func(err error) error {
+			return toolcontract.WithDataFields(
+				toolcontract.WithRootFields(wrapErr(err), rateLimitRootFields(limiter)),
+				rateLimitDataFields(limiter, cfg.RateLimit.CreateUpdatePerMin, rateLimitScopeCreateUpdateUpload, time.Now().UTC()),
+			)
+		}
+		if in.Slug == "" {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: slug must not be empty"))
+		}
+		lang, err := validateLangParam(in.Lang)
+		if err != nil {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(err)
+		}
+		if lang != "" {
+			trimmedSlug := strings.Trim(in.Slug, "/")
+			prefix := lang + "/"
+			if strings.HasPrefix(trimmedSlug, prefix) {
+				return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("language_prefixed_slug_with_explicit_lang: use slug %q with lang %q", strings.TrimPrefix(trimmedSlug, prefix), lang))
+			}
+		}
+		if err := validateSlugFormat(in.Slug); err != nil {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(err)
+		}
+		if strings.TrimSpace(in.ToRevision) == "" {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: to_revision must not be empty"))
+		}
+		if err := validateIdempotencyKey(in.IdempotencyKey); err != nil {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(err)
+		}
+		resolvedChangeSetID, err := changeSets.Resolve(ctx, in.ChangeSetID, time.Now().UTC())
+		if err != nil {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(err)
+		}
+		if !in.DryRun && !limiter.Allow() {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(rateLimitExceededErr("rollback_change", cfg.RateLimit.CreateUpdatePerMin, limiter))
+		}
+
+		if _, err := pg.SafeJoin(in.Slug); err != nil {
+			slog.Warn("rollback_change: path validation failed", "slug", in.Slug, "error", err)
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: path validation failed"))
+		}
+
+		resolvedSource, langErr := resolveExistingSource(cfg.ContentRoot, in.Slug, lang)
+		if langErr != nil {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(langErr)
+		}
+		filePath := resolvedSource.SourcePath
+
+		idemHash := ""
+		if !in.DryRun && strings.TrimSpace(in.IdempotencyKey) != "" {
+			hash, hashErr := requestHash(struct {
+				Slug             string `json:"slug"`
+				Lang             string `json:"lang,omitempty"`
+				ToRevision       string `json:"to_revision"`
+				ExpectedRevision string `json:"expected_revision"`
+			}{Slug: in.Slug, Lang: lang, ToRevision: in.ToRevision, ExpectedRevision: in.ExpectedRevision})
+			if hashErr != nil {
+				return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("internal_error: failed to hash idempotency request"))
+			}
+			idemHash = hash
+			var cached rollbackChangeOutput
+			hit, replayErr := idem.replay(idempotencyCallerKey(ctx), "rollback_change", in.IdempotencyKey, idemHash, &cached)
+			if replayErr != nil {
+				return nil, rollbackChangeOutput{}, wrapErrWithLimiter(replayErr)
+			}
+			if hit {
+				return nil, cached, nil
+			}
+		}
+
+		const lockWait = 10 * time.Second
+		deadline := time.Now().Add(lockWait)
+		for {
+			if hugosite.ContentMu.TryLock() {
+				slog.Debug("rollback_change: lock_acquired")
+				break
+			}
+			if time.Now().After(deadline) {
+				slog.Error("rollback_change: lock_timeout", "timeout_s", lockWait.Seconds())
+				return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("build_in_progress: content lock is held, retry in a moment"))
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		defer func() {
+			hugosite.ContentMu.Unlock()
+			slog.Debug("rollback_change: lock_released")
+		}()
+
+		raw, err := os.ReadFile(filePath)
+		if err != nil {
+			slog.Error("rollback_change: read failed", "slug", in.Slug, "path", filePath, "error", err)
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("read_error: failed to read page"))
+		}
+		currentRevision := contentmodel.SourceRevisionBytes(raw)
+		if !in.DryRun {
+			if strings.TrimSpace(in.ExpectedRevision) == "" {
+				return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: expected_revision is required for non-dry-run rollback_change"))
+			}
+			if in.ExpectedRevision != currentRevision {
+				return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("revision_conflict: page changed since it was read; read the latest revision and retry"))
+			}
+		}
+
+		snapshotContent, ok, snapshotErr := snapshots.get(filePath, in.ToRevision, isolationCallerKey(ctx))
+		if snapshotErr != nil {
+			slog.Error("rollback_change: snapshot persistence read failed", "slug", in.Slug, "error", snapshotErr)
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to load rollback snapshot"))
+		}
+		if !ok {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("snapshot_not_found: no snapshot recorded for revision %q of this page — snapshots from update_page, apply_content_plan, or rollback_change are caller-isolated and retained for 24 hours", in.ToRevision))
+		}
+		if err := validateFrontmatterRoundTrip(snapshotContent); err != nil {
+			slog.Error("rollback_change: round-trip guard failed on stored snapshot", "slug", in.Slug, "error", err)
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("validation_error: %w", err))
+		}
+		// Re-run the same blocked-shortcode policy create_page/update_page
+		// enforce on every direct write (#590). A snapshot is a verbatim
+		// copy of whatever content the page held *before* the write that
+		// produced it — for update_page in particular, that's the page's
+		// prior state, which may predate #590's denylist or have been
+		// written before it was extended to include a given shortcode name.
+		// Restoring that content should not be a way to reintroduce a body
+		// direct writes would now reject outright (#636 review finding).
+		if err := rejectDangerousShortcodes(snapshotContent, cfg.BlockedShortcodes); err != nil {
+			slog.Warn("rollback_change: snapshot content invokes a blocked shortcode", "slug", in.Slug, "error", err)
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: %w", err))
+		}
+
+		if in.DryRun {
+			diffLabel := in.Slug + "/" + filepath.Base(filePath)
+			diff := simpleDiff(diffLabel, string(raw), snapshotContent)
+			return nil, newRollbackChangeOutput(rollbackChangeData{
+				Status:         "would_restore",
+				Slug:           canonicalPublicSlug(in.Slug),
+				DryRun:         true,
+				Diff:           diff,
+				BeforeRevision: currentRevision,
+				RateLimit:      ptrRateLimitBucket(newRateLimitBucket(limiter, cfg.RateLimit.CreateUpdatePerMin, rateLimitScopeCreateUpdateUpload, time.Now().UTC())),
+			}, rateLimitRemaining(limiter)), nil
+		}
+		// A rollback is itself a state transition. Preserve its pre-rollback
+		// bytes first so a later rollback can reverse this operation after a
+		// service restart, just like rollback_bundle does for translations.
+		if err := snapshots.put(filePath, currentRevision, isolationCallerKey(ctx), string(raw)); err != nil {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to persist pre-rollback snapshot: %w", err))
+		}
+
+		if err := pg.RevalidateForWrite(filePath); err != nil {
+			slog.Warn("rollback_change: symlink-swap detected before write", "slug", in.Slug, "error", err)
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("security_error: symlink detected in write path"))
+		}
+		afterRevision := contentmodel.SourceRevisionBytes([]byte(snapshotContent))
+		recoveryOp, err := beginSourceWriteRecovery(siteDB, filePath, currentRevision, afterRevision, recoveryIdempotencyFor(ctx, "rollback_change", in.IdempotencyKey, idemHash, map[string]any{
+			"slug": canonicalPublicSlug(in.Slug), "before_revision": currentRevision, "after_revision": afterRevision,
+		}))
+		if err != nil {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to record source write intent"))
+		}
+		if err := fileutil.AtomicWriteChecked(filePath, snapshotContent, pg); err != nil {
+			slog.Error("rollback_change: write failed", "slug", in.Slug, "error", err)
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("write_error: failed to write page"))
+		}
+		if err := recoveryFilesystemBoundary("rollback_change", "after_source_write"); err != nil {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: interrupted after source write"))
+		}
+		if err := recoveryOp.record(siteDB, "file_written"); err != nil {
+			slog.Warn("rollback_change: could not advance recovery journal", "slug", in.Slug, "error", err)
+		}
+
+		restoredTags, restoredCategories := currentTaxonomyFromRaw([]byte(snapshotContent))
+		restoredFM := parseFrontmatterMap([]byte(snapshotContent))
+		var restoredTitle string
+		if restoredFM != nil {
+			if t, ok := restoredFM["title"].(string); ok {
+				restoredTitle = t
+			}
+		}
+
+		var updated hugosite.SourcePage
+		switch {
+		case resolvedSource.Lang != "":
+			if existing, ok := idx.GetBySlugLang(in.Slug, resolvedSource.Lang); ok {
+				updated = *existing
+			} else {
+				updated = hugosite.SourcePage{Slug: in.Slug, Lang: resolvedSource.Lang}
+			}
+		default:
+			if existing, ok := idx.GetDefaultBySlug(in.Slug); ok {
+				updated = *existing
+			} else {
+				updated = hugosite.SourcePage{Slug: in.Slug}
+			}
+		}
+		updated.FilePath = filePath
+		updated.Lang = resolvedSource.Lang
+		if restoredTitle != "" {
+			updated.Title = restoredTitle
+		}
+		// FrontmatterRaw is reassigned wholesale from the snapshot's own
+		// parsed map (already computed above as restoredFM) instead of
+		// patching just "title" in by hand — see the identical fix on
+		// update_page/apply_content_plan in tools.go/content_plan.go
+		// (#810). Previously every other frontmatter field (description,
+		// featured_image, draft, ...) kept whatever stale value the index
+		// held from before the rollback until the next full reindex.
+		if restoredFM != nil {
+			updated.FrontmatterRaw = restoredFM
+			// #911 follow-up: FrontmatterRaw above fixes callers that read
+			// the raw map, but SourcePage also carries typed Date/Draft/
+			// PublishDate/ExpiryDate fields (consumed directly by e.g.
+			// search_content's date sort and draft filtering — see
+			// internal/tools/read/extended.go) that were never resynced
+			// here. Left alone, they keep whatever value `updated` started
+			// from — the exact mechanism this rollback fix exists to close
+			// for Title, just on different fields. This resync is now the
+			// mechanism that actually makes the rebuild correct regardless
+			// of which base entry `updated` started from above: every
+			// SourcePage field ends up explicitly reassigned from either
+			// resolvedSource or this restored snapshot by the end of this
+			// function, so the language-scoped lookup above is defense in
+			// depth against a future field being added to SourcePage and
+			// missed here — not, on its own, what a caller can currently
+			// observe through get_page_frontmatter/get_page_for_edit.
+			updated.Date = frontmatterString(restoredFM["date"])
+			updated.Draft = frontmatterBool(restoredFM["draft"])
+			updated.PublishDate = frontmatterTime(restoredFM["publishDate"])
+			updated.ExpiryDate = frontmatterTime(restoredFM["expiryDate"])
+		}
+		updated.Tags = restoredTags
+		updated.Categories = restoredCategories
+		// #643: the in-memory source index's Body field was never
+		// reassigned here, so get_page_markdown (which reads straight from
+		// this index entry) kept serving the pre-rollback body while every
+		// other field on the same entry — Tags/Categories/Title/Revision —
+		// was correctly restored, with index_state still reporting "fresh".
+		updated.Body = bodyFromRaw([]byte(snapshotContent))
+		updated.BuildPending = true
+		idx.Upsert(updated)
+
+		hadPublic := false
+		if siteIdx != nil {
+			if pub, ok := siteIdx.GetBySlug(in.Slug); ok {
+				hadPublic = true
+				pubUpdated := *pub
+				if restoredTitle != "" {
+					pubUpdated.Title = restoredTitle
+				}
+				pubUpdated.Tags = restoredTags
+				pubUpdated.Categories = restoredCategories
+				siteIdx.UpsertPage(pubUpdated)
+			}
+		}
+
+		status := "restored"
+		warning := ""
+		if siteDB != nil {
+			if err := siteDB.SyncSourcePage(updated); err != nil {
+				slog.Warn("rollback_change: db sync failed", "slug", in.Slug, "error", err)
+				status = "partial_success"
+				warning = fmt.Sprintf("source rolled back but derived DB could not be updated: %v", err)
+			}
+		}
+
+		state := updatePageState(siteIdx != nil, hadPublic)
+		out := newRollbackChangeOutput(rollbackChangeData{
+			Status:         status,
+			Slug:           canonicalPublicSlug(in.Slug),
+			BeforeRevision: currentRevision,
+			AfterRevision:  contentmodel.SourceRevisionBytes([]byte(snapshotContent)),
+			Warning:        appendLastBuildWarning(warning),
+			State:          &state,
+			RateLimit:      ptrRateLimitBucket(newRateLimitBucket(limiter, cfg.RateLimit.CreateUpdatePerMin, rateLimitScopeCreateUpdateUpload, time.Now().UTC())),
+		}, rateLimitRemaining(limiter))
+		if err := recoveryOp.stageResult(siteDB, out); err != nil {
+			return nil, rollbackChangeOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to stage recoverable mutation result"))
+		}
+		if idemHash != "" {
+			if err := idem.remember(idempotencyCallerKey(ctx), "rollback_change", in.IdempotencyKey, idemHash, out); err != nil {
+				slog.Warn("rollback_change: could not persist idempotency result", "slug", in.Slug, "error", err)
+			}
+		}
+		if err := recoveryOp.record(siteDB, "committed"); err != nil {
+			slog.Warn("rollback_change: could not commit recovery journal", "slug", in.Slug, "error", err)
+		}
+		changeSets.RecordMutation(resolvedChangeSetID, mutationCallerKey(ctx), "rollback_change", in.Slug, "rollback", time.Now().UTC())
+		return nil, out, nil
+	}))
+}
+
+func registerListPageSnapshots(s *mcp.Server, cfg config.Config, snapshots *snapshotStore) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name:         "list_page_snapshots",
+		Title:        "List rollback snapshots",
+		Description:  "List live rollback snapshots captured by this server for one page. Entries are caller-isolated, expire after 24 hours, and carry revision_kind=content_snapshot; unlike list_page_revisions git commits, these revisions can be passed to rollback_change.",
+		InputSchema:  tools.MustSchema[listPageSnapshotsInput](),
+		OutputSchema: tools.MustSchema[listPageSnapshotsOutput](),
+		Annotations:  &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: fileutil.BoolPtr(false), IdempotentHint: true},
+	}, toolcontract.WrapTool(func(ctx context.Context, _ *mcp.CallToolRequest, in listPageSnapshotsInput) (*mcp.CallToolResult, listPageSnapshotsOutput, error) {
+		in.Slug = normalizeInputSlug(in.Slug)
+		if in.Slug == "" {
+			return nil, listPageSnapshotsOutput{}, fmt.Errorf("invalid_params: slug must not be empty")
+		}
+		lang, err := validateLangParam(in.Lang)
+		if err != nil {
+			return nil, listPageSnapshotsOutput{}, err
+		}
+		resolved, err := contentmodel.ResolvePageSource(in.Slug, lang, cfg.ContentRoot)
+		if err != nil {
+			return nil, listPageSnapshotsOutput{}, err
+		}
+		items, snapshotErr := snapshots.list(resolved.SourcePath, isolationCallerKey(ctx))
+		if snapshotErr != nil {
+			slog.Error("list_page_snapshots: persistence read failed", "slug", in.Slug, "error", snapshotErr)
+			return nil, listPageSnapshotsOutput{}, fmt.Errorf("persistence_error: failed to list rollback snapshots")
+		}
+		out := make([]pageSnapshotDTO, 0, len(items))
+		for _, item := range items {
+			out = append(out, pageSnapshotDTO{RevisionKind: "content_snapshot", Revision: item.Revision, CreatedAt: item.CreatedAt.UTC().Format(time.RFC3339), ExpiresAt: item.ExpiresAt.UTC().Format(time.RFC3339)})
+		}
+		return nil, listPageSnapshotsOutput{ToolResponse: writeSuccessEnvelope(listPageSnapshotsData{Slug: canonicalPublicSlug(in.Slug), SourceKey: in.Slug, Lang: resolved.Lang, Snapshots: out})}, nil
+	}))
+}

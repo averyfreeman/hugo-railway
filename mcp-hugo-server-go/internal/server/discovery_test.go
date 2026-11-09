@@ -1,0 +1,1346 @@
+package server_test
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/config"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/server"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/site"
+)
+
+func mustDiscoveryServer(t *testing.T, siteRoot string) *server.Server {
+	t.Helper()
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://www.arleo.eu"
+	cfg.SiteName = "arleo.eu"
+	cfg.OAuth.Enabled = true
+	cfg.OAuth.Issuer = "https://mcp.arleo.eu"
+	cfg.OAuth.Resource = "https://mcp.arleo.eu/mcp"
+	return mustDiscoveryServerWithConfig(t, cfg)
+}
+
+func mustDiscoveryServerWithConfig(t *testing.T, cfg config.Config) *server.Server {
+	t.Helper()
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	return srv
+}
+
+func TestWellKnownOAuthServer(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q want application/json", ct)
+	}
+
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	if _, ok := got["agent_auth"]; !ok {
+		t.Fatal("response missing agent_auth field")
+	}
+	if _, ok := got["access_profiles"]; !ok {
+		t.Fatal("response missing access_profiles field")
+	}
+	if _, ok := got["issuer"]; !ok {
+		t.Fatal("response missing issuer field")
+	}
+
+	var agentAuth map[string]json.RawMessage
+	if err := json.Unmarshal(got["agent_auth"], &agentAuth); err != nil {
+		t.Fatalf("agent_auth is not an object: %v", err)
+	}
+
+	checkStringField := func(obj map[string]json.RawMessage, key, want string) {
+		t.Helper()
+		raw, ok := obj[key]
+		if !ok {
+			t.Errorf("agent_auth missing %q", key)
+			return
+		}
+		var got string
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Errorf("agent_auth[%q] not a string: %v", key, err)
+			return
+		}
+		if got != want {
+			t.Errorf("agent_auth[%q] = %q want %q", key, got, want)
+		}
+	}
+
+	checkStringField(agentAuth, "identity_endpoint", "https://mcp.arleo.eu/agent/identity")
+	checkStringField(agentAuth, "claim_endpoint", "https://mcp.arleo.eu/agent/identity/claim")
+	checkStringField(agentAuth, "claim_uri", "https://mcp.arleo.eu/agent/identity/claim")
+	checkStringField(agentAuth, "events_endpoint", "https://mcp.arleo.eu/agent/event/notify")
+	checkStringField(agentAuth, "skill", "https://mcp.arleo.eu/auth.md")
+
+	var identityTypes []string
+	if err := json.Unmarshal(agentAuth["identity_types_supported"], &identityTypes); err != nil {
+		t.Fatalf("identity_types_supported: %v", err)
+	}
+	for _, want := range []string{"anonymous", "identity_assertion"} {
+		found := false
+		for _, got := range identityTypes {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("identity_types_supported missing %q", want)
+		}
+	}
+
+	var anonymous struct {
+		CredentialTypesSupported []string `json:"credential_types_supported"`
+		ClaimURI                 string   `json:"claim_uri"`
+	}
+	if err := json.Unmarshal(agentAuth["anonymous"], &anonymous); err != nil {
+		t.Fatalf("anonymous: %v", err)
+	}
+	if anonymous.ClaimURI != "https://mcp.arleo.eu/agent/identity/claim" {
+		t.Errorf("anonymous.claim_uri = %q", anonymous.ClaimURI)
+	}
+	if len(anonymous.CredentialTypesSupported) == 0 {
+		t.Fatal("anonymous.credential_types_supported is empty")
+	}
+	var identityAssertion struct {
+		AssertionTypesSupported  []string `json:"assertion_types_supported"`
+		CredentialTypesSupported []string `json:"credential_types_supported"`
+	}
+	if err := json.Unmarshal(agentAuth["identity_assertion"], &identityAssertion); err != nil {
+		t.Fatalf("identity_assertion: %v", err)
+	}
+	if len(identityAssertion.AssertionTypesSupported) == 0 {
+		t.Fatal("identity_assertion.assertion_types_supported is empty")
+	}
+	if len(identityAssertion.CredentialTypesSupported) == 0 {
+		t.Fatal("identity_assertion.credential_types_supported is empty")
+	}
+
+	var grantTypes []string
+	if err := json.Unmarshal(got["grant_types_supported"], &grantTypes); err != nil {
+		t.Fatalf("grant_types_supported: %v", err)
+	}
+	wantGrants := []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:jwt-bearer", "urn:workos:agent-auth:grant-type:claim"}
+	for _, g := range wantGrants {
+		found := false
+		for _, ag := range grantTypes {
+			if ag == g {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("grant_types_supported missing %q", g)
+		}
+	}
+
+	var accessProfiles map[string]struct {
+		Description     string   `json:"description"`
+		Acquisition     string   `json:"acquisition"`
+		AcquisitionMode string   `json:"acquisition_mode"`
+		InternalScopes  []string `json:"internal_scopes"`
+	}
+	if err := json.Unmarshal(got["access_profiles"], &accessProfiles); err != nil {
+		t.Fatalf("access_profiles is not an object: %v", err)
+	}
+	reader, ok := accessProfiles["reader"]
+	if !ok {
+		t.Fatal("access_profiles.reader missing")
+	}
+	if reader.Acquisition == "" || len(reader.InternalScopes) == 0 {
+		t.Fatalf("access_profiles.reader = %#v, want acquisition and internal_scopes", reader)
+	}
+	if reader.AcquisitionMode == "" {
+		t.Fatalf("access_profiles.reader = %#v, want acquisition_mode", reader)
+	}
+	operator, ok := accessProfiles["operator"]
+	if !ok {
+		t.Fatal("access_profiles.operator missing")
+	}
+	if operator.Acquisition == "" || len(operator.InternalScopes) == 0 {
+		t.Fatalf("access_profiles.operator = %#v, want acquisition and internal_scopes", operator)
+	}
+	if operator.AcquisitionMode != "approved_token" {
+		t.Fatalf("operator acquisition_mode = %q, want approved_token", operator.AcquisitionMode)
+	}
+	if len(reader.InternalScopes) != 1 || reader.InternalScopes[0] != "read" {
+		t.Fatalf("reader internal_scopes = %v, want [read]", reader.InternalScopes)
+	}
+	if len(operator.InternalScopes) != 1 || operator.InternalScopes[0] != "write" {
+		t.Fatalf("operator internal_scopes = %v, want [write]", operator.InternalScopes)
+	}
+	if !strings.Contains(reader.Description, "canonical read scope") {
+		t.Fatalf("reader description = %q, want canonical read scope wording", reader.Description)
+	}
+	if !strings.Contains(operator.Description, "canonical write scope") {
+		t.Fatalf("operator description = %q, want canonical write scope wording", operator.Description)
+	}
+}
+
+func TestProtectedResourceReaderAcquisitionMetadataReflectsDeploymentMode(t *testing.T) {
+	t.Run("dynamic client registration only", func(t *testing.T) {
+		cfg := config.Default()
+		cfg.SiteRoot = t.TempDir()
+		cfg.SiteURL = "https://www.arleo.eu"
+		cfg.SiteName = "arleo.eu"
+		cfg.OAuth.Enabled = true
+		cfg.OAuth.Issuer = "https://mcp.arleo.eu"
+		cfg.OAuth.Resource = "https://mcp.arleo.eu/mcp"
+		cfg.OAuth.DynamicClientEnabled = true
+		cfg.OAuth.AllowReaderSelfRegistration = false
+		srv := mustDiscoveryServerWithConfig(t, cfg)
+
+		req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d want 200", rec.Code)
+		}
+
+		var meta struct {
+			AccessProfiles map[string]struct {
+				Acquisition     string `json:"acquisition"`
+				AcquisitionMode string `json:"acquisition_mode"`
+			} `json:"access_profiles"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		reader := meta.AccessProfiles["reader"]
+		if reader.AcquisitionMode != "self_serve_oauth_registration" {
+			t.Fatalf("reader acquisition_mode = %q, want self_serve_oauth_registration", reader.AcquisitionMode)
+		}
+		if reader.Acquisition != "self-serve OAuth registration" {
+			t.Fatalf("reader acquisition = %q, want self-serve OAuth registration", reader.Acquisition)
+		}
+	})
+}
+
+func TestWellKnownOAuthServerWithClientRegistry(t *testing.T) {
+	dir := t.TempDir()
+	registryPath := filepath.Join(dir, "oauth-clients.yaml")
+	if err := os.WriteFile(registryPath, []byte(`
+clients:
+  - client_id: claude-admin
+    client_secret: admin-secret-value
+    redirect_uris:
+      - https://client.test/callback
+    scope: site.admin
+`), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+	cfg := config.Default()
+	cfg.SiteRoot = dir
+	cfg.SiteURL = "https://www.arleo.eu"
+	cfg.SiteName = "arleo.eu"
+	cfg.OAuth.Issuer = "https://mcp.arleo.eu"
+	cfg.OAuth.Resource = "https://mcp.arleo.eu/mcp"
+	cfg.OAuth.ClientRegistryPath = registryPath
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	var meta struct {
+		TokenEndpointAuthMethodsSupported []string `json:"token_endpoint_auth_methods_supported"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	found := false
+	for _, m := range meta.TokenEndpointAuthMethodsSupported {
+		if m == "client_secret_basic" || m == "client_secret_post" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("token_endpoint_auth_methods_supported = %v, want client_secret_* support", meta.TokenEndpointAuthMethodsSupported)
+	}
+}
+
+func TestDiscoveryMinimalPublicSurfaceSnapshots(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+
+	type accessProfileSnapshot struct {
+		AcquisitionMode string   `json:"acquisition_mode"`
+		InternalScopes  []string `json:"internal_scopes"`
+	}
+
+	authReq := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	authRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusOK {
+		t.Fatalf("auth server status = %d want 200", authRec.Code)
+	}
+	var authMeta struct {
+		Issuer          string                           `json:"issuer"`
+		ScopesSupported []string                         `json:"scopes_supported"`
+		AccessProfiles  map[string]accessProfileSnapshot `json:"access_profiles"`
+	}
+	if err := json.Unmarshal(authRec.Body.Bytes(), &authMeta); err != nil {
+		t.Fatalf("decode auth server: %v", err)
+	}
+	authSubset := map[string]any{
+		"issuer":                authMeta.Issuer,
+		"scopes_supported":      authMeta.ScopesSupported,
+		"reader_profile":        authMeta.AccessProfiles["reader"],
+		"operator_profile":      authMeta.AccessProfiles["operator"],
+		"administrator_profile": authMeta.AccessProfiles["administrator"],
+	}
+	wantAuth := map[string]any{
+		"issuer":                "https://mcp.arleo.eu",
+		"scopes_supported":      []string{"read", "write", "admin"},
+		"reader_profile":        accessProfileSnapshot{AcquisitionMode: "operator_approved_claim_or_pre_registered_oauth_client", InternalScopes: []string{"read"}},
+		"operator_profile":      accessProfileSnapshot{AcquisitionMode: "approved_token", InternalScopes: []string{"write"}},
+		"administrator_profile": accessProfileSnapshot{AcquisitionMode: "approved_admin_token", InternalScopes: []string{"admin"}},
+	}
+	if !reflect.DeepEqual(authSubset, wantAuth) {
+		t.Fatalf("auth server subset = %#v, want %#v", authSubset, wantAuth)
+	}
+
+	prReq := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
+	prReq.Host = "mcp.arleo.eu" // matches production: the issuer's own host
+	prRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(prRec, prReq)
+	if prRec.Code != http.StatusOK {
+		t.Fatalf("protected resource status = %d want 200", prRec.Code)
+	}
+	var prMeta struct {
+		Resource              string                           `json:"resource"`
+		ResourceDocumentation string                           `json:"resource_documentation"`
+		ScopesSupported       []string                         `json:"scopes_supported"`
+		AccessProfiles        map[string]accessProfileSnapshot `json:"access_profiles"`
+	}
+	if err := json.Unmarshal(prRec.Body.Bytes(), &prMeta); err != nil {
+		t.Fatalf("decode protected resource: %v", err)
+	}
+	prSubset := map[string]any{
+		"resource":               prMeta.Resource,
+		"resource_documentation": prMeta.ResourceDocumentation,
+		"scopes_supported":       prMeta.ScopesSupported,
+		"reader_profile":         prMeta.AccessProfiles["reader"],
+		"operator_profile":       prMeta.AccessProfiles["operator"],
+		"administrator_profile":  prMeta.AccessProfiles["administrator"],
+	}
+	wantPR := map[string]any{
+		"resource":               "https://mcp.arleo.eu/mcp",
+		"resource_documentation": "https://mcp.arleo.eu/auth.md",
+		"scopes_supported":       []string{"read", "write", "admin"},
+		"reader_profile":         accessProfileSnapshot{AcquisitionMode: "operator_approved_claim_or_pre_registered_oauth_client", InternalScopes: []string{"read"}},
+		"operator_profile":       accessProfileSnapshot{AcquisitionMode: "approved_token", InternalScopes: []string{"write"}},
+		"administrator_profile":  accessProfileSnapshot{AcquisitionMode: "approved_admin_token", InternalScopes: []string{"admin"}},
+	}
+	if !reflect.DeepEqual(prSubset, wantPR) {
+		t.Fatalf("protected resource subset = %#v, want %#v", prSubset, wantPR)
+	}
+}
+
+func TestPublishedAuthAndToolSurfacesStayConvergedOnCanonicalReadWrite(t *testing.T) {
+	dir := t.TempDir()
+	const content = "# auth.md\n\nAgent authentication instructions.\n"
+	if err := os.WriteFile(filepath.Join(dir, "auth.md"), []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile(auth.md): %v", err)
+	}
+	srv := mustDiscoveryServer(t, dir)
+
+	authReq := httptest.NewRequest(http.MethodGet, "/auth.md", nil)
+	authRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusOK {
+		t.Fatalf("auth.md status = %d want 200", authRec.Code)
+	}
+	authBody := authRec.Body.String()
+	for _, want := range []string{
+		"`reader` maps to `read`; `operator` maps to `write`; `administrator` maps to `admin`.",
+		`"internal_scopes": ["read"]`,
+		`"internal_scopes": ["write"]`,
+		`"internal_scopes": ["admin"]`,
+	} {
+		if !strings.Contains(authBody, want) {
+			t.Fatalf("auth.md missing %q:\n%s", want, authBody)
+		}
+	}
+	for _, bad := range []string{
+		`"internal_scopes": ["read", "write"]`,
+		"public-safe",
+	} {
+		if strings.Contains(authBody, bad) {
+			t.Fatalf("auth.md contains forbidden legacy wording %q:\n%s", bad, authBody)
+		}
+	}
+
+	oauthSrv := mustOAuthServer(t)
+	bearer := obtainBearerToken(t, oauthSrv)
+	body := doMCPToolsListBody(t, oauthSrv, bearer, nil)
+	var result struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	parsed := false
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "data: ")
+		if err := json.Unmarshal([]byte(line), &result); err == nil && len(result.Result.Tools) > 0 {
+			parsed = true
+			break
+		}
+	}
+	if !parsed {
+		t.Fatalf("tools/list response did not contain a parseable tools payload: %q", body)
+	}
+	for _, tool := range result.Result.Tools {
+		for _, bad := range []string{"content.read", "content.write", "site.admin", "public-safe", "reader-safe"} {
+			if strings.Contains(tool.Description, bad) {
+				t.Fatalf("tool %q description contains forbidden legacy wording %q: %q", tool.Name, bad, tool.Description)
+			}
+		}
+	}
+}
+
+func TestWellKnownMCPServerCard(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/mcp/server-card.json", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q want application/json", ct)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("Access-Control-Allow-Origin = %q want *", got)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "GET" {
+		t.Fatalf("Access-Control-Allow-Methods = %q want GET", got)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "Content-Type" {
+		t.Fatalf("Access-Control-Allow-Headers = %q want Content-Type", got)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if got["$schema"] != "https://static.modelcontextprotocol.io/schemas/mcp-server-card/v1.json" {
+		t.Fatalf("$schema = %v", got["$schema"])
+	}
+	if got["version"] != "1.0" {
+		t.Fatalf("version = %v", got["version"])
+	}
+	if got["protocolVersion"] != "2025-06-18" {
+		t.Fatalf("protocolVersion = %v", got["protocolVersion"])
+	}
+
+	serverInfo, ok := got["serverInfo"].(map[string]any)
+	if !ok {
+		t.Fatalf("serverInfo type = %T", got["serverInfo"])
+	}
+	if serverInfo["name"] != "mcp-hugo-server-go" {
+		t.Fatalf("serverInfo.name = %v", serverInfo["name"])
+	}
+	if serverInfo["version"] == "" {
+		t.Fatalf("serverInfo.version is empty")
+	}
+
+	transport, ok := got["transport"].(map[string]any)
+	if !ok {
+		t.Fatalf("transport type = %T", got["transport"])
+	}
+	if transport["type"] != "streamable-http" {
+		t.Fatalf("transport.type = %v", transport["type"])
+	}
+	if transport["endpoint"] != "/mcp" {
+		t.Fatalf("transport.endpoint = %v", transport["endpoint"])
+	}
+
+	capabilities, ok := got["capabilities"].(map[string]any)
+	if !ok {
+		t.Fatalf("capabilities type = %T", got["capabilities"])
+	}
+	toolsCaps, ok := capabilities["tools"].(map[string]any)
+	if !ok || toolsCaps["listChanged"] != true {
+		t.Fatalf("capabilities.tools = %#v want listChanged=true", capabilities["tools"])
+	}
+	promptsCaps, ok := capabilities["prompts"].(map[string]any)
+	if !ok || promptsCaps["listChanged"] != true {
+		t.Fatalf("capabilities.prompts = %#v want listChanged=true", capabilities["prompts"])
+	}
+	resourcesCaps, ok := capabilities["resources"].(map[string]any)
+	if !ok {
+		t.Fatalf("capabilities.resources type = %T", capabilities["resources"])
+	}
+	if resourcesCaps["listChanged"] != true || resourcesCaps["subscribe"] != true {
+		t.Fatalf("capabilities.resources = %#v want listChanged=true subscribe=true", capabilities["resources"])
+	}
+
+	auth, ok := got["authentication"].(map[string]any)
+	if !ok {
+		t.Fatalf("authentication type = %T", got["authentication"])
+	}
+	if auth["required"] != true {
+		t.Fatalf("authentication.required = %v", auth["required"])
+	}
+	schemes, ok := auth["schemes"].([]any)
+	if !ok {
+		t.Fatalf("authentication.schemes type = %T", auth["schemes"])
+	}
+	if len(schemes) != 2 || schemes[0] != "bearer" || schemes[1] != "oauth2" {
+		t.Fatalf("authentication.schemes = %v", schemes)
+	}
+
+	// #424: a client that discovers OAuth via the server card itself
+	// (rather than following WWW-Authenticate's resource_metadata pointer)
+	// must be able to bootstrap discovery from these fields alone.
+	authServers, ok := auth["authorization_servers"].([]any)
+	if !ok || len(authServers) != 1 || authServers[0] != "https://mcp.arleo.eu" {
+		t.Fatalf("authentication.authorization_servers = %v", auth["authorization_servers"])
+	}
+	if auth["protected_resource_metadata"] != "https://mcp.arleo.eu/.well-known/oauth-protected-resource" {
+		t.Fatalf("authentication.protected_resource_metadata = %v", auth["protected_resource_metadata"])
+	}
+}
+
+// TestWellKnownMCPServerCardResourcePathAlias covers #424: Mistral Le Chat's
+// connector auto-detect requests the server card under a per-resource
+// sub-path (/.well-known/mcp/server-card/mcp) rather than the canonical
+// /.well-known/mcp/server-card.json, and gives up entirely (never reaching
+// OAuth discovery) on a 404. Confirms the alias serves byte-identical
+// content to the canonical path.
+func TestWellKnownMCPServerCardResourcePathAlias(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+
+	canonical := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(canonical, httptest.NewRequest(http.MethodGet, "/.well-known/mcp/server-card.json", nil))
+	if canonical.Code != http.StatusOK {
+		t.Fatalf("canonical status = %d want 200", canonical.Code)
+	}
+
+	alias := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(alias, httptest.NewRequest(http.MethodGet, "/.well-known/mcp/server-card/mcp", nil))
+	if alias.Code != http.StatusOK {
+		t.Fatalf("alias status = %d want 200", alias.Code)
+	}
+	if alias.Body.String() != canonical.Body.String() {
+		t.Fatalf("alias body = %q, want identical to canonical %q", alias.Body.String(), canonical.Body.String())
+	}
+	if got := alias.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("alias Content-Type = %q want application/json", got)
+	}
+}
+
+func TestLegacyMCPJSONAliasStillServed(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/mcp.json", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q want application/json", ct)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if got["version"] != "1.0" {
+		t.Fatalf("legacy alias should serve same server card version, got %v", got["version"])
+	}
+}
+
+func TestWellKnownOAuthServerMethodNotAllowed(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodPost, "/.well-known/oauth-authorization-server", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d want 405", rec.Code)
+	}
+}
+
+func TestWellKnownProtectedResource(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
+	req.Host = "mcp.arleo.eu" // matches production: the issuer's own host
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q want application/json", ct)
+	}
+
+	var meta struct {
+		Resource              string   `json:"resource"`
+		AuthorizationServers  []string `json:"authorization_servers"`
+		ScopesSupported       []string `json:"scopes_supported"`
+		ResourceDocumentation string   `json:"resource_documentation"`
+		AccessProfiles        map[string]struct {
+			Description    string   `json:"description"`
+			Acquisition    string   `json:"acquisition"`
+			InternalScopes []string `json:"internal_scopes"`
+		} `json:"access_profiles"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if meta.Resource != "https://mcp.arleo.eu/mcp" {
+		t.Errorf("resource = %q want https://mcp.arleo.eu/mcp", meta.Resource)
+	}
+	if len(meta.AuthorizationServers) != 1 || meta.AuthorizationServers[0] != "https://mcp.arleo.eu" {
+		t.Errorf("authorization_servers = %v want [https://mcp.arleo.eu]", meta.AuthorizationServers)
+	}
+	// resource_documentation must point to auth.md, NOT the MCP endpoint.
+	// Scanners follow this URL to find the registration flow; the /mcp endpoint
+	// requires auth and returns 401, breaking agent-readiness checks.
+	if meta.ResourceDocumentation != "https://mcp.arleo.eu/auth.md" {
+		t.Errorf("resource_documentation = %q want https://mcp.arleo.eu/auth.md (must not be the /mcp endpoint)", meta.ResourceDocumentation)
+	}
+	for _, bad := range []string{"mcp"} {
+		for _, scope := range meta.ScopesSupported {
+			if scope == bad {
+				t.Fatalf("scopes_supported must not contain legacy scope %q", bad)
+			}
+		}
+	}
+	wantScopes := []string{"read", "write"}
+	for _, want := range wantScopes {
+		found := false
+		for _, s := range meta.ScopesSupported {
+			if s == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("scopes_supported missing %q, got %v", want, meta.ScopesSupported)
+		}
+	}
+	for _, bad := range []string{"system.admin"} {
+		for _, s := range meta.ScopesSupported {
+			if s == bad {
+				t.Errorf("scopes_supported must not contain removed scope %q", bad)
+			}
+		}
+	}
+	if _, ok := meta.AccessProfiles["reader"]; !ok {
+		t.Fatalf("access_profiles.reader missing from protected resource metadata: %#v", meta.AccessProfiles)
+	}
+	if _, ok := meta.AccessProfiles["operator"]; !ok {
+		t.Fatalf("access_profiles.operator missing from protected resource metadata: %#v", meta.AccessProfiles)
+	}
+}
+
+// TestWellKnownProtectedResourceMatchesReverseProxiedHost is a regression
+// test: this endpoint is reverse-proxied (not redirected) from
+// www.arleo.eu so the two hosts share one implementation instead of
+// drifting. An external validator that checks
+// "resource" against the origin it queried (isitagentready.com's OAuth
+// Protected Resource Metadata check does exactly this, per RFC 9728) must
+// see a "resource" matching www.arleo.eu when it queries www.arleo.eu, not
+// the issuer's own https://mcp.arleo.eu/mcp value — that mismatch is what
+// broke the live check after this endpoint was first simplified into a 308
+// redirect to the issuer's host.
+func TestWellKnownProtectedResourceMatchesReverseProxiedHost(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
+	req.Host = "www.arleo.eu"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	var meta struct {
+		Resource string `json:"resource"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if meta.Resource != "https://www.arleo.eu" {
+		t.Fatalf("resource = %q, want https://www.arleo.eu (must match the queried origin, not the issuer's own /mcp resource)", meta.Resource)
+	}
+}
+
+// TestWellKnownProtectedResourceIgnoresUnrecognizedHost is a security
+// regression test: requestHost is a caller-controlled HTTP Host header.
+// buildProtectedResourceMeta must only substitute it into "resource" when
+// it exactly matches cfg.SiteURL's hostname (the one legitimate
+// reverse-proxied alternate) — never for an arbitrary/spoofed Host, or a
+// request could make this server assert an attacker-chosen "resource" in a
+// document agents use to decide where to send OAuth tokens.
+func TestWellKnownProtectedResourceIgnoresUnrecognizedHost(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource", nil)
+	req.Host = "evil.example"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	var meta struct {
+		Resource string `json:"resource"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if meta.Resource != "https://mcp.arleo.eu/mcp" {
+		t.Fatalf("resource = %q, want the configured default unchanged (https://mcp.arleo.eu/mcp) — an unrecognized Host header must never be reflected", meta.Resource)
+	}
+}
+
+func TestWellKnownProtectedResourceAliasMCP(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil)
+	req.Host = "mcp.arleo.eu" // matches production: the issuer's own host
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type = %q want application/json", ct)
+	}
+
+	var meta struct {
+		Resource             string   `json:"resource"`
+		AuthorizationServers []string `json:"authorization_servers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if meta.Resource != "https://mcp.arleo.eu/mcp" {
+		t.Fatalf("resource = %q want https://mcp.arleo.eu/mcp", meta.Resource)
+	}
+	if len(meta.AuthorizationServers) != 1 || meta.AuthorizationServers[0] != "https://mcp.arleo.eu" {
+		t.Fatalf("authorization_servers = %v want [https://mcp.arleo.eu]", meta.AuthorizationServers)
+	}
+}
+
+// TestWellKnownProtectedResourceAliasMCPIgnoresReverseProxiedHost is a
+// regression test: the /mcp-suffixed alias's path mirrors the protected
+// resource's own path (RFC 9728 §3.1), which is always "<issuer>/mcp" —
+// unlike the base path, it must NOT substitute the queried host into
+// "resource" even when reached through the www.arleo.eu reverse proxy,
+// or the document would claim a resource that doesn't match its own path.
+func TestWellKnownProtectedResourceAliasMCPIgnoresReverseProxiedHost(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil)
+	req.Host = "www.arleo.eu"
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	var meta struct {
+		Resource string `json:"resource"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if meta.Resource != "https://mcp.arleo.eu/mcp" {
+		t.Fatalf("resource = %q, want https://mcp.arleo.eu/mcp (the /mcp alias must not vary by requested host)", meta.Resource)
+	}
+}
+
+func TestAuthServerMetaRegistrationEndpoint(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	var meta struct {
+		RegistrationEndpoint string `json:"registration_endpoint"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	// registration_endpoint must always be present and point to /register (#117).
+	// Removing or omitting it breaks agent-readiness scanners.
+	if meta.RegistrationEndpoint == "" {
+		t.Fatal("registration_endpoint must be present in OAuth authorization server metadata (#117)")
+	}
+	if !strings.HasSuffix(meta.RegistrationEndpoint, "/register") {
+		t.Errorf("registration_endpoint = %q, must end with /register", meta.RegistrationEndpoint)
+	}
+}
+
+func TestAuthServerMetaRegisterURI(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	var meta struct {
+		AgentAuth struct {
+			RegisterURI string `json:"register_uri"`
+			Skill       string `json:"skill"`
+		} `json:"agent_auth"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	// agent_auth.register_uri must be present so agent-readiness scanners can
+	// find the registration endpoint via the auth server discovery metadata.
+	if meta.AgentAuth.RegisterURI == "" {
+		t.Fatal("agent_auth.register_uri must be present in OAuth auth server metadata")
+	}
+	// agent_auth.skill must point to auth.md, not to any endpoint requiring auth.
+	if !strings.HasSuffix(meta.AgentAuth.Skill, "/auth.md") {
+		t.Errorf("agent_auth.skill = %q, must end with /auth.md", meta.AgentAuth.Skill)
+	}
+}
+
+func TestAuthMdContainsRegistrationFlow(t *testing.T) {
+	dir := t.TempDir()
+	// auth.md must contain a machine-readable registration_flow block so
+	// agent-readiness scanners can autonomously complete registration.
+	// This test prevents future code-cleanup from stripping required content.
+	const authMd = `# Auth.md
+
+## Agent registration
+
+### Standalone registration flow
+
+` + "```json\n" + `{
+  "registration_flow": {
+    "step_1_register": {
+      "method": "POST",
+      "url": "https://mcp.arleo.eu/register"
+    }
+  },
+  "endpoints": {
+    "registration_endpoint": "https://mcp.arleo.eu/register"
+  }
+}
+` + "```\n"
+	if err := os.WriteFile(filepath.Join(dir, "auth.md"), []byte(authMd), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv := mustDiscoveryServer(t, dir)
+	req := httptest.NewRequest(http.MethodGet, "/auth.md", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "registration_flow") {
+		t.Error("auth.md must contain 'registration_flow' for agent-readiness scanners")
+	}
+	if !strings.Contains(body, "agent_auth_metadata") {
+		t.Error("auth.md must contain 'agent_auth_metadata' for agent-readiness scanners")
+	}
+	if !strings.Contains(body, "access_profiles") {
+		t.Error("auth.md must contain access_profiles for the reader/operator contract")
+	}
+	if !strings.Contains(body, "\"reader\"") || !strings.Contains(body, "\"operator\"") {
+		t.Error("auth.md must document reader/operator access profiles")
+	}
+	if !strings.Contains(body, "credential_types_supported") {
+		t.Error("auth.md must document anonymous.credential_types_supported")
+	}
+	if !strings.Contains(body, "claim_uri") {
+		t.Error("auth.md must document claim_uri")
+	}
+	if !strings.Contains(body, `"identity_types_supported": ["anonymous", "identity_assertion"]`) {
+		t.Error("auth.md must document ID-JAG identity_assertion support")
+	}
+	if !strings.Contains(body, "/register") {
+		t.Error("auth.md must reference the /register endpoint")
+	}
+	// Scanners extract URLs from auth.md by scanning for https:// prefixes.
+	// A URL followed immediately by a markdown backtick (end-of-line) causes the
+	// scanner to include the backtick in the URL, turning a valid path into a
+	// 404. Ensure no well-known URLs are backtick-wrapped at end-of-line.
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, ".well-known/") && strings.HasSuffix(strings.TrimRight(line, "\r"), "`") {
+			t.Errorf("auth.md line ends with backtick after a .well-known/ URL — scanner will include the backtick in the URL: %q", line)
+		}
+	}
+}
+
+func TestAuthMdAppendsCanonicalRegistrationBlockWhenMissing(t *testing.T) {
+	dir := t.TempDir()
+	const content = "# auth.md\n\nAgent authentication instructions.\n"
+	if err := os.WriteFile(filepath.Join(dir, "auth.md"), []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv := mustDiscoveryServer(t, dir)
+	req := httptest.NewRequest(http.MethodGet, "/auth.md", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "registration_flow") {
+		t.Fatal("auth.md response must append a machine-readable registration_flow block")
+	}
+	if !strings.Contains(body, "agent_auth_metadata") {
+		t.Fatal("auth.md response must append agent_auth_metadata")
+	}
+	if !strings.Contains(body, "access_profiles") {
+		t.Fatal("auth.md response must append access_profiles")
+	}
+	if !strings.Contains(body, "registration_endpoint") {
+		t.Fatal("auth.md response must mention registration_endpoint")
+	}
+	if !strings.Contains(body, "https://mcp.arleo.eu/register") {
+		t.Fatal("auth.md response must reference the canonical /register endpoint")
+	}
+	if !strings.Contains(body, `"internal_scopes": ["write"]`) {
+		t.Fatal("auth.md response must publish operator as the canonical write scope")
+	}
+	if strings.Contains(body, `"internal_scopes": ["read", "write"]`) {
+		t.Fatal("auth.md response must not publish legacy operator scope inheritance")
+	}
+	if !strings.Contains(body, "`reader` maps to `read`; `operator` maps to `write`; `administrator` maps to `admin`.") {
+		t.Fatal("auth.md response must explain the reader/operator/administrator labels in terms of canonical scopes")
+	}
+}
+
+func TestAuthMdAppendsAgentAuthMetadataWhenRegistrationFlowAlreadyExists(t *testing.T) {
+	dir := t.TempDir()
+	const content = `# Auth.md
+
+` + "```json\n" + `{
+  "registration_flow": {
+    "registration_endpoint": "https://mcp.arleo.eu/register"
+  }
+}
+` + "```\n"
+	if err := os.WriteFile(filepath.Join(dir, "auth.md"), []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv := mustDiscoveryServer(t, dir)
+	req := httptest.NewRequest(http.MethodGet, "/auth.md", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		"registration_flow",
+		"agent_auth_metadata",
+		"credential_types_supported",
+		"claim_uri",
+		`"identity_types_supported": ["anonymous", "identity_assertion"]`,
+		"urn:ietf:params:oauth:token-type:id-jag",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("auth.md missing %q", want)
+		}
+	}
+	if strings.Count(body, "registration_flow") != 1 {
+		t.Fatalf("registration_flow should not be duplicated, body:\n%s", body)
+	}
+}
+
+func TestRobotsTxt(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/robots.txt", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "User-agent: *") {
+		t.Errorf("robots.txt missing 'User-agent: *', got: %q", body)
+	}
+	if !strings.Contains(body, "Allow: /") {
+		t.Errorf("robots.txt missing 'Allow: /', got: %q", body)
+	}
+	if !strings.Contains(body, "sitemap.xml") {
+		t.Errorf("robots.txt missing sitemap.xml reference, got: %q", body)
+	}
+	if !strings.Contains(body, "www.arleo.eu") {
+		t.Errorf("robots.txt missing site URL, got: %q", body)
+	}
+}
+
+func TestLLMsTxt(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/llms.txt", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "arleo.eu") {
+		t.Errorf("llms.txt missing site name, got: %q", body)
+	}
+	if !strings.Contains(body, "mcp") {
+		t.Errorf("llms.txt missing MCP reference, got: %q", body)
+	}
+}
+
+func TestAgentJSON(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/agent.json", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if got["name"] == "" || got["url"] == "" {
+		t.Fatalf("agent.json missing required fields: %#v", got)
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if got["status"] != "ok" {
+		t.Fatalf(`status field = %q, want "ok"`, got["status"])
+	}
+}
+
+func TestHealthEndpointMethodNotAllowed(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodPost, "/health", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d want 405", rec.Code)
+	}
+	if allow := rec.Header().Get("Allow"); !strings.Contains(allow, "GET") || !strings.Contains(allow, "HEAD") {
+		t.Errorf("Allow header = %q, want to mention GET and HEAD", allow)
+	}
+}
+
+func TestHealthEndpointHead(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodHead, "/health", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("HEAD response body = %q, want empty", rec.Body.String())
+	}
+}
+
+func TestOpenAPIJSON(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/openapi.json", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if got["openapi"] != "3.1.0" {
+		t.Fatalf("openapi version = %v, want 3.1.0", got["openapi"])
+	}
+	paths, ok := got["paths"].(map[string]any)
+	if !ok {
+		t.Fatalf("paths missing or wrong type: %#v", got["paths"])
+	}
+	// The tool catalog must never be enumerated here — it's dynamic (see
+	// buildOpenAPISpec's doc comment) and documenting it would go stale on
+	// every release. Guard against a future edit accidentally listing tools
+	// as paths — check against real tool names rather than an allowlist of
+	// known-good paths, since the allowlist grows with every legitimate new
+	// path added and would otherwise drift toward never failing.
+	knownToolPaths := []string{
+		"/get_page", "/build_site", "/list_pages", "/create_page", "/update_page",
+		"/delete_page", "/search_pages", "/get_sitemap", "/get_feed", "/validate_site",
+	}
+	for _, tp := range knownToolPaths {
+		if _, ok := paths[tp]; ok {
+			t.Errorf("openapi.json enumerates MCP tool %q as a REST path — tools are dynamic, see buildOpenAPISpec doc comment", tp)
+		}
+	}
+	if _, ok := paths["/mcp"]; !ok {
+		t.Fatalf("openapi.json missing /mcp path")
+	}
+	if _, ok := paths["/register"]; !ok {
+		t.Fatalf("openapi.json missing /register path")
+	}
+}
+
+func TestOpenAPIJSONMethodNotAllowed(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodPost, "/openapi.json", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d want 405", rec.Code)
+	}
+	if allow := rec.Header().Get("Allow"); !strings.Contains(allow, "GET") || !strings.Contains(allow, "HEAD") {
+		t.Errorf("Allow header = %q, want to mention GET and HEAD", allow)
+	}
+}
+
+func TestOpenAPIJSONHead(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodHead, "/openapi.json", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("HEAD response body = %q, want empty", rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/openapi+json" {
+		t.Errorf("Content-Type = %q, want application/openapi+json", ct)
+	}
+}
+
+func TestAuthMdServed(t *testing.T) {
+	dir := t.TempDir()
+	const content = "# auth.md protocol\n\nAgent authentication instructions.\n"
+	if err := os.WriteFile(filepath.Join(dir, "auth.md"), []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv := mustDiscoveryServer(t, dir)
+	req := httptest.NewRequest(http.MethodGet, "/auth.md", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/markdown") {
+		t.Errorf("Content-Type = %q want text/markdown", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "auth.md protocol") {
+		t.Errorf("body missing expected content, got: %q", rec.Body.String())
+	}
+}
+
+// TestAuthMdCorrectsStaleReturnsFields is a regression test: auth.md is
+// hand-authored prose in a separate content repo and has drifted from the
+// real /register and /token response shapes before (it once claimed
+// /register returned only "client_id" and omitted "scope" from /token).
+// The server must self-correct these field lists from the real
+// RegistrationResponse/TokenResponse structs rather than trusting
+// whatever an operator hand-typed.
+func TestAuthMdCorrectsStaleReturnsFields(t *testing.T) {
+	dir := t.TempDir()
+	const stale = "# auth.md\n\n" +
+		"```json\n" +
+		"{\n" +
+		"  \"step_1_register\": {\n" +
+		"    \"returns\": [\"client_id\", \"client_secret\"]\n" +
+		"  },\n" +
+		"  \"step_3_token\": {\n" +
+		"    \"returns\": [\"access_token\", \"token_type\"]\n" +
+		"  }\n" +
+		"}\n" +
+		"```\n"
+	if err := os.WriteFile(filepath.Join(dir, "auth.md"), []byte(stale), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	srv := mustDiscoveryServer(t, dir)
+	req := httptest.NewRequest(http.MethodGet, "/auth.md", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "client_secret") {
+		t.Errorf("stale client_secret field survived rewrite, got: %q", body)
+	}
+	for _, want := range []string{"client_id_issued_at", "grant_types", "response_types",
+		"token_endpoint_auth_method", "code_challenge_methods_supported"} {
+		if !strings.Contains(body, `"`+want+`"`) {
+			t.Errorf("body missing %q from real RegistrationResponse fields, got: %q", want, body)
+		}
+	}
+	if !strings.Contains(body, `"scope"`) {
+		t.Errorf("body missing scope field from real TokenResponse, got: %q", body)
+	}
+}
+
+func TestAuthMdNotFound(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/auth.md", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d want 404", rec.Code)
+	}
+}
+
+func TestSecurityTxtServed(t *testing.T) {
+	cfg := config.Default()
+	cfg.SiteRoot = t.TempDir()
+	cfg.SiteURL = "https://www.arleo.eu"
+	cfg.SecurityContact = "mailto:security@example.com"
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/security.txt", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Contact: mailto:security@example.com") {
+		t.Errorf("security.txt missing Contact, got: %q", body)
+	}
+	if !strings.Contains(body, "Expires:") {
+		t.Errorf("security.txt missing Expires, got: %q", body)
+	}
+	if !strings.Contains(body, "Canonical:") {
+		t.Errorf("security.txt missing Canonical, got: %q", body)
+	}
+}
+
+func TestSecurityTxtNotFoundWhenUnconfigured(t *testing.T) {
+	srv := mustDiscoveryServer(t, t.TempDir())
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/security.txt", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d want 404 when SecurityContact not configured", rec.Code)
+	}
+}
+
+func TestOAuthServerServedWithOAuthDisabled(t *testing.T) {
+	cfg := config.Default()
+	cfg.SiteRoot = t.TempDir()
+	cfg.OAuth.Enabled = false
+	cfg.OAuth.Issuer = "https://mcp.arleo.eu"
+	cfg.OAuth.Resource = "https://mcp.arleo.eu/mcp"
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("discovery must be served even when OAuth is disabled: status = %d", rec.Code)
+	}
+}
+
+func TestDiscoveryHeadRequests(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "auth.md"), []byte("# auth\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	srv := mustDiscoveryServer(t, dir)
+	for _, path := range []string{
+		"/.well-known/oauth-authorization-server",
+		"/.well-known/oauth-protected-resource",
+		"/.well-known/oauth-protected-resource/mcp",
+		"/.well-known/mcp/server-card.json",
+		"/robots.txt",
+		"/llms.txt",
+		"/auth.md",
+	} {
+		req := httptest.NewRequest(http.MethodHead, path, nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("HEAD %s status = %d want 200", path, rec.Code)
+		}
+		if rec.Body.Len() != 0 {
+			t.Fatalf("HEAD %s should not include a body, got %q", path, rec.Body.String())
+		}
+	}
+}

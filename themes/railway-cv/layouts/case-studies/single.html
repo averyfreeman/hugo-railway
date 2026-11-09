@@ -1,0 +1,31 @@
+{{ define "main" }}
+  {{ $repository := false }}
+  {{ range hugo.Data.portfolio.repositories.repositories }}
+    {{ if eq (lower .name) (lower $.Params.repository) }}{{ $repository = . }}{{ end }}
+  {{ end }}
+  <article class="content-page page-shell case-study-page">
+    <header class="content-page__header">
+      <a class="back-link" href="{{ "/portfolio/" | relURL }}">← Back to portfolio</a>
+      <p class="eyebrow">CASE STUDY / {{ .Params.focus }}</p>
+      <h1>{{ .Title }}</h1>
+      <p class="lede">{{ .Params.summary }}</p>
+      <div class="case-study-tags">{{ range .Params.tags }}<span class="badge badge-outline">{{ . }}</span>{{ end }}</div>
+      <div class="case-study-evidence-links">
+        {{ with $repository }}<a class="btn button button--primary" href="{{ .html_url }}" target="_blank" rel="noopener noreferrer">View source on GitHub <span aria-hidden="true">↗</span></a>{{ with .homepage }}<a class="btn button button--quiet" href="{{ . }}" target="_blank" rel="noopener noreferrer">Open live project <span aria-hidden="true">↗</span></a>{{ end }}{{ end }}
+      </div>
+    </header>
+    <div class="content-page__body prose case-study-prose">{{ .Content }}</div>
+    {{ with .Params.related_posts }}
+      <aside class="related-posts" aria-labelledby="related-posts-title">
+        <h2 id="related-posts-title">Related writing</h2>
+        <ul>
+          {{ range . }}
+            {{ $path := . }}
+            {{ $relatedPages := where site.RegularPages "RelPermalink" $path }}
+            {{ with index $relatedPages 0 }}<li><a href="{{ .RelPermalink }}">{{ .Title }} <span aria-hidden="true">↗</span></a></li>{{ end }}
+          {{ end }}
+        </ul>
+      </aside>
+    {{ end }}
+  </article>
+{{ end }}

@@ -1,0 +1,18 @@
+<header class="site-header" data-site-header>
+  <div class="site-header__inner page-shell navbar">
+    <a class="brand" href="{{ "/" | relURL }}" aria-label="{{ hugo.Data.home.identity.name }} home">
+      <span class="brand__mark">{{ hugo.Data.home.identity.mark }}</span>
+      <span class="brand__name">{{ hugo.Data.home.identity.name }} <small>/ {{ hugo.Data.home.identity.descriptor | default "software & systems" }}</small></span>
+    </a>
+    <nav class="site-nav" id="site-nav" aria-label="Primary navigation">
+      {{ range hugo.Data.home.navigation }}
+        {{ $href := .url }}
+        {{ if not .external }}{{ $href = .url | relURL }}{{ end }}
+        <a href="{{ $href }}"{{ if .cta }} class="btn btn-ghost site-nav__cta"{{ end }}{{ if .external }} rel="me"{{ end }}>{{ .label }}{{ if .external }} <span aria-hidden="true">↗</span>{{ end }}</a>
+      {{ end }}
+    </nav>
+    <button class="menu-toggle" type="button" aria-label="Open navigation menu" aria-controls="site-nav" aria-expanded="false" data-menu-toggle>
+      <span class="sr-only">Toggle navigation</span><i></i><i></i>
+    </button>
+  </div>
+</header>

@@ -1,0 +1,12 @@
+schema_version: 1.0.0
+revision: 1
+scope: hugo-railway
+problem: Build a hiring-first Hugo developer portfolio that demonstrates the reusable Railway-CV theme and a portable Hugo MCP server packaged as a Codex plugin and MCPB.
+languages:
+    - go
+adr_files:
+    - docs/adr/0001-monorepo-boundaries.md
+    - docs/adr/0002-static-first-notebook-rendering.md
+    - docs/adr/0003-progressive-signal-motion.md
+    - docs/adr/0004-protected-demo-staged-vitepress-migration.md
+    - docs/adr/0005-hiring-first-hugo-portfolio.md

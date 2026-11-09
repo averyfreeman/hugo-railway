@@ -1,0 +1,3689 @@
+package server_test
+
+import (
+	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/buildinfo"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/config"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/hugosite"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/previewstore"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/server"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/site"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/storage"
+	_ "modernc.org/sqlite"
+)
+
+func mustTestServer(t *testing.T) *server.Server {
+	t.Helper()
+	cfg := config.Default()
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	return srv
+}
+
+func copyServerFixtureTree(t *testing.T, source string) string {
+	t.Helper()
+	destination := t.TempDir()
+	err := filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, rel)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
+	if err != nil {
+		t.Fatalf("copyServerFixtureTree(%q): %v", source, err)
+	}
+	return destination
+}
+
+func mustOAuthServer(t *testing.T) *server.Server {
+	t.Helper()
+	// Bake in a read client for http://localhost:9999/cb. Since #497, DCR
+	// always grants "read" regardless of match, so this registry entry is no
+	// longer strictly required for that outcome — kept for clarity so
+	// TestReadCannotCallWriteTool/TestReadCannotCallSiteAdminTool document the
+	// read→write boundary explicitly.
+	registryPath := filepath.Join(t.TempDir(), "clients.yaml")
+	if err := os.WriteFile(registryPath, []byte(`clients:
+- client_id: test-read-client
+  client_secret: test-read-secret
+  redirect_uris:
+    - http://localhost:9999/cb
+  scope: read
+`), 0o600); err != nil {
+		t.Fatalf("write test registry: %v", err)
+	}
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.HugoRoot = t.TempDir()
+	cfg.ContentRoot = filepath.Join("..", "..", "testdata", "fixtures", "content")
+	cfg.OAuth = config.OAuthConfig{
+		Enabled:               true,
+		Issuer:                "https://mcp.test",
+		DynamicClientEnabled:  true,
+		AuthCodeTTLSeconds:    300,
+		AccessTokenTTLSeconds: 3600,
+		TrustedAuthorizeCIDRs: []string{"127.0.0.1/32", "::1/128"},
+		ClientRegistryPath:    registryPath,
+	}
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	return srv
+}
+
+func mustOAuthServerWithRegistry(t *testing.T, registryPath string) *server.Server {
+	t.Helper()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.HugoRoot = t.TempDir()
+	cfg.ContentRoot = filepath.Join("..", "..", "testdata", "fixtures", "content")
+	cfg.OAuth = config.OAuthConfig{
+		Enabled:               true,
+		Issuer:                "https://mcp.test",
+		DynamicClientEnabled:  true,
+		AuthCodeTTLSeconds:    300,
+		AccessTokenTTLSeconds: 3600,
+		TrustedAuthorizeCIDRs: []string{"127.0.0.1/32", "::1/128"},
+		ClientRegistryPath:    registryPath,
+	}
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	return srv
+}
+
+func mustOAuthSQLiteServer(t *testing.T, storePath string) *server.Server {
+	t.Helper()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.HugoRoot = t.TempDir()
+	cfg.ContentRoot = filepath.Join("..", "..", "testdata", "fixtures", "content")
+	cfg.OAuth = config.OAuthConfig{
+		Enabled:               true,
+		Issuer:                "https://mcp.test",
+		DynamicClientEnabled:  true,
+		AuthCodeTTLSeconds:    300,
+		AccessTokenTTLSeconds: 3600,
+		TrustedAuthorizeCIDRs: []string{"127.0.0.1/32", "::1/128"},
+		StorageBackend:        "sqlite",
+		StoragePath:           storePath,
+	}
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	return srv
+}
+
+func mustOAuthSQLiteServerWithConfig(t *testing.T, cfg config.Config, storePath string) *server.Server {
+	t.Helper()
+	cfg.OAuth = config.OAuthConfig{
+		Enabled:               true,
+		Issuer:                "https://mcp.test",
+		DynamicClientEnabled:  true,
+		AuthCodeTTLSeconds:    300,
+		AccessTokenTTLSeconds: 3600,
+		TrustedAuthorizeCIDRs: []string{"127.0.0.1/32", "::1/128"},
+		StorageBackend:        "sqlite",
+		StoragePath:           storePath,
+	}
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	return srv
+}
+
+func addBearerToken(t *testing.T, storePath, rawToken, scope string) {
+	addBearerTokenWithPrincipal(t, storePath, rawToken, scope, rawToken)
+}
+
+func addBearerTokenWithPrincipal(t *testing.T, storePath, rawToken, scope, principal string) {
+	t.Helper()
+	store, err := storage.NewSQLite(storePath)
+	if err != nil {
+		t.Fatalf("NewSQLite() error = %v", err)
+	}
+	defer store.Close()
+	if err := store.AddAccessToken(oauthHashForTest(rawToken), scope, principal, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("AddAccessToken() error = %v", err)
+	}
+}
+
+func TestMCPEndpointResponds(t *testing.T) {
+	srv := mustTestServer(t)
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d want 200 body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "tools") {
+		t.Fatalf("body missing tools: %q", rec.Body.String())
+	}
+}
+
+// TestInitializeExposesRuntimeBuildVersion proves mcp.Implementation.Version
+// (surfaced in the initialize response's serverInfo.version) tracks
+// buildinfo.Version — the actual deployed build/release identifier injected
+// via -ldflags — rather than silently reporting the "dev" placeholder on a
+// release build (#327).
+func TestInitializeExposesRuntimeBuildVersion(t *testing.T) {
+	orig := buildinfo.Version
+	buildinfo.Version = "v1.4.7-runtime-test"
+	defer func() { buildinfo.Version = orig }()
+
+	srv := mustTestServer(t)
+	body := []byte(`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("initialize status = %d body = %q", rec.Code, rec.Body.String())
+	}
+
+	var result struct {
+		Result struct {
+			ServerInfo struct {
+				Version string `json:"version"`
+			} `json:"serverInfo"`
+		} `json:"result"`
+	}
+	found := false
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		line = strings.TrimSpace(line)
+		data := strings.TrimPrefix(line, "data: ")
+		if err := json.Unmarshal([]byte(data), &result); err == nil && result.Result.ServerInfo.Version != "" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("initialize response did not contain a parseable serverInfo.version: %q", rec.Body.String())
+	}
+	if result.Result.ServerInfo.Version != "v1.4.7-runtime-test" {
+		t.Fatalf("serverInfo.version = %q, want buildinfo.Version %q", result.Result.ServerInfo.Version, "v1.4.7-runtime-test")
+	}
+	if result.Result.ServerInfo.Version == "dev" {
+		t.Fatal("serverInfo.version must not fall back to the dev placeholder once buildinfo.Version is set")
+	}
+}
+
+func TestUnknownPathReturns404(t *testing.T) {
+	srv := mustTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/unknown", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d want 404", rec.Code)
+	}
+}
+
+// TestOAuthEndpointsSupportCORSPreflight covers a real bug found live
+// (Mistral Le Chat, 2026-07-18): a browser-based OAuth client calling
+// /register, /authorize, or /token directly (not just navigating to them)
+// sends a CORS preflight OPTIONS request first. Before this fix, these
+// endpoints had no CORS support at all — OPTIONS got a plain 405 with no
+// Access-Control-Allow-Origin — so a browser would block the real request
+// before it ever reached this server, showing the client a generic
+// "can't connect" with nothing in this server's own logs to explain it.
+// Confirmed live via curl against production before landing this fix.
+func TestOAuthEndpointsSupportCORSPreflight(t *testing.T) {
+	srv := mustOAuthServer(t)
+	for _, path := range []string{"/register", "/authorize", "/token"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodOptions, path, nil)
+			req.Header.Set("Origin", "https://chat.mistral.ai")
+			req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+			rec := httptest.NewRecorder()
+
+			srv.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusNoContent {
+				t.Fatalf("%s OPTIONS status = %d, want 204", path, rec.Code)
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+				t.Fatalf("%s OPTIONS Access-Control-Allow-Origin = %q, want \"*\"", path, got)
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Methods"); got == "" {
+				t.Fatalf("%s OPTIONS Access-Control-Allow-Methods missing", path)
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Headers"); got == "" {
+				t.Fatalf("%s OPTIONS Access-Control-Allow-Headers missing", path)
+			}
+		})
+	}
+}
+
+// TestOAuthEndpointsSetCORSOnRealResponseNotJustPreflight covers the other
+// half of the same fix: a passing preflight isn't enough for a browser to
+// accept the actual response — the real GET/POST response needs
+// Access-Control-Allow-Origin too, or client-side JS still can't read it.
+func TestOAuthEndpointsSetCORSOnRealResponseNotJustPreflight(t *testing.T) {
+	srv := mustOAuthServer(t)
+	regBody, _ := json.Marshal(map[string]any{
+		"redirect_uris": []string{"http://localhost:9999/cb"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/register", bytes.NewReader(regBody))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://chat.mistral.ai")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("register status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("register real response Access-Control-Allow-Origin = %q, want \"*\"", got)
+	}
+}
+
+func TestACLBlocksProtectedToolAnonymous(t *testing.T) {
+	// With OAuth enabled, unauthenticated requests get 401 before reaching
+	// the ACL layer — the challenge is the guard, not a 403.
+	srv := mustOAuthServer(t)
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_page_markdown"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d want 401 body = %q", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("WWW-Authenticate") == "" {
+		t.Fatal("unauthenticated /mcp must include WWW-Authenticate header")
+	}
+}
+
+func TestACLAllowsPublicToolAnonymous(t *testing.T) {
+	// With OAuth enabled every /mcp request without a token gets 401 so that
+	// OAuth clients discover the authorization server. Public tools are still
+	// accessible once a token is acquired (any scope level).
+	srv := mustOAuthServer(t)
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_pages"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated request, got %d: %q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMCPMethodNotAllowed(t *testing.T) {
+	srv := mustTestServer(t)
+	// PUT is not a valid MCP method (GET/POST/DELETE are all spec-valid)
+	req := httptest.NewRequest(http.MethodPut, "/mcp", nil)
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d want 405", rec.Code)
+	}
+	allow := rec.Header().Get("Allow")
+	if allow != "GET, POST, DELETE" {
+		t.Fatalf("Allow = %q want \"GET, POST, DELETE\"", allow)
+	}
+}
+
+func toolsListNames(t *testing.T, body string) []string {
+	t.Helper()
+	var result struct {
+		Result struct {
+			Tools []struct {
+				Name string `json:"name"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		data := line
+		if strings.HasPrefix(line, "data: ") {
+			data = strings.TrimPrefix(line, "data: ")
+		}
+		if err := json.Unmarshal([]byte(data), &result); err == nil && len(result.Result.Tools) > 0 {
+			names := make([]string, len(result.Result.Tools))
+			for i, tool := range result.Result.Tools {
+				names[i] = tool.Name
+			}
+			return names
+		}
+	}
+	return nil
+}
+
+func toolsListPayload(t *testing.T, body string) string {
+	t.Helper()
+	var result struct {
+		Result struct {
+			Tools []any `json:"tools"`
+		} `json:"result"`
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		data := line
+		if strings.HasPrefix(line, "data: ") {
+			data = strings.TrimPrefix(line, "data: ")
+		}
+		if err := json.Unmarshal([]byte(data), &result); err == nil && len(result.Result.Tools) > 0 {
+			normalized, err := json.Marshal(result.Result.Tools)
+			if err != nil {
+				t.Fatalf("marshal normalized tools payload: %v", err)
+			}
+			return string(normalized)
+		}
+	}
+	t.Fatalf("tools/list response did not contain a parseable tools payload: %q", body)
+	return ""
+}
+
+// initMCPSession sends an initialize request and returns the session ID.
+// Required in stateful mode: without initialize, the session is uninitialized
+// and tools/list returns an empty list.
+func initMCPSession(t *testing.T, srv *server.Server, bearer string) string {
+	t.Helper()
+	body := []byte(`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.0.1"}}}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("initialize status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	sessionID := rec.Header().Get("Mcp-Session-Id")
+	if sessionID == "" {
+		t.Fatal("initialize response missing Mcp-Session-Id header")
+	}
+	return sessionID
+}
+
+func doMCPToolsList(t *testing.T, srv *server.Server, bearer string) []string {
+	t.Helper()
+	body := doMCPToolsListBody(t, srv, bearer, nil)
+	return toolsListNames(t, body)
+}
+
+func doMCPToolsListBody(t *testing.T, srv *server.Server, bearer string, extraHeaders map[string]string) string {
+	t.Helper()
+	sessionID := initMCPSession(t, srv, bearer)
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tools/list status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	return rec.Body.String()
+}
+
+func doMCPCall(t *testing.T, srv *server.Server, bearer string, payload []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	// ACL-blocked calls (403) never reach go-sdk, so they don't need a session.
+	// We still initialize to be correct for calls that succeed.
+	sessionID := initMCPSession(t, srv, bearer)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+func obtainBearerToken(t *testing.T, srv *server.Server) string {
+	t.Helper()
+
+	regBody, _ := json.Marshal(map[string]any{
+		"redirect_uris": []string{"http://localhost:9999/cb"},
+	})
+	regReq := httptest.NewRequest(http.MethodPost, "/register", bytes.NewReader(regBody))
+	regReq.Header.Set("Content-Type", "application/json")
+	regRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(regRec, regReq)
+	if regRec.Code != http.StatusCreated {
+		t.Fatalf("register status = %d body = %q", regRec.Code, regRec.Body.String())
+	}
+	var regResp struct {
+		ClientID string `json:"client_id"`
+	}
+	if err := json.Unmarshal(regRec.Body.Bytes(), &regResp); err != nil {
+		t.Fatalf("register decode: %v", err)
+	}
+	clientID := regResp.ClientID
+
+	verifierBytes := make([]byte, 32)
+	if _, err := rand.Read(verifierBytes); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	verifier := base64.RawURLEncoding.EncodeToString(verifierBytes)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	authParams := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {"http://localhost:9999/cb"},
+		"state":                 {"teststate"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}
+	authURL := fmt.Sprintf("/authorize?%s", authParams.Encode())
+	authReq := httptest.NewRequest(http.MethodGet, authURL, nil)
+	authReq.RemoteAddr = "127.0.0.1:1234"
+	authRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusFound {
+		t.Fatalf("authorize status = %d body = %q", authRec.Code, authRec.Body.String())
+	}
+	loc, err := url.Parse(authRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatalf("no code in redirect: %q", authRec.Header().Get("Location"))
+	}
+
+	tokenForm := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {clientID},
+		"redirect_uri":  {"http://localhost:9999/cb"},
+		"code":          {code},
+		"code_verifier": {verifier},
+	}
+	tokenReq := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(tokenForm.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body = %q", tokenRec.Code, tokenRec.Body.String())
+	}
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(io.NopCloser(bytes.NewReader(tokenRec.Body.Bytes()))).Decode(&tokenResp); err != nil {
+		t.Fatalf("token decode: %v", err)
+	}
+	if tokenResp.AccessToken == "" {
+		t.Fatalf("empty access_token in: %q", tokenRec.Body.String())
+	}
+	return tokenResp.AccessToken
+}
+
+func rewriteTokenScopeToLegacyMCP(t *testing.T, storePath, token string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatalf("open token store: %v", err)
+	}
+	defer db.Close()
+	key := oauthHashForTest(token)
+	if _, err := db.Exec(`UPDATE access_tokens SET scope = ? WHERE token = ?`, "mcp", key); err != nil {
+		t.Fatalf("update token scope: %v", err)
+	}
+}
+
+func oauthHashForTest(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+// withDefaultLogger replaces the global slog default for the duration of one
+// test. Do NOT use in tests that call t.Parallel() — the global mutation is
+// not goroutine-safe across parallel test cases.
+func withDefaultLogger(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+	})
+	return &buf
+}
+
+func TestUnauthenticatedMCPReturns401WithWWWAuthenticate(t *testing.T) {
+	// When OAuth is enabled every unauthenticated /mcp request must return 401
+	// so that OAuth clients (Claude.ai, ChatGPT) discover the authorization
+	// server and start the PKCE flow (RFC 6750 §3.1).
+	srv := mustOAuthServer(t)
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d want 401", rec.Code)
+	}
+	wwwAuth := rec.Header().Get("WWW-Authenticate")
+	if wwwAuth == "" {
+		t.Fatal("missing WWW-Authenticate header on unauthenticated /mcp")
+	}
+	if !strings.Contains(wwwAuth, `realm="`) {
+		t.Fatalf("WWW-Authenticate missing realm parameter: %q", wwwAuth)
+	}
+	if !strings.Contains(wwwAuth, "resource_metadata=") {
+		t.Fatalf("WWW-Authenticate missing resource_metadata: %q", wwwAuth)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q want %q", got, "no-store")
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != "unauthorized" {
+		t.Fatalf("body = %q want %q", body, "unauthorized")
+	}
+}
+
+// TestMCPRejectsQueryStringBearerToken proves a valid access token passed as
+// a URL query parameter (?access_token=...) is never accepted as a
+// substitute for the Authorization header (#1069). Query strings land in
+// server access logs and browser history, so RFC 6750 forbids this transport
+// for confidential clients; newMCPBearerAuthMiddleware only ever inspects the
+// Authorization header, so this also guards against a future refactor that
+// starts consulting the query string.
+func TestMCPRejectsQueryStringBearerToken(t *testing.T) {
+	srv := mustOAuthServer(t)
+	bearer := obtainBearerToken(t, srv)
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp?access_token="+bearer, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d want 401 for a query-string-only bearer token", rec.Code)
+	}
+	// missing_bearer (no Authorization header at all), not invalid_token —
+	// the query string must never be evaluated as a bearer credential.
+	if wwwAuth := rec.Header().Get("WWW-Authenticate"); strings.Contains(wwwAuth, `error="invalid_token"`) {
+		t.Fatalf("WWW-Authenticate = %q: query-string token must be ignored (missing_bearer), not evaluated as invalid_token", wwwAuth)
+	}
+}
+
+func TestInSessionMissingBearerEmitsStructuredLog(t *testing.T) {
+	srv := mustOAuthServer(t)
+	logBuf := withDefaultLogger(t)
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Mcp-Session-Id", "session-123")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d want 401", rec.Code)
+	}
+	raw := logBuf.String()
+	if !strings.Contains(raw, `"msg":"audit"`) {
+		t.Fatalf("missing audit log: %s", raw)
+	}
+	if !strings.Contains(raw, `"event_type":"auth_rejected"`) {
+		t.Fatalf("missing event_type=auth_rejected in log: %s", raw)
+	}
+	if !strings.Contains(raw, `"result":"missing_bearer"`) {
+		t.Fatalf("missing rejection reason in log: %s", raw)
+	}
+	if !strings.Contains(raw, `"has_session":true`) {
+		t.Fatalf("missing has_session=true in log: %s", raw)
+	}
+}
+
+func TestInSessionInvalidBearerEmitsStructuredLog(t *testing.T) {
+	srv := mustOAuthServer(t)
+	logBuf := withDefaultLogger(t)
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Mcp-Session-Id", "session-123")
+	req.Header.Set("Authorization", "Bearer definitely-invalid")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d want 401", rec.Code)
+	}
+	wwwAuth := rec.Header().Get("WWW-Authenticate")
+	if !strings.Contains(wwwAuth, `realm="`) {
+		t.Fatalf("WWW-Authenticate missing realm parameter: %q", wwwAuth)
+	}
+	if !strings.Contains(wwwAuth, `error="invalid_token"`) {
+		t.Fatalf("WWW-Authenticate missing invalid_token marker: %q", wwwAuth)
+	}
+	raw := logBuf.String()
+	if !strings.Contains(raw, `"msg":"audit"`) {
+		t.Fatalf("missing audit log: %s", raw)
+	}
+	if !strings.Contains(raw, `"event_type":"auth_rejected"`) {
+		t.Fatalf("missing event_type=auth_rejected in log: %s", raw)
+	}
+	if !strings.Contains(raw, `"result":"invalid_token"`) {
+		t.Fatalf("missing invalid_token reason in log: %s", raw)
+	}
+	if !strings.Contains(raw, `"has_session":true`) {
+		t.Fatalf("missing has_session=true in log: %s", raw)
+	}
+}
+
+// TestScopeDeniedToolCallEmitsStructuredAuditLog proves the security audit
+// trail (#371) acceptance criteria for insufficient-scope denials: a
+// read token attempting a write tool must produce a
+// distinguishable event_type=scope_denied audit line (not just a generic
+// tool_error), and that line must never contain the caller's raw bearer
+// token.
+func TestScopeDeniedToolCallEmitsStructuredAuditLog(t *testing.T) {
+	srv := mustOAuthServer(t)
+	logBuf := withDefaultLogger(t)
+	bearer := obtainBearerToken(t, srv)
+
+	payload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page"}}`)
+	rec := doMCPCall(t, srv, bearer, payload)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+
+	raw := logBuf.String()
+	if !strings.Contains(raw, `"msg":"audit"`) {
+		t.Fatalf("missing audit log: %s", raw)
+	}
+	if !strings.Contains(raw, `"event_type":"scope_denied"`) {
+		t.Fatalf("missing event_type=scope_denied in log: %s", raw)
+	}
+	if !strings.Contains(raw, `"scope":"read"`) {
+		t.Fatalf("missing caller scope in log: %s", raw)
+	}
+	if strings.Contains(raw, bearer) {
+		t.Fatalf("audit log must never contain the raw bearer token: %s", raw)
+	}
+}
+
+// TestOversizedRequestBodyReturnsActionableError is a regression test for
+// #1190: a POST body over max_request_bytes previously fell into
+// io.LimitReader's silent truncation, and the truncated JSON then failed
+// ScopePolicy.parse — so a caller sending e.g. an oversized
+// upload_page_asset content_base64 payload got a misleading 403
+// scope_denied/unknown_tool instead of an error naming the actual limit
+// hit. It must now fail fast with 413 and a message identifying
+// max_request_bytes, before the truncated body ever reaches the scope
+// check.
+// TestToolCatalogVisibleCountMatchesActualToolsList is a regression test
+// for #1175's own diagnostic to be trustworthy: get_capabilities.data.
+// tool_catalog.visible_count is computed from a package-level tools.Registry
+// reconstruction (internal/tools/anonymous.visibleToolCatalog), separate
+// from the actual per-scope *mcp.Server built here — a drift between the
+// two (e.g. a tool registered outside any Defs() function, or a Defs()
+// entry for a tool that never actually registers) would make the
+// stale-discovery detector itself unreliable, firing false mismatches on
+// every healthy session. Compares visible_count directly against a real
+// tools/list call on the same session for every canonical scope. The read
+// case is essential: writeEnabled is deployment state, not permission to
+// register the write package on a read-scoped server (#1244).
+func TestToolCatalogVisibleCountMatchesActualToolsList(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	srv := mustOAuthSQLiteServer(t, storePath)
+
+	for _, scope := range []string{"read", "write", "admin"} {
+		t.Run(scope, func(t *testing.T) {
+			bearer := "tool-catalog-" + scope + "-token"
+			addBearerToken(t, storePath, bearer, scope)
+
+			names := doMCPToolsListAtPath(t, srv, "/mcp", bearer)
+
+			rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_capabilities"}}`))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("get_capabilities status = %d body = %q", rec.Code, rec.Body.String())
+			}
+			payload := rec.Body.String()
+			if i := strings.Index(payload, "{"); i > 0 {
+				payload = payload[i:]
+			}
+			var rpc struct {
+				Result struct {
+					StructuredContent map[string]any `json:"structuredContent"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal([]byte(payload), &rpc); err != nil {
+				t.Fatalf("unmarshal get_capabilities response: %v\nbody=%q", err, rec.Body.String())
+			}
+			data, _ := rpc.Result.StructuredContent["data"].(map[string]any)
+			toolCatalog, _ := data["tool_catalog"].(map[string]any)
+			visibleCount, _ := toolCatalog["visible_count"].(float64)
+
+			if int(visibleCount) != len(names) {
+				t.Fatalf("tool_catalog.visible_count = %d, want %d (actual tools/list count for scope %q); tools/list names = %v", int(visibleCount), len(names), scope, names)
+			}
+		})
+	}
+}
+
+func TestOversizedRequestBodyReturnsActionableError(t *testing.T) {
+	srv := mustOAuthServer(t) // config.Default() leaves max_request_bytes at its 1 MiB default
+	logBuf := withDefaultLogger(t)
+	bearer := obtainBearerToken(t, srv)
+
+	oversized := bytes.Repeat([]byte("a"), (1<<20)+1024)
+	payload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"upload_page_asset","arguments":{"content_base64":"` + string(oversized) + `"}}}`)
+	rec := doMCPCall(t, srv, bearer, payload)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body = %q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "max_request_bytes") {
+		t.Fatalf("error body doesn't name max_request_bytes: %s", body)
+	}
+	if !strings.Contains(body, "asset_upload") {
+		t.Fatalf("error body doesn't point to get_capabilities.data.asset_upload for the actual reachable limit: %s", body)
+	}
+	if !strings.Contains(body, `"code":-32010`) {
+		t.Fatalf("error.code must be distinct from scope_denied's -32001: %s", body)
+	}
+
+	// A body-size rejection is a transport condition, not an authorization
+	// failure — it must never be tagged event_type=scope_denied, since that
+	// event is a security signal operators alert on
+	// (TestScopeDeniedToolCallEmitsStructuredAuditLog covers its real use).
+	raw := logBuf.String()
+	if strings.Contains(raw, `"event_type":"scope_denied"`) {
+		t.Fatalf("oversized-body rejection must not be logged as scope_denied: %s", raw)
+	}
+	if !strings.Contains(raw, `"event_type":"request_rejected"`) {
+		t.Fatalf("missing event_type=request_rejected in audit log: %s", raw)
+	}
+}
+
+func TestOversizedJSONRPCBatchReturnsActionableError(t *testing.T) {
+	srv := mustOAuthServer(t)
+	bearer := obtainBearerToken(t, srv)
+	batch := make([]map[string]any, 51)
+	for i := range batch {
+		batch[i] = map[string]any{
+			"jsonrpc": "2.0",
+			"id":      i + 1,
+			"method":  "tools/list",
+		}
+	}
+	payload, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := doMCPCall(t, srv, bearer, payload)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "batch_too_large: maximum 50 requests") {
+		t.Fatalf("oversized batch response is not actionable: %q", rec.Body.String())
+	}
+}
+
+// TestRequestBodyExactlyAtLimitIsNotRejected guards the off-by-one this
+// fix depends on: the size check reads one byte past maxBody specifically
+// so a body landing exactly on max_request_bytes is let through, not
+// caught by the same '>' that must reject anything larger. A future
+// '>' -> '>=' typo would 413 every request sitting exactly at the
+// configured limit, and nothing else would catch it.
+func TestRequestBodyExactlyAtLimitIsNotRejected(t *testing.T) {
+	srv := mustOAuthServer(t) // config.Default() leaves max_request_bytes at its 1 MiB default
+	bearer := obtainBearerToken(t, srv)
+
+	const maxRequestBytes = 1 << 20
+	suffix := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	payload := append(bytes.Repeat([]byte(" "), maxRequestBytes-len(suffix)), suffix...)
+	if len(payload) != maxRequestBytes {
+		t.Fatalf("test setup: payload length = %d, want exactly %d", len(payload), maxRequestBytes)
+	}
+
+	rec := doMCPCall(t, srv, bearer, payload)
+	if rec.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("a body exactly at max_request_bytes must not be rejected as too large: status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestWriteTokenCannotInvokeAdminOnlyTools is #1069's remaining matrix gap:
+// existing coverage proves the four managed Hugo binary lifecycle tools
+// (stage_hugo_upgrade/activate_hugo/rollback_hugo/bootstrap_hugo) are
+// absent from a write-scope token's tools/list (TestSystemAdminClientSeesWriteAndAdminTools's
+// sibling test at the top of this file), and TestScopeDeniedToolCallEmitsStructuredAuditLog
+// proves a read token calling a write tool is rejected at call time — but
+// nothing ever actually calls one of these four admin-only tools with a
+// write-scope token. Listing exclusion and call-time enforcement are
+// different mechanisms; only this proves the real security boundary (a
+// caller could always attempt tools/call for a tool it can't see).
+func TestWriteTokenCannotInvokeAdminOnlyTools(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	srv := mustOAuthSQLiteServer(t, storePath)
+
+	const bearer = "write-scope-admin-boundary-token"
+	addBearerToken(t, storePath, bearer, "write")
+
+	for _, tool := range []string{"stage_hugo_upgrade", "activate_hugo", "rollback_hugo", "bootstrap_hugo"} {
+		t.Run(tool, func(t *testing.T) {
+			payload := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"%s","arguments":{}}}`, tool))
+			rec := doMCPCall(t, srv, bearer, payload)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("%s: status = %d body = %q, want 403", tool, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestToolsListAuthenticatedReturnsThirtyTwoTools(t *testing.T) {
+	// mustOAuthServer includes a read client for http://localhost:9999/cb,
+	// so obtainBearerToken (which DCR-registers with that redirect URI) gets a
+	// read token via resolveRegistrationScope (#249).
+	srv := mustOAuthServer(t)
+	bearer := obtainBearerToken(t, srv)
+	names := doMCPToolsList(t, srv, bearer)
+	if len(names) != 32 {
+		t.Fatalf("authenticated tools/list = %d tools, want 32; got %v", len(names), names)
+	}
+	for _, name := range []string{"get_page_markdown", "get_page_frontmatter", "get_related_content", "build_agent_context", "export_agent_context", "check_ai_readiness", "search_content", "explain_structure", "get_site_health", "diff_page", "validate_frontmatter", "validate_site", "suggest_links"} {
+		found := false
+		for _, n := range names {
+			if n == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("authenticated tools/list missing %q; got %v", name, names)
+		}
+	}
+}
+
+func TestReaderTokenToolsListMatchesReadOnlyCatalog(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	srv := mustOAuthSQLiteServer(t, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	names := doMCPToolsList(t, srv, bearer)
+	if len(names) != 32 {
+		t.Fatalf("reader tools/list = %d tools, want 32; got %v", len(names), names)
+	}
+	for _, name := range []string{
+		"list_pages", "get_page", "search_pages", "get_recent_posts", "list_tags", "list_categories", "get_sitemap", "get_feed", "get_site_information", "get_capabilities",
+		"get_page_markdown", "get_page_frontmatter", "get_related_content", "build_agent_context", "export_agent_context", "check_ai_readiness",
+		"search_content", "explain_structure", "get_site_health", "diff_page", "validate_frontmatter", "validate_site",
+		"get_broken_links", "get_backlinks", "suggest_links",
+	} {
+		found := false
+		for _, got := range names {
+			if got == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("reader tools/list missing %q; got %v", name, names)
+		}
+	}
+	for _, forbidden := range []string{"create_page", "update_page", "delete_page", "build_site", "preview_build", "run_post_build_hooks", "get_hugo_update", "stage_hugo_upgrade", "activate_hugo", "rollback_hugo", "bootstrap_hugo"} {
+		for _, got := range names {
+			if got == forbidden {
+				t.Fatalf("reader tools/list must not include %q; got %v", forbidden, names)
+			}
+		}
+	}
+}
+
+func TestOAuthEnabledToolsListDescriptionsDoNotClaimBearerlessOrLegacyReadScopes(t *testing.T) {
+	srv := mustOAuthServer(t)
+	bearer := obtainBearerToken(t, srv)
+	body := doMCPToolsListBody(t, srv, bearer, nil)
+
+	var result struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	parsed := false
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		data := line
+		if strings.HasPrefix(line, "data: ") {
+			data = strings.TrimPrefix(line, "data: ")
+		}
+		if err := json.Unmarshal([]byte(data), &result); err == nil && len(result.Result.Tools) > 0 {
+			parsed = true
+			break
+		}
+	}
+	if !parsed {
+		t.Fatalf("tools/list response did not contain a parseable tools payload: %q", body)
+	}
+
+	forbiddenGlobal := []string{
+		"No authentication required",
+		"Does not require authentication",
+		"Requires content.read",
+		"requires content.read",
+		"if you have content.read scope",
+	}
+	for _, tool := range result.Result.Tools {
+		for _, bad := range forbiddenGlobal {
+			if strings.Contains(tool.Description, bad) {
+				t.Fatalf("tool %q description still contains forbidden auth wording %q: %q", tool.Name, bad, tool.Description)
+			}
+		}
+	}
+
+	mustContain := map[string]string{
+		"search_pages":      "read Bearer token",
+		"search_content":    "read Bearer token",
+		"get_page_markdown": "read Bearer token",
+		"get_site_health":   "translation_pair",
+	}
+	for name, needle := range mustContain {
+		found := false
+		for _, tool := range result.Result.Tools {
+			if tool.Name == name {
+				found = true
+				if !strings.Contains(tool.Description, needle) {
+					t.Fatalf("tool %q description = %q, want substring %q", name, tool.Description, needle)
+				}
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("tools/list missing %q", name)
+		}
+	}
+}
+
+func TestReaderTokenGetPageRejectsSourceOnlyFallback(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	publicRoot := filepath.Join(root, "public")
+	storePath := filepath.Join(root, "tokens.db")
+
+	if err := os.MkdirAll(filepath.Join(contentRoot, "drafts", "fresh"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "drafts", "fresh", "index.md"), []byte("---\ntitle: Fresh\n---\nFresh body\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.MkdirAll(publicRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(public) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicRoot, "index.html"), []byte(`<!doctype html><html lang="en"><head><title>Home</title><link rel="canonical" href="https://example.test/"></head><body><main>home</main></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.html) error = %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = publicRoot
+	cfg.HugoRoot = root
+	cfg.ContentRoot = contentRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	// content_only=false explicit: this test asserts read-scope full
+	// visibility into source-only content (#450), not content_only's own
+	// default (#619) — with the #619 default (true), a source-only page's
+	// html is empty regardless of scope, which would defeat this test's
+	// actual purpose.
+	payload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_page","arguments":{"slug":"/drafts/fresh/","allow_source_fallback":true,"content_only":false}}}`)
+	rec := doMCPCall(t, srv, bearer, payload)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read get_page status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	// Per #450, "read" grants full visibility including drafts/source-only
+	// content (an explicit operator risk-acceptance decision, not an
+	// oversight) — the reader-safe content_not_public rejection no longer
+	// applies to any live scope.
+	if strings.Contains(rec.Body.String(), "content_not_public") {
+		t.Fatalf("read get_page must allow source-only fallback (full visibility per #450); body = %q", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Fresh body") {
+		t.Fatalf("read get_page missing draft body content; body = %q", rec.Body.String())
+	}
+}
+
+func TestReaderTokenListPagesExposeSourceDerivedMetadata(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	publicRoot := filepath.Join(root, "public")
+	storePath := filepath.Join(root, "tokens.db")
+
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(content) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "demo", "index.md"), []byte("---\ntitle: Demo\ntags:\n  - SourceTag\ncategories:\n  - SourceCat\n---\nSource body\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(source) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(publicRoot, "posts", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(public page) error = %v", err)
+	}
+	publicHTML := `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Demo</title>
+  <meta name="description" content="Rendered summary">
+  <link rel="canonical" href="https://example.test/posts/demo/">
+</head>
+<body><main><article><h1>Demo</h1><p>Rendered body.</p></article></main></body>
+</html>`
+	if err := os.WriteFile(filepath.Join(publicRoot, "posts", "demo", "index.html"), []byte(publicHTML), 0o644); err != nil {
+		t.Fatalf("WriteFile(public html) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicRoot, "index.html"), []byte(`<!doctype html><html lang="en"><head><title>Home</title><link rel="canonical" href="https://example.test/"></head><body><main>home</main></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.html) error = %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = publicRoot
+	cfg.HugoRoot = root
+	cfg.ContentRoot = contentRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_pages","arguments":{"limit":10,"offset":0}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read list_pages status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	// Per #450, "read" grants full visibility: source-derived taxonomy
+	// (categories not present in the public rendered HTML) is now
+	// expected to be visible, not stripped.
+	if !strings.Contains(rec.Body.String(), "sourcecat") {
+		t.Fatalf("read list_pages must expose source-derived taxonomy (full visibility per #450); body = %q", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "\"slug\":\"/posts/demo/\"") {
+		t.Fatalf("read list_pages missing public page slug; body = %q", rec.Body.String())
+	}
+}
+
+func TestReaderTokenGetFullPageMarkdownExposesFullSourceContent(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	publicRoot := filepath.Join(root, "public")
+	storePath := filepath.Join(root, "tokens.db")
+
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(content) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "demo", "index.md"), []byte("---\ntitle: Demo\ncategories:\n  - SecretCat\n---\nSource-only body that should stay hidden.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(source) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(publicRoot, "posts", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(public page) error = %v", err)
+	}
+	publicHTML := `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Demo</title>
+  <meta name="description" content="Rendered summary">
+  <link rel="canonical" href="https://example.test/posts/demo/">
+</head>
+<body><main><article><h1>Demo</h1><p>Rendered public body.</p></article></main></body>
+</html>`
+	if err := os.WriteFile(filepath.Join(publicRoot, "posts", "demo", "index.html"), []byte(publicHTML), 0o644); err != nil {
+		t.Fatalf("WriteFile(public html) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicRoot, "index.html"), []byte(`<!doctype html><html lang="en"><head><title>Home</title><link rel="canonical" href="https://example.test/"></head><body><main>home</main></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.html) error = %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = publicRoot
+	cfg.HugoRoot = root
+	cfg.ContentRoot = contentRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_page_markdown","arguments":{"slug":"/posts/demo/"}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read get_page_markdown status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// Per #450, "read" grants full visibility (drafts/source-only content
+	// included, an explicit operator risk-acceptance decision): the
+	// source markdown/frontmatter is now expected to be visible, not
+	// stripped down to the public rendered projection.
+	if !strings.Contains(body, "Source-only body that should stay hidden.") || !strings.Contains(body, "SecretCat") {
+		t.Fatalf("read get_page_markdown must expose full source content (full visibility per #450); body = %q", body)
+	}
+}
+
+func TestReaderTokenGetPageForEditExposesFullSourceContentAndQuality(t *testing.T) {
+	// #339: get_page_for_edit's quality section needs raw source access
+	// (front matter validation via sourcePagesForValidation), the same
+	// class of source-derived signal as #324's taxonomy details. Confirm
+	// end-to-end that a read-scoped caller gets the full source-aware edit
+	// bundle, including quality, rather than relying on older public-safe
+	// reader assumptions by inspection alone.
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	publicRoot := filepath.Join(root, "public")
+	storePath := filepath.Join(root, "tokens.db")
+
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(content) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "demo", "index.md"), []byte("---\ntitle: Demo\ncategories:\n  - SecretCat\n---\nSource-only body that should stay hidden.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(source) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(publicRoot, "posts", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(public page) error = %v", err)
+	}
+	publicHTML := `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Demo</title>
+  <meta name="description" content="Rendered summary">
+  <link rel="canonical" href="https://example.test/posts/demo/">
+</head>
+<body><main><article><h1>Demo</h1><p>Rendered public body.</p></article></main></body>
+</html>`
+	if err := os.WriteFile(filepath.Join(publicRoot, "posts", "demo", "index.html"), []byte(publicHTML), 0o644); err != nil {
+		t.Fatalf("WriteFile(public html) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicRoot, "index.html"), []byte(`<!doctype html><html lang="en"><head><title>Home</title><link rel="canonical" href="https://example.test/"></head><body><main>home</main></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.html) error = %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = publicRoot
+	cfg.HugoRoot = root
+	cfg.ContentRoot = contentRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_page_for_edit","arguments":{"slug":"/posts/demo/"}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read get_page_for_edit status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// Per #450, "read" grants full visibility (drafts/source-only content
+	// included, an explicit operator risk-acceptance decision): source
+	// content/frontmatter and the source-derived quality section are both
+	// now expected to be visible, not stripped as they were for the old
+	// reader-safe profile.
+	if !strings.Contains(body, "Source-only body that should stay hidden.") || !strings.Contains(body, "SecretCat") {
+		t.Fatalf("read get_page_for_edit must expose full source content (full visibility per #450); body = %q", body)
+	}
+	if !strings.Contains(body, `"quality"`) {
+		t.Fatalf("read get_page_for_edit must include quality (source access granted per #450); body = %q", body)
+	}
+}
+
+func TestReaderTokenListPageAssetsExposeBundleDirectoryForPublicPage(t *testing.T) {
+	// #348: list_page_assets' payload is entirely source-derived (it lists a
+	// filesystem directory under content root). Under the live #450 model,
+	// read-scoped callers have full source-aware visibility, so the bundle
+	// directory contents are expected to be visible here.
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	publicRoot := filepath.Join(root, "public")
+	storePath := filepath.Join(root, "tokens.db")
+
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(content) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "demo", "index.md"), []byte("---\ntitle: Demo\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(source) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "demo", "cover.webp"), []byte("cover bytes"), 0o644); err != nil {
+		t.Fatalf("WriteFile(asset) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(publicRoot, "posts", "demo"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(public page) error = %v", err)
+	}
+	publicHTML := `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Demo</title><link rel="canonical" href="https://example.test/posts/demo/"></head>
+<body><main><article><h1>Demo</h1><p>Rendered public body.</p></article></main></body>
+</html>`
+	if err := os.WriteFile(filepath.Join(publicRoot, "posts", "demo", "index.html"), []byte(publicHTML), 0o644); err != nil {
+		t.Fatalf("WriteFile(public html) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicRoot, "index.html"), []byte(`<!doctype html><html lang="en"><head><title>Home</title><link rel="canonical" href="https://example.test/"></head><body><main>home</main></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.html) error = %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = publicRoot
+	cfg.HugoRoot = root
+	cfg.ContentRoot = contentRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_page_assets","arguments":{"slug":"/posts/demo/"}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read list_page_assets status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// Per #450, "read" grants full visibility: the source bundle directory
+	// is now expected to be listed, not stripped to an empty result.
+	if !strings.Contains(body, "cover.webp") {
+		t.Fatalf("read list_page_assets must expose the source bundle contents (full visibility per #450); body = %q", body)
+	}
+}
+
+func TestReaderTokenListPageAssetsAllowsSourceOnlyPage(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	publicRoot := filepath.Join(root, "public")
+	storePath := filepath.Join(root, "tokens.db")
+
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "draft"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(content) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "draft", "index.md"), []byte("---\ntitle: Draft\ndraft: true\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(source) error = %v", err)
+	}
+	if err := os.MkdirAll(publicRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(public) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicRoot, "index.html"), []byte(`<!doctype html><html lang="en"><head><title>Home</title><link rel="canonical" href="https://example.test/"></head><body><main>home</main></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.html) error = %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = publicRoot
+	cfg.HugoRoot = root
+	cfg.ContentRoot = contentRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_page_assets","arguments":{"slug":"/posts/draft/"}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read list_page_assets status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	// Per #450, "read" grants full visibility: a source-only (draft) page
+	// is no longer rejected with content_not_public.
+	if strings.Contains(rec.Body.String(), "content_not_public") {
+		t.Fatalf("read list_page_assets must allow a source-only page (full visibility per #450); body = %q", rec.Body.String())
+	}
+}
+
+func TestReaderTokenListContentTypesIncludesPageCounts(t *testing.T) {
+	// #347: page_count is derived from source pages (including drafts),
+	// the same class of source-derived signal as #324/#339. Archetype
+	// metadata (filesystem templates, not page content) remains visible, and
+	// under the live #450 model the observed/counted side is visible too.
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	publicRoot := filepath.Join(root, "public")
+	storePath := filepath.Join(root, "tokens.db")
+
+	if err := os.MkdirAll(filepath.Join(root, "archetypes"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(archetypes) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "archetypes", "posts.md"), []byte("---\ntitle: \"\"\n---\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(archetype) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "secret-draft"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(content) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "secret-draft", "index.md"), []byte("---\ntitle: SecretDraftTitle\ndraft: true\n---\nBody.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(source) error = %v", err)
+	}
+	if err := os.MkdirAll(publicRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(public) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicRoot, "index.html"), []byte(`<!doctype html><html lang="en"><head><title>Home</title><link rel="canonical" href="https://example.test/"></head><body><main>home</main></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.html) error = %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = publicRoot
+	cfg.HugoRoot = root
+	cfg.ContentRoot = contentRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_content_types","arguments":{}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read list_content_types status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// Per #450, "read" grants full visibility: source-derived signals like
+	// page_count and draft-derived entries are now expected to be visible.
+	if !strings.Contains(body, `"page_count"`) {
+		t.Fatalf("read list_content_types must include page_count (full visibility per #450); body = %q", body)
+	}
+	if !strings.Contains(body, `"posts"`) || !strings.Contains(body, "archetype") {
+		t.Fatalf("read list_content_types should still see the archetype-derived 'posts' entry; body = %q", body)
+	}
+}
+
+func TestReaderTokenGetSiteHealthExposesTaxonomyInconsistencyDetails(t *testing.T) {
+	// #324: taxonomy_inconsistency_details carries source-page slugs
+	// (including draft/source-only pages). Under the live #450 model those
+	// source-derived details are visible to read-scoped callers, so verify
+	// the end-to-end payload rather than relying on older public-safe-reader
+	// assumptions by inspection alone.
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	publicRoot := filepath.Join(root, "public")
+	storePath := filepath.Join(root, "tokens.db")
+
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "a"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "a", "index.md"), []byte("---\ntitle: A\ncategories:\n  - security\n---\nBody A.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(contentRoot, "posts", "b"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "posts", "b", "index.md"), []byte("---\ntitle: B\ncategories:\n  - securite\n---\nBody B.\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.MkdirAll(publicRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(public) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicRoot, "index.html"), []byte(`<!doctype html><html lang="en"><head><title>Home</title><link rel="canonical" href="https://example.test/"></head><body><main>home</main></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.html) error = %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = publicRoot
+	cfg.HugoRoot = root
+	cfg.ContentRoot = contentRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_site_health","arguments":{}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read get_site_health status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	// Per #450, "read" grants full visibility: taxonomy_inconsistencies
+	// (source page slugs) is now expected to be visible, not stripped.
+	if !strings.Contains(body, "taxonomy_inconsistencies") {
+		t.Fatalf("read get_site_health must expose taxonomy_inconsistencies (full visibility per #450); body = %q", body)
+	}
+}
+
+func TestReaderTokenGetFullPageMarkdownAllowsSourceOnlyPage(t *testing.T) {
+	root := t.TempDir()
+	contentRoot := filepath.Join(root, "content")
+	publicRoot := filepath.Join(root, "public")
+	storePath := filepath.Join(root, "tokens.db")
+
+	if err := os.MkdirAll(filepath.Join(contentRoot, "drafts", "fresh"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(contentRoot, "drafts", "fresh", "index.md"), []byte("---\ntitle: Fresh\n---\nFresh body\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.MkdirAll(publicRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(public) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(publicRoot, "index.html"), []byte(`<!doctype html><html lang="en"><head><title>Home</title><link rel="canonical" href="https://example.test/"></head><body><main>home</main></body></html>`), 0o644); err != nil {
+		t.Fatalf("WriteFile(index.html) error = %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.SiteRoot = publicRoot
+	cfg.HugoRoot = root
+	cfg.ContentRoot = contentRoot
+	cfg.SiteURL = "https://example.test"
+	cfg.SiteName = "example.test"
+	cfg.DefaultLanguage = "en"
+
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_page_markdown","arguments":{"slug":"/drafts/fresh/"}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read get_page_markdown status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	// Per #450, "read" grants full visibility: a source-only (draft) page
+	// is no longer rejected with content_not_public.
+	if strings.Contains(rec.Body.String(), "content_not_public") {
+		t.Fatalf("read get_page_markdown must allow a source-only page (full visibility per #450); body = %q", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Fresh body") {
+		t.Fatalf("read get_page_markdown missing draft body content; body = %q", rec.Body.String())
+	}
+}
+
+func TestReaderTokenValidateSiteRejectsSourceDiagnostics(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	srv := mustOAuthSQLiteServer(t, storePath)
+
+	const bearer = "reader-token"
+	addBearerToken(t, storePath, bearer, "read")
+
+	rec := doMCPCall(t, srv, bearer, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"validate_site","arguments":{}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read validate_site status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	// Per #450, "read" grants full visibility: source diagnostics are no
+	// longer rejected with content_not_public.
+	if strings.Contains(rec.Body.String(), "content_not_public") {
+		t.Fatalf("read validate_site must allow source diagnostics (full visibility per #450); body = %q", rec.Body.String())
+	}
+}
+
+func TestLegacyMCPBearerBehavesLikeContentReadOverHTTP(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	srv := mustOAuthSQLiteServer(t, storePath)
+	bearer := obtainBearerToken(t, srv)
+	rewriteTokenScopeToLegacyMCP(t, storePath, bearer)
+
+	names := doMCPToolsList(t, srv, bearer)
+	if len(names) != 32 {
+		t.Fatalf("legacy mcp tools/list = %d tools, want 32; got %v", len(names), names)
+	}
+	for _, bad := range []string{"create_page", "update_page", "delete_page", "build_site"} {
+		for _, n := range names {
+			if n == bad {
+				t.Fatalf("legacy mcp tools/list must not include %q", bad)
+			}
+		}
+	}
+
+	readPayload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_page_markdown","arguments":{"slug":"/posts/hello"}}}`)
+	readRec := doMCPCall(t, srv, bearer, readPayload)
+	if readRec.Code != http.StatusOK {
+		t.Fatalf("legacy mcp must allow read tool: status = %d body = %q", readRec.Code, readRec.Body.String())
+	}
+	if readRec.Body.Len() == 0 {
+		t.Fatal("legacy mcp read tool returned empty body")
+	}
+
+	writePayload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page"}}`)
+	writeRec := doMCPCall(t, srv, bearer, writePayload)
+	if writeRec.Code != http.StatusForbidden {
+		t.Fatalf("legacy mcp must reject write tool: status = %d body = %q", writeRec.Code, writeRec.Body.String())
+	}
+	if !strings.Contains(writeRec.Body.String(), "forbidden_tool") {
+		t.Fatalf("expected forbidden_tool for legacy mcp write attempt, got %q", writeRec.Body.String())
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(metricsRec, metricsReq)
+	if metricsRec.Code != http.StatusOK {
+		t.Fatalf("/metrics status = %d body = %q", metricsRec.Code, metricsRec.Body.String())
+	}
+	if !strings.Contains(metricsRec.Body.String(), `mcp_legacy_scope_requests_total{scope="mcp"} 6`) {
+		t.Fatalf("metrics missing legacy scope counter: %q", metricsRec.Body.String())
+	}
+}
+
+// TestReadCannotCallWriteTool proves that a read bearer cannot invoke a
+// write tool (issue #25 acceptance criterion 1; scope model collapsed to
+// read/write by #450).
+func TestReadCannotCallWriteTool(t *testing.T) {
+	srv := mustOAuthServer(t)
+	bearer := obtainBearerToken(t, srv)
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page"}}`)
+	rec := doMCPCall(t, srv, bearer, body)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("read must not call create_page: status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "forbidden_tool") {
+		t.Fatalf("expected forbidden_tool in response, got: %q", rec.Body.String())
+	}
+}
+
+// TestReadCannotCallSiteAdminTool proves that a read bearer cannot invoke a
+// tool that used to require site.admin (issue #25 acceptance criterion 2;
+// site.admin folded into write by #450).
+func TestReadCannotCallSiteAdminTool(t *testing.T) {
+	srv := mustOAuthServer(t)
+	bearer := obtainBearerToken(t, srv)
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"build_site"}}`)
+	rec := doMCPCall(t, srv, bearer, body)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("read must not call build_site: status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "forbidden_tool") {
+		t.Fatalf("expected forbidden_tool in response, got: %q", rec.Body.String())
+	}
+}
+
+// TestUnauthenticatedCannotCallSystemAdminTool verifies unauthenticated callers
+// are rejected before reaching the tool layer (RFC 6750: 401, not 403).
+func TestUnauthenticatedCannotCallSystemAdminTool(t *testing.T) {
+	srv := mustOAuthServer(t)
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"check_sri_versions"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated must get 401 before tool layer: status = %d body = %q", rec.Code, rec.Body.String())
+	}
+}
+
+// TestScopesSupported verifies that the server discovery announces the actual granular
+// scopes (issue #28 acceptance criterion).
+func TestScopesSupported(t *testing.T) {
+	srv := mustOAuthServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var meta struct {
+		ScopesSupported []string `json:"scopes_supported"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &meta); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	wantScopes := []string{"read", "write"}
+	for _, want := range wantScopes {
+		found := false
+		for _, got := range meta.ScopesSupported {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("scopes_supported missing %q; got %v", want, meta.ScopesSupported)
+		}
+	}
+	for _, bad := range []string{"mcp", "system.admin"} {
+		for _, got := range meta.ScopesSupported {
+			if got == bad {
+				t.Errorf("scopes_supported should not contain legacy scope %q", bad)
+			}
+		}
+	}
+}
+
+func TestConfidentialClientCanAccessSiteAdminTools(t *testing.T) {
+	mockDir := t.TempDir()
+	mockHugo := filepath.Join(mockDir, "hugo")
+	if err := os.WriteFile(mockHugo, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write mock hugo: %v", err)
+	}
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	registryPath := filepath.Join(t.TempDir(), "oauth-clients.yaml")
+	if err := os.WriteFile(registryPath, []byte(`
+clients:
+  - client_id: claude-admin
+    client_secret: admin-secret-value
+    redirect_uris:
+      - https://client.test/callback
+    scope: site.admin
+`), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+
+	srv := mustOAuthServerWithRegistry(t, registryPath)
+
+	authReq := httptest.NewRequest(http.MethodGet, "/authorize?"+url.Values{
+		"response_type": {"code"},
+		"client_id":     {"claude-admin"},
+		"redirect_uri":  {"https://client.test/callback"},
+		"state":         {"site-admin"},
+		"code_challenge": {func() string {
+			sum := sha256.Sum256([]byte("verifier-verifier-verifier-verifier-verifier"))
+			return base64.RawURLEncoding.EncodeToString(sum[:])
+		}()},
+		"code_challenge_method": {"S256"},
+	}.Encode(), nil)
+	authReq.RemoteAddr = "127.0.0.1:1234"
+	authRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusFound {
+		t.Fatalf("authorize status = %d body = %q", authRec.Code, authRec.Body.String())
+	}
+	loc, err := url.Parse(authRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatal("authorize missing code")
+	}
+
+	tokenForm := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {"claude-admin"},
+		"client_secret": {"admin-secret-value"},
+		"redirect_uri":  {"https://client.test/callback"},
+		"code":          {code},
+		"code_verifier": {"verifier-verifier-verifier-verifier-verifier"},
+	}
+	tokenReq := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(tokenForm.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body = %q", tokenRec.Code, tokenRec.Body.String())
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		Scope       string `json:"scope"`
+	}
+	if err := json.Unmarshal(tokenRec.Body.Bytes(), &tokenResp); err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	if tokenResp.Scope != "admin" {
+		t.Fatalf("token scope = %q want admin", tokenResp.Scope)
+	}
+
+	names := doMCPToolsList(t, srv, tokenResp.AccessToken)
+	found := false
+	writeFound := false
+	for _, name := range names {
+		if name == "build_site" {
+			found = true
+		}
+		if name == "create_page" {
+			writeFound = true
+		}
+	}
+	if !found {
+		t.Fatalf("write token missing build_site; got %v", names)
+	}
+	if !writeFound {
+		t.Fatalf("write token missing create_page; got %v", names)
+	}
+
+	callRec := doMCPCall(t, srv, tokenResp.AccessToken, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"build_site","arguments":{}}}`))
+	if callRec.Code != http.StatusOK {
+		t.Fatalf("build_site status = %d body = %q", callRec.Code, callRec.Body.String())
+	}
+	if !strings.Contains(callRec.Body.String(), "status") {
+		t.Fatalf("build_site response missing status: %q", callRec.Body.String())
+	}
+}
+
+func TestSystemAdminClientSeesWriteAndAdminTools(t *testing.T) {
+	mockDir := t.TempDir()
+	mockHugo := filepath.Join(mockDir, "hugo")
+	if err := os.WriteFile(mockHugo, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write mock hugo: %v", err)
+	}
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	registryPath := filepath.Join(t.TempDir(), "oauth-clients.yaml")
+	if err := os.WriteFile(registryPath, []byte(`
+clients:
+  - id: claude-admin
+    secret: admin-secret-value
+    scopes: ["read", "write", "admin"]
+    redirect_uris:
+      - https://claude.ai/*
+    enabled: true
+`), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+
+	srv := mustOAuthServerWithRegistry(t, registryPath)
+
+	authReq := httptest.NewRequest(http.MethodGet, "/authorize?"+url.Values{
+		"response_type": {"code"},
+		"client_id":     {"claude-admin"},
+		"redirect_uri":  {"https://claude.ai/oauth/callback"},
+		"state":         {"admin-state"},
+		"code_challenge": {func() string {
+			sum := sha256.Sum256([]byte("verifier-verifier-verifier-verifier-verifier"))
+			return base64.RawURLEncoding.EncodeToString(sum[:])
+		}()},
+		"code_challenge_method": {"S256"},
+	}.Encode(), nil)
+	authReq.RemoteAddr = "127.0.0.1:1234"
+	authRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusFound {
+		t.Fatalf("authorize status = %d body = %q", authRec.Code, authRec.Body.String())
+	}
+	loc, err := url.Parse(authRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatal("authorize missing code")
+	}
+
+	tokenForm := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {"claude-admin"},
+		"client_secret": {"admin-secret-value"},
+		"redirect_uri":  {"https://claude.ai/oauth/callback"},
+		"code":          {code},
+		"code_verifier": {"verifier-verifier-verifier-verifier-verifier"},
+	}
+	tokenReq := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(tokenForm.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body = %q", tokenRec.Code, tokenRec.Body.String())
+	}
+
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		Scope       string `json:"scope"`
+	}
+	if err := json.Unmarshal(tokenRec.Body.Bytes(), &tokenResp); err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	if tokenResp.Scope != "admin" {
+		t.Fatalf("token scope = %q want admin", tokenResp.Scope)
+	}
+
+	names := doMCPToolsList(t, srv, tokenResp.AccessToken)
+	found := false
+	writeFound := false
+	for _, name := range names {
+		if name == "build_site" {
+			found = true
+		}
+		if name == "create_page" {
+			writeFound = true
+		}
+	}
+	if !found {
+		t.Fatalf("write token missing build_site; got %v", names)
+	}
+	if !writeFound {
+		t.Fatalf("write token missing create_page; got %v", names)
+	}
+}
+
+// TestAnonymousServerExposesReadTools documents the #450 scope collapse:
+// "read" is capability-identical to anonymous (both ScopeRank 0), so tools
+// that used to require the "content.read" tier (rank 1, gated) are now
+// ungated and appear even when the server runs without OAuth (anonymous
+// mode). This test used to be TestAnonymousServerDoesNotExposeAuthenticatedTools,
+// asserting the opposite; that boundary no longer exists by design — read
+// requires no secret and is auto-registrable.
+func TestAnonymousServerExposesReadTools(t *testing.T) {
+	// Use a config with ContentRoot set (no OAuth) so source-index-backed
+	// read tools (validate_site, search_content, ...) are registered at
+	// all; mustTestServer's bare config.Default() has no ContentRoot, so
+	// those tools would be absent regardless of scope, and this test would
+	// not actually exercise the #450 scope boundary.
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.HugoRoot = t.TempDir()
+	cfg.ContentRoot = filepath.Join("..", "..", "testdata", "fixtures", "content")
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	names := doMCPToolsList(t, srv, "")
+
+	// These tools used to require content.read; per #450 they are now
+	// ungated (same rank as anonymous) and must appear here.
+	formerlyAuthOnlyTools := []string{
+		"validate_site",
+		"validate_frontmatter",
+		"build_agent_context",
+		"export_agent_context",
+		"get_broken_links",
+		"get_site_health",
+		"diff_page",
+		"search_content",
+	}
+	for _, want := range formerlyAuthOnlyTools {
+		found := false
+		for _, got := range names {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("public server must expose read tool %q (ungated per #450); got %v", want, names)
+		}
+	}
+
+	// Public tools must still be present.
+	publicTools := []string{"list_pages", "get_page", "list_tags"}
+	for _, want := range publicTools {
+		found := false
+		for _, got := range names {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("anonymous server missing expected public tool %q; got %v", want, names)
+		}
+	}
+}
+
+// --- Regression: Claude.ai OAuth flow ---
+//
+// Claude.ai always sends scope=content.read+content.write+site.admin+system.admin
+// regardless of what the server advertises. Before v1.2.10 this caused an
+// invalid_scope redirect (disguised as HTTP 302) and the token endpoint was
+// never called. This test locks in the correct behaviour: scope is clamped to
+// the client ceiling (write), a code is issued, and the token exchange
+// returns write with admin (now write-gated) tools visible.
+func TestRegressionClaudeAiScopeClamping(t *testing.T) {
+	mockDir := t.TempDir()
+	mockHugo := filepath.Join(mockDir, "hugo")
+	if err := os.WriteFile(mockHugo, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write mock hugo: %v", err)
+	}
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	registryPath := filepath.Join(t.TempDir(), "oauth-clients.yaml")
+	if err := os.WriteFile(registryPath, []byte(`
+clients:
+  - client_id: claude-admin
+    client_secret: admin-secret
+    redirect_uris:
+      - https://claude.ai/api/mcp/auth_callback
+    scope: site.admin
+`), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+
+	srv := mustOAuthServerWithRegistry(t, registryPath)
+
+	verifier := "verifier-regression-claude-ai-00000000000"
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	// Simulate the exact scope string Claude.ai sends (includes system.admin).
+	authReq := httptest.NewRequest(http.MethodGet, "/authorize?"+url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"claude-admin"},
+		"redirect_uri":          {"https://claude.ai/api/mcp/auth_callback"},
+		"state":                 {"regression"},
+		"scope":                 {"content.read content.write site.admin system.admin"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}.Encode(), nil)
+	authReq.RemoteAddr = "127.0.0.1:1234"
+	authRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusFound {
+		t.Fatalf("authorize status = %d (want 302); body = %q", authRec.Code, authRec.Body.String())
+	}
+	loc, err := url.Parse(authRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	// Must have a code, not an error — a 302 with ?error=invalid_scope looks
+	// identical in nginx logs but breaks the token exchange silently (issue #121).
+	if errParam := loc.Query().Get("error"); errParam != "" {
+		t.Fatalf("authorize returned error=%q in Location; scope clamping must prevent this", errParam)
+	}
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatalf("authorize Location missing code: %s", loc)
+	}
+
+	tokenForm := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {"claude-admin"},
+		"client_secret": {"admin-secret"},
+		"redirect_uri":  {"https://claude.ai/api/mcp/auth_callback"},
+		"code":          {code},
+		"code_verifier": {verifier},
+	}
+	tokenReq := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(tokenForm.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body = %q", tokenRec.Code, tokenRec.Body.String())
+	}
+	var tokenResp struct {
+		Scope string `json:"scope"`
+	}
+	if err := json.Unmarshal(tokenRec.Body.Bytes(), &tokenResp); err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	if tokenResp.Scope != "admin" {
+		t.Fatalf("token scope = %q want admin (system.admin compatibility alias)", tokenResp.Scope)
+	}
+}
+
+// --- Regression: ChatGPT OAuth flow ---
+//
+// ChatGPT uses a wildcard redirect URI and requests the legacy
+// scope=content.read+content.write string (still accepted via CanonicalScope,
+// #450). It must receive a canonical "write" token that exposes write tools
+// (create_page). Per #450, site.admin tools folded into write with no
+// exceptions, so build_site/check_sri_versions/preview_build are now also
+// expected to be visible — this is the intended behavior, not a boundary
+// violation.
+func TestRegressionChatGPTWriteScopeToolBoundary(t *testing.T) {
+	registryPath := filepath.Join(t.TempDir(), "oauth-clients.yaml")
+	if err := os.WriteFile(registryPath, []byte(`
+clients:
+  - client_id: chatgpt-write
+    client_secret: chatgpt-secret
+    redirect_uris:
+      - https://chatgpt.com/connector/oauth/*
+    scope: content.write
+`), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+
+	srv := mustOAuthServerWithRegistry(t, registryPath)
+
+	verifier := "verifier-regression-chatgpt-00000000000"
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	authReq := httptest.NewRequest(http.MethodGet, "/authorize?"+url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"chatgpt-write"},
+		"redirect_uri":          {"https://chatgpt.com/connector/oauth/callback"},
+		"state":                 {"regression"},
+		"scope":                 {"content.read content.write"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}.Encode(), nil)
+	authReq.RemoteAddr = "127.0.0.1:1234"
+	authRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusFound {
+		t.Fatalf("authorize status = %d body = %q", authRec.Code, authRec.Body.String())
+	}
+	loc, _ := url.Parse(authRec.Header().Get("Location"))
+	if errParam := loc.Query().Get("error"); errParam != "" {
+		t.Fatalf("authorize returned error=%q", errParam)
+	}
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatalf("authorize missing code")
+	}
+
+	tokenForm := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {"chatgpt-write"},
+		"client_secret": {"chatgpt-secret"},
+		"redirect_uri":  {"https://chatgpt.com/connector/oauth/callback"},
+		"code":          {code},
+		"code_verifier": {verifier},
+	}
+	tokenReq := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(tokenForm.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body = %q", tokenRec.Code, tokenRec.Body.String())
+	}
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		Scope       string `json:"scope"`
+	}
+	if err := json.Unmarshal(tokenRec.Body.Bytes(), &tokenResp); err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	if tokenResp.Scope != "write" {
+		t.Fatalf("token scope = %q want write", tokenResp.Scope)
+	}
+
+	names := doMCPToolsList(t, srv, tokenResp.AccessToken)
+	if got, want := len(names), 68; got != want {
+		t.Errorf("chatgpt write token tools/list = %d tools, want %d; got %v", got, want, names)
+	}
+	// Must see write tools.
+	if !containsToolName(names, "create_page") {
+		t.Errorf("chatgpt write token missing create_page; got %v", names)
+	}
+	// The four managed Hugo binary lifecycle tools are admin-only and omitted
+	// from the ordinary write-scoped tools/list response.
+	for _, adminTool := range []string{
+		"build_site", "check_sri_versions", "preview_build",
+		"get_hugo_update",
+	} {
+		if !containsToolName(names, adminTool) {
+			t.Errorf("chatgpt write token must expose write tool %q", adminTool)
+		}
+	}
+	for _, adminTool := range []string{"stage_hugo_upgrade", "activate_hugo", "rollback_hugo", "bootstrap_hugo"} {
+		if containsToolName(names, adminTool) {
+			t.Errorf("chatgpt write token must not expose admin tool %q", adminTool)
+		}
+	}
+}
+
+// --- Regression: IsItAgentReady 7/7 discovery endpoints ---
+//
+// These seven endpoints make up the API, Auth, MCP & Skill Discovery score.
+// A score drop from 7/7 breaks AgentReady certification.
+func TestRegressionIsItAgentReadyDiscoveryEndpoints(t *testing.T) {
+	// auth.md must exist in SiteRoot for the /auth.md endpoint to return 200.
+	siteRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(siteRoot, "auth.md"), []byte("# auth\n"), 0o644); err != nil {
+		t.Fatalf("write auth.md: %v", err)
+	}
+	cfg := config.Default()
+	cfg.SiteRoot = siteRoot
+	cfg.SiteURL = "https://www.arleo.eu"
+	cfg.SiteName = "arleo.eu"
+	cfg.OAuth = config.OAuthConfig{
+		Enabled:               true,
+		Issuer:                "https://mcp.arleo.eu",
+		Resource:              "https://mcp.arleo.eu/mcp",
+		DynamicClientEnabled:  true,
+		AuthCodeTTLSeconds:    300,
+		AccessTokenTTLSeconds: 3600,
+		TrustedAuthorizeCIDRs: []string{"127.0.0.1/32"},
+	}
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex: %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+
+	endpoints := []struct {
+		path        string
+		description string
+	}{
+		{"/.well-known/oauth-authorization-server", "OAuth/OIDC discovery"},
+		{"/.well-known/oauth-protected-resource", "OAuth protected resource"},
+		{"/.well-known/mcp/server-card.json", "MCP server card"},
+		{"/.well-known/mcp/server-card/mcp", "MCP server card (Le Chat per-resource alias, #424)"},
+		{"/.well-known/mcp.json", "API catalog (mcp.json alias)"},
+		{"/.well-known/agent.json", "Agent skills index"},
+		{"/auth.md", "Auth.md agent integration"},
+		{"/mcp", "MCP endpoint reachable (401 = auth challenge, not a failure)"},
+	}
+
+	for _, ep := range endpoints {
+		req := httptest.NewRequest(http.MethodGet, ep.path, nil)
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		// /mcp returns 401 when OAuth is enabled — that IS the correct response
+		// (it tells the client to authenticate). Any other endpoint must be 200.
+		if ep.path == "/mcp" {
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s (%s): got %d want 401", ep.path, ep.description, rec.Code)
+			}
+			if rec.Header().Get("WWW-Authenticate") == "" {
+				t.Errorf("%s: missing WWW-Authenticate header", ep.path)
+			}
+		} else {
+			if rec.Code != http.StatusOK {
+				t.Errorf("%s (%s): got %d want 200", ep.path, ep.description, rec.Code)
+			}
+		}
+	}
+}
+
+func containsToolName(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestOperatorTokenToolCatalogIgnoresClientBranding(t *testing.T) {
+	mockDir := t.TempDir()
+	mockHugo := filepath.Join(mockDir, "hugo")
+	if err := os.WriteFile(mockHugo, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("write mock hugo: %v", err)
+	}
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	registryPath := filepath.Join(t.TempDir(), "oauth-clients.yaml")
+	if err := os.WriteFile(registryPath, []byte(`
+clients:
+  - client_id: parity-admin
+    client_secret: parity-secret
+    redirect_uris:
+      - https://claude.ai/oauth/callback
+    scope: site.admin
+`), 0o600); err != nil {
+		t.Fatalf("write registry: %v", err)
+	}
+
+	srv := mustOAuthServerWithRegistry(t, registryPath)
+
+	verifier := "verifier-operator-parity-000000000000"
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	authReq := httptest.NewRequest(http.MethodGet, "/authorize?"+url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"parity-admin"},
+		"redirect_uri":          {"https://claude.ai/oauth/callback"},
+		"state":                 {"operator-parity"},
+		"scope":                 {"content.read content.write site.admin"},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}.Encode(), nil)
+	authReq.RemoteAddr = "127.0.0.1:1234"
+	authRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(authRec, authReq)
+	if authRec.Code != http.StatusFound {
+		t.Fatalf("authorize status = %d body = %q", authRec.Code, authRec.Body.String())
+	}
+	loc, err := url.Parse(authRec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	code := loc.Query().Get("code")
+	if code == "" {
+		t.Fatal("authorize missing code")
+	}
+
+	tokenForm := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {"parity-admin"},
+		"client_secret": {"parity-secret"},
+		"redirect_uri":  {"https://claude.ai/oauth/callback"},
+		"code":          {code},
+		"code_verifier": {verifier},
+	}
+	tokenReq := httptest.NewRequest(http.MethodPost, "/token", strings.NewReader(tokenForm.Encode()))
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body = %q", tokenRec.Code, tokenRec.Body.String())
+	}
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		Scope       string `json:"scope"`
+	}
+	if err := json.Unmarshal(tokenRec.Body.Bytes(), &tokenResp); err != nil {
+		t.Fatalf("decode token: %v", err)
+	}
+	if tokenResp.Scope != "admin" {
+		t.Fatalf("token scope = %q want admin", tokenResp.Scope)
+	}
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{
+			name: "claude-like",
+			headers: map[string]string{
+				"User-Agent":    "Claude/1.0",
+				"X-Client-Name": "claude.ai",
+			},
+		},
+		{
+			name: "chatgpt-like",
+			headers: map[string]string{
+				"User-Agent":    "ChatGPT/1.0",
+				"X-Client-Name": "chatgpt",
+			},
+		},
+		{
+			name: "generic-mcp",
+			headers: map[string]string{
+				"User-Agent":    "GenericMCP/1.0",
+				"X-Client-Name": "generic",
+			},
+		},
+	}
+
+	var want string
+	for i, tc := range cases {
+		got := toolsListPayload(t, doMCPToolsListBody(t, srv, tokenResp.AccessToken, tc.headers))
+		if i == 0 {
+			want = got
+			continue
+		}
+		if got != want {
+			t.Fatalf("%s tools/list body differed for same operator token\nwant: %s\n\ngot: %s", tc.name, want, got)
+		}
+	}
+}
+
+// toolCallResultData extracts the tool's own JSON payload (the text content
+// item's "text" field, which every tool response marshals its ToolResponse
+// envelope into) from a raw tools/call SSE response body.
+func toolCallResultData(t *testing.T, body string) map[string]any {
+	t.Helper()
+	var envelope struct {
+		Result struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+			IsError bool `json:"isError"`
+		} `json:"result"`
+	}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		data := line
+		if strings.HasPrefix(line, "data: ") {
+			data = strings.TrimPrefix(line, "data: ")
+		}
+		if err := json.Unmarshal([]byte(data), &envelope); err == nil && len(envelope.Result.Content) > 0 {
+			if envelope.Result.IsError {
+				t.Fatalf("tool call returned an error result: %s", body)
+			}
+			var out map[string]any
+			if err := json.Unmarshal([]byte(envelope.Result.Content[0].Text), &out); err != nil {
+				t.Fatalf("decode tool result text: %v (%q)", err, envelope.Result.Content[0].Text)
+			}
+			return out
+		}
+	}
+	t.Fatalf("tools/call response did not contain a parseable result: %q", body)
+	return nil
+}
+
+func writeServerPreviewMockHugo(t *testing.T, html string) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := `#!/bin/sh
+dest=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--destination" ]; then
+    dest="$arg"
+  fi
+  prev="$arg"
+done
+if [ -z "$dest" ]; then
+  echo "missing --destination" >&2
+  exit 1
+fi
+mkdir -p "$dest/posts/hello"
+printf '%s' '` + html + `' > "$dest/posts/hello/index.html"
+exit 0
+`
+	p := filepath.Join(dir, "hugo")
+	if err := os.WriteFile(p, []byte(script), 0o755); err != nil {
+		t.Fatalf("write mock hugo: %v", err)
+	}
+	return dir
+}
+
+func toolCallBodyHasError(rec *httptest.ResponseRecorder, want string) bool {
+	return strings.Contains(rec.Body.String(), want)
+}
+
+// TestGetMutationStatusIsolatedByCallerAcrossHTTP is the end-to-end
+// counterpart to internal/tools/write's TestIdempotencyStoreIsolatesByCallerKey
+// (#627): that test proves the store isolates two callerKeys handed to it
+// directly, but does not prove the real HTTP request path ever produces two
+// distinct callerKeys in the first place — a silently empty
+// oauth.CtxTokenID would make every caller share one bucket and the fix
+// would be a no-op despite every other test passing. This test drives two
+// distinct bearer tokens through the actual /mcp HTTP handler: caller A
+// creates a page with an idempotency_key, then caller B calls
+// get_mutation_status with the identical tool+key and must see "unknown",
+// not caller A's result — while caller A, using the same key, still sees
+// "succeeded".
+func TestGetMutationStatusIsolatedByCallerAcrossHTTP(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = t.TempDir()
+	cfg.HugoRoot = t.TempDir()
+	cfg.OAuth = config.OAuthConfig{
+		Enabled:               true,
+		Issuer:                "https://mcp.test",
+		AccessTokenTTLSeconds: 3600,
+		StorageBackend:        "sqlite",
+		StoragePath:           storePath,
+	}
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+
+	const callerA = "caller-a-bearer-token"
+	const callerB = "caller-b-bearer-token"
+	addBearerToken(t, storePath, callerA, "write")
+	addBearerToken(t, storePath, callerB, "write")
+
+	const sharedKey = "e2e-shared-idempotency-key"
+	createPayload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"posts/e2e-caller-isolation","title":"E2E","body":"Body","tags":[],"categories":[],"idempotency_key":"` + sharedKey + `"}}}`)
+	createRec := doMCPCall(t, srv, callerA, createPayload)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create_page (caller A) status = %d body = %q", createRec.Code, createRec.Body.String())
+	}
+	createData := toolCallResultData(t, createRec.Body.String())
+	if status, _ := createData["data"].(map[string]any)["status"].(string); status != "created" {
+		t.Fatalf("create_page (caller A) data.status = %v, want created: %#v", createData["data"], createData)
+	}
+
+	statusPayload := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_mutation_status","arguments":{"tool":"create_page","idempotency_key":"` + sharedKey + `"}}}`)
+
+	// Caller B, using the exact same tool+key, must NOT see caller A's result.
+	bRec := doMCPCall(t, srv, callerB, statusPayload)
+	if bRec.Code != http.StatusOK {
+		t.Fatalf("get_mutation_status (caller B) status = %d body = %q", bRec.Code, bRec.Body.String())
+	}
+	bData := toolCallResultData(t, bRec.Body.String())
+	if status, _ := bData["data"].(map[string]any)["status"].(string); status != "unknown" {
+		t.Fatalf("get_mutation_status (caller B) data.status = %q, want unknown — leaked caller A's mutation result across the caller boundary (#627): %#v", status, bData["data"])
+	}
+
+	// Caller A, the legitimate owner, must still see its own result.
+	aRec := doMCPCall(t, srv, callerA, statusPayload)
+	if aRec.Code != http.StatusOK {
+		t.Fatalf("get_mutation_status (caller A) status = %d body = %q", aRec.Code, aRec.Body.String())
+	}
+	aData := toolCallResultData(t, aRec.Body.String())
+	if status, _ := aData["data"].(map[string]any)["status"].(string); status != "succeeded" {
+		t.Fatalf("get_mutation_status (caller A) data.status = %q, want succeeded: %#v", status, aData["data"])
+	}
+}
+
+// TestApplyContentPlanIsolatedByCallerAcrossHTTP closes the cross-principal
+// gap issue #932 called out for server-held plans: principal B must not be
+// able to consume principal A's plan_id, and a rejected attempt must leave
+// disk untouched until A applies it.
+func TestApplyContentPlanIsolatedByCallerAcrossHTTP(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	contentRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = contentRoot
+	cfg.HugoRoot = t.TempDir()
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const callerA = "plan-owner-token"
+	const callerB = "plan-intruder-token"
+	addBearerToken(t, storePath, callerA, "write")
+	addBearerToken(t, storePath, callerB, "write")
+
+	createRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"posts/e2e-plan-owner","title":"Title","body":"Original body","tags":[],"categories":[]}}}`))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create_page status = %d body = %q", createRec.Code, createRec.Body.String())
+	}
+	filePath := filepath.Join(contentRoot, "posts", "e2e-plan-owner", "index.md")
+	beforeAttempt, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read created file: %v", err)
+	}
+
+	planRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_content_change","arguments":{"slug":"posts/e2e-plan-owner","operations":[{"op":"update_body","body":"Changed by plan owner"}]}}}`))
+	if planRec.Code != http.StatusOK {
+		t.Fatalf("plan_content_change status = %d body = %q", planRec.Code, planRec.Body.String())
+	}
+	planEnvelope := toolCallResultData(t, planRec.Body.String())
+	planData := planEnvelope["data"].(map[string]any)
+	planID := planData["plan_id"].(string)
+	if planID == "" {
+		t.Fatal("plan_content_change returned empty plan_id")
+	}
+
+	applyPayload := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"apply_content_plan","arguments":{"plan_id":"%s"}}}`, planID))
+	bRec := doMCPCall(t, srv, callerB, applyPayload)
+	if bRec.Code != http.StatusOK {
+		t.Fatalf("apply_content_plan intruder status = %d body = %q", bRec.Code, bRec.Body.String())
+	}
+	if !toolCallBodyHasError(bRec, "plan_not_found") {
+		t.Fatalf("apply_content_plan intruder body = %q, want plan_not_found", bRec.Body.String())
+	}
+	afterRejected, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read file after rejected apply: %v", err)
+	}
+	if string(afterRejected) != string(beforeAttempt) {
+		t.Fatalf("intruder apply changed file:\nbefore=%q\nafter=%q", string(beforeAttempt), string(afterRejected))
+	}
+
+	aRec := doMCPCall(t, srv, callerA, applyPayload)
+	if aRec.Code != http.StatusOK {
+		t.Fatalf("apply_content_plan owner status = %d body = %q", aRec.Code, aRec.Body.String())
+	}
+	aData := toolCallResultData(t, aRec.Body.String())["data"].(map[string]any)
+	if got, _ := aData["status"].(string); got != "updated" {
+		t.Fatalf("apply_content_plan owner status = %q, want updated: %#v", got, aData)
+	}
+	applied, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read file after owner apply: %v", err)
+	}
+	if !strings.Contains(string(applied), "Changed by plan owner") {
+		t.Fatalf("owner apply did not write planned body: %q", string(applied))
+	}
+}
+
+func TestGetRateLimitsSharesQuotaAcrossTokensForSamePrincipal(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	contentRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = contentRoot
+	cfg.HugoRoot = t.TempDir()
+	cfg.RateLimit.CreateUpdatePerMin = 2
+	cfg.OAuth = config.OAuthConfig{
+		Enabled:               true,
+		Issuer:                "https://mcp.test",
+		AccessTokenTTLSeconds: 3600,
+		StorageBackend:        "sqlite",
+		StoragePath:           storePath,
+	}
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+
+	addBearerTokenWithPrincipal(t, storePath, "token-a1", "write", "client-a")
+	addBearerTokenWithPrincipal(t, storePath, "token-a2", "write", "client-a")
+	addBearerTokenWithPrincipal(t, storePath, "token-b1", "write", "client-b")
+
+	createRec := doMCPCall(t, srv, "token-a1", []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"posts/shared-bucket","title":"Shared","body":"Body","tags":[],"categories":[]}}}`))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create_page status = %d body = %q", createRec.Code, createRec.Body.String())
+	}
+
+	samePrincipalRec := doMCPCall(t, srv, "token-a2", []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_rate_limits","arguments":{}}}`))
+	if samePrincipalRec.Code != http.StatusOK {
+		t.Fatalf("get_rate_limits same principal status = %d body = %q", samePrincipalRec.Code, samePrincipalRec.Body.String())
+	}
+	samePrincipalData := toolCallResultData(t, samePrincipalRec.Body.String())
+	createBucket := samePrincipalData["data"].(map[string]any)["create_update_upload"].(map[string]any)
+	if got := int(createBucket["remaining"].(float64)); got != 1 {
+		t.Fatalf("same-principal remaining = %d, want 1 after one create consumed the shared bucket", got)
+	}
+
+	otherPrincipalRec := doMCPCall(t, srv, "token-b1", []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_rate_limits","arguments":{}}}`))
+	if otherPrincipalRec.Code != http.StatusOK {
+		t.Fatalf("get_rate_limits other principal status = %d body = %q", otherPrincipalRec.Code, otherPrincipalRec.Body.String())
+	}
+	otherPrincipalData := toolCallResultData(t, otherPrincipalRec.Body.String())
+	otherBucket := otherPrincipalData["data"].(map[string]any)["create_update_upload"].(map[string]any)
+	if got := int(otherBucket["remaining"].(float64)); got != 2 {
+		t.Fatalf("other-principal remaining = %d, want full independent bucket of 2", got)
+	}
+}
+
+// TestApplyContentPlanIsolatedByTokenEvenUnderSharedPrincipal guards the
+// boundary #950's principal-preferring caller.Key() must not cross: two
+// tokens issued to the same OAuth principal (e.g. one token refreshed into
+// another) must not be able to consume, inspect, or roll back each other's
+// plans/snapshots. That per-caller binding is what #932/#934 fixed; widening
+// it to principal-level sharing — as a naive read of #950's "share rate
+// limits across a principal's tokens" would suggest applying everywhere —
+// would silently reopen it.
+func TestApplyContentPlanIsolatedByTokenEvenUnderSharedPrincipal(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	contentRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = contentRoot
+	cfg.HugoRoot = t.TempDir()
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const sharedPrincipal = "client-shared"
+	addBearerTokenWithPrincipal(t, storePath, "token-p1", "write", sharedPrincipal)
+	addBearerTokenWithPrincipal(t, storePath, "token-p2", "write", sharedPrincipal)
+
+	createRec := doMCPCall(t, srv, "token-p1", []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"posts/e2e-shared-principal","title":"Title","body":"Original body","tags":[],"categories":[]}}}`))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create_page status = %d body = %q", createRec.Code, createRec.Body.String())
+	}
+	filePath := filepath.Join(contentRoot, "posts", "e2e-shared-principal", "index.md")
+	beforeAttempt, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read created file: %v", err)
+	}
+
+	planRec := doMCPCall(t, srv, "token-p1", []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_content_change","arguments":{"slug":"posts/e2e-shared-principal","operations":[{"op":"update_body","body":"Changed by token-p1"}]}}}`))
+	if planRec.Code != http.StatusOK {
+		t.Fatalf("plan_content_change status = %d body = %q", planRec.Code, planRec.Body.String())
+	}
+	planEnvelope := toolCallResultData(t, planRec.Body.String())
+	planID := planEnvelope["data"].(map[string]any)["plan_id"].(string)
+	if planID == "" {
+		t.Fatal("plan_content_change returned empty plan_id")
+	}
+
+	applyPayload := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"apply_content_plan","arguments":{"plan_id":"%s"}}}`, planID))
+
+	// token-p2 shares token-p1's OAuth principal but is a distinct bearer;
+	// it must still be treated as an intruder for plan ownership.
+	otherTokenRec := doMCPCall(t, srv, "token-p2", applyPayload)
+	if otherTokenRec.Code != http.StatusOK {
+		t.Fatalf("apply_content_plan same-principal-other-token status = %d body = %q", otherTokenRec.Code, otherTokenRec.Body.String())
+	}
+	if !toolCallBodyHasError(otherTokenRec, "plan_not_found") {
+		t.Fatalf("apply_content_plan same-principal-other-token body = %q, want plan_not_found", otherTokenRec.Body.String())
+	}
+	afterRejected, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read file after rejected apply: %v", err)
+	}
+	if string(afterRejected) != string(beforeAttempt) {
+		t.Fatalf("same-principal-other-token apply changed file:\nbefore=%q\nafter=%q", string(beforeAttempt), string(afterRejected))
+	}
+
+	ownerRec := doMCPCall(t, srv, "token-p1", applyPayload)
+	if ownerRec.Code != http.StatusOK {
+		t.Fatalf("apply_content_plan owner status = %d body = %q", ownerRec.Code, ownerRec.Body.String())
+	}
+	ownerData := toolCallResultData(t, ownerRec.Body.String())["data"].(map[string]any)
+	if got, _ := ownerData["status"].(string); got != "updated" {
+		t.Fatalf("apply_content_plan owner status = %q, want updated: %#v", got, ownerData)
+	}
+	applied, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read file after owner apply: %v", err)
+	}
+	if !strings.Contains(string(applied), "Changed by token-p1") {
+		t.Fatalf("owner apply did not write planned body: %q", string(applied))
+	}
+}
+
+func TestRollbackChangeSnapshotIsolatedByCallerAcrossHTTP(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	contentRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = contentRoot
+	cfg.HugoRoot = t.TempDir()
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const callerA = "rollback-owner-token"
+	const callerB = "rollback-intruder-token"
+	addBearerToken(t, storePath, callerA, "write")
+	addBearerToken(t, storePath, callerB, "write")
+
+	createRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"posts/e2e-rollback-owner","title":"Title","body":"Before rollback snapshot","tags":[],"categories":[]}}}`))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create_page status = %d body = %q", createRec.Code, createRec.Body.String())
+	}
+	planRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_content_change","arguments":{"slug":"posts/e2e-rollback-owner","operations":[{"op":"update_body","body":"After apply snapshot"}]}}}`))
+	planData := toolCallResultData(t, planRec.Body.String())["data"].(map[string]any)
+	planID := planData["plan_id"].(string)
+	applyRec := doMCPCall(t, srv, callerA, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"apply_content_plan","arguments":{"plan_id":"%s"}}}`, planID)))
+	if applyRec.Code != http.StatusOK {
+		t.Fatalf("apply_content_plan status = %d body = %q", applyRec.Code, applyRec.Body.String())
+	}
+	applyData := toolCallResultData(t, applyRec.Body.String())["data"].(map[string]any)
+	beforeRevision := applyData["before_revision"].(string)
+	afterRevision := applyData["after_revision"].(string)
+	filePath := filepath.Join(contentRoot, "posts", "e2e-rollback-owner", "index.md")
+	beforeRejected, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read applied file: %v", err)
+	}
+
+	bRec := doMCPCall(t, srv, callerB, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rollback_change","arguments":{"slug":"posts/e2e-rollback-owner","to_revision":"%s","expected_revision":"%s"}}}`, beforeRevision, afterRevision)))
+	if bRec.Code != http.StatusOK {
+		t.Fatalf("rollback_change intruder status = %d body = %q", bRec.Code, bRec.Body.String())
+	}
+	if !toolCallBodyHasError(bRec, "snapshot_not_found") {
+		t.Fatalf("rollback_change intruder body = %q, want snapshot_not_found", bRec.Body.String())
+	}
+	afterRejected, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read file after rejected rollback: %v", err)
+	}
+	if string(afterRejected) != string(beforeRejected) {
+		t.Fatalf("intruder rollback changed file:\nbefore=%q\nafter=%q", string(beforeRejected), string(afterRejected))
+	}
+
+	aRec := doMCPCall(t, srv, callerA, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rollback_change","arguments":{"slug":"posts/e2e-rollback-owner","to_revision":"%s","expected_revision":"%s"}}}`, beforeRevision, afterRevision)))
+	if aRec.Code != http.StatusOK {
+		t.Fatalf("rollback_change owner status = %d body = %q", aRec.Code, aRec.Body.String())
+	}
+	if toolCallBodyHasError(aRec, "snapshot_not_found") {
+		t.Fatalf("rollback_change owner lost its snapshot after the intruder attempt: %q", aRec.Body.String())
+	}
+	rolledBack, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read file after owner rollback: %v", err)
+	}
+	if strings.Contains(string(rolledBack), "After apply snapshot") {
+		t.Fatalf("owner rollback did not restore file contents: %q", string(rolledBack))
+	}
+}
+
+func TestBundlePlansAndSnapshotsAreIsolatedByCallerAcrossHTTP(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	contentRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = contentRoot
+	cfg.HugoRoot = t.TempDir()
+	cfg.DBPath = filepath.Join(t.TempDir(), "runtime-state.sqlite")
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const callerA = "bundle-owner-token"
+	const callerB = "bundle-intruder-token"
+	addBearerToken(t, storePath, callerA, "write")
+	addBearerToken(t, storePath, callerB, "write")
+
+	for _, createPayload := range []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"posts/e2e-bundle-owner","lang":"fr","title":"Titre FR","body":"Corps FR","tags":[],"categories":[]}}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"posts/e2e-bundle-owner","lang":"en","title":"Title EN","body":"Body EN","tags":[],"categories":[]}}}`,
+	} {
+		rec := doMCPCall(t, srv, callerA, []byte(createPayload))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("create multilingual page status = %d body = %q", rec.Code, rec.Body.String())
+		}
+	}
+	frPath := filepath.Join(contentRoot, "posts", "e2e-bundle-owner", "index.fr.md")
+	frBeforePlan, err := os.ReadFile(frPath)
+	if err != nil {
+		t.Fatalf("read fr file before bundle apply: %v", err)
+	}
+
+	planRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_bundle_change","arguments":{"slug":"posts/e2e-bundle-owner","translations":[{"lang":"fr","operations":[{"op":"update_body","body":"FR changed by owner"}]},{"lang":"en","operations":[{"op":"update_body","body":"EN changed by owner"}]}]}}}`))
+	if planRec.Code != http.StatusOK {
+		t.Fatalf("plan_bundle_change status = %d body = %q", planRec.Code, planRec.Body.String())
+	}
+	planData := toolCallResultData(t, planRec.Body.String())["data"].(map[string]any)
+	planID := planData["plan_id"].(string)
+
+	bApplyRec := doMCPCall(t, srv, callerB, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"apply_bundle_plan","arguments":{"plan_id":"%s"}}}`, planID)))
+	if bApplyRec.Code != http.StatusOK {
+		t.Fatalf("apply_bundle_plan intruder status = %d body = %q", bApplyRec.Code, bApplyRec.Body.String())
+	}
+	if !toolCallBodyHasError(bApplyRec, "plan_not_found") {
+		t.Fatalf("apply_bundle_plan intruder body = %q, want plan_not_found", bApplyRec.Body.String())
+	}
+	frAfterRejectedApply, err := os.ReadFile(frPath)
+	if err != nil {
+		t.Fatalf("read fr file after rejected bundle apply: %v", err)
+	}
+	if string(frAfterRejectedApply) != string(frBeforePlan) {
+		t.Fatalf("intruder bundle apply changed FR file:\nbefore=%q\nafter=%q", string(frBeforePlan), string(frAfterRejectedApply))
+	}
+
+	aApplyRec := doMCPCall(t, srv, callerA, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"apply_bundle_plan","arguments":{"plan_id":"%s"}}}`, planID)))
+	if aApplyRec.Code != http.StatusOK {
+		t.Fatalf("apply_bundle_plan owner status = %d body = %q", aApplyRec.Code, aApplyRec.Body.String())
+	}
+	aApplyData := toolCallResultData(t, aApplyRec.Body.String())["data"].(map[string]any)
+	beforeBundleRevision := aApplyData["before_revision"].(string)
+	afterBundleRevision := aApplyData["after_revision"].(string)
+	frAfterOwnerApply, err := os.ReadFile(frPath)
+	if err != nil {
+		t.Fatalf("read fr file after owner bundle apply: %v", err)
+	}
+	if !strings.Contains(string(frAfterOwnerApply), "FR changed by owner") {
+		t.Fatalf("owner bundle apply did not change FR file: %q", string(frAfterOwnerApply))
+	}
+
+	// Simulate a process restart: a fresh server and source index must restore
+	// the durable bundle snapshot, while the bearer-token owner boundary
+	// remains enforced for an intruder.
+	srv = mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	bRollbackRec := doMCPCall(t, srv, callerB, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rollback_bundle","arguments":{"slug":"posts/e2e-bundle-owner","to_bundle_revision":"%s","expected_bundle_revision":"%s"}}}`, beforeBundleRevision, afterBundleRevision)))
+	if bRollbackRec.Code != http.StatusOK {
+		t.Fatalf("rollback_bundle intruder status = %d body = %q", bRollbackRec.Code, bRollbackRec.Body.String())
+	}
+	if !toolCallBodyHasError(bRollbackRec, "snapshot_not_found") {
+		t.Fatalf("rollback_bundle intruder body = %q, want snapshot_not_found", bRollbackRec.Body.String())
+	}
+	frAfterRejectedRollback, err := os.ReadFile(frPath)
+	if err != nil {
+		t.Fatalf("read fr file after rejected bundle rollback: %v", err)
+	}
+	if string(frAfterRejectedRollback) != string(frAfterOwnerApply) {
+		t.Fatalf("intruder bundle rollback changed FR file:\nbefore=%q\nafter=%q", string(frAfterOwnerApply), string(frAfterRejectedRollback))
+	}
+
+	aRollbackRec := doMCPCall(t, srv, callerA, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rollback_bundle","arguments":{"slug":"posts/e2e-bundle-owner","to_bundle_revision":"%s","expected_bundle_revision":"%s"}}}`, beforeBundleRevision, afterBundleRevision)))
+	if aRollbackRec.Code != http.StatusOK {
+		t.Fatalf("rollback_bundle owner status = %d body = %q", aRollbackRec.Code, aRollbackRec.Body.String())
+	}
+	if toolCallBodyHasError(aRollbackRec, "snapshot_not_found") {
+		t.Fatalf("rollback_bundle owner lost its snapshot after the intruder attempt: %q", aRollbackRec.Body.String())
+	}
+	frAfterOwnerRollback, err := os.ReadFile(frPath)
+	if err != nil {
+		t.Fatalf("read fr file after owner bundle rollback: %v", err)
+	}
+	if string(frAfterOwnerRollback) != string(frBeforePlan) {
+		t.Fatalf("owner bundle rollback did not restore FR file:\nbefore=%q\nafter=%q", string(frBeforePlan), string(frAfterOwnerRollback))
+	}
+}
+
+// TestConcurrentApplyBundlePlanByDistinctPrincipalsIsolatesMutationStatus is
+// #1067's remaining bundle-mutation race scenario (noted as open in #1109's
+// PR body): TestBundlePlansAndSnapshotsAreIsolatedByCallerAcrossHTTP already
+// proves an intruder's apply_bundle_plan on someone else's plan_id is
+// rejected sequentially (plan_not_found, an authorization check that never
+// even reaches the content lock) — but that never exercises a genuine
+// content-level race, since two calls against two different plan_ids for
+// two different callers don't contend for anything until they both target
+// the same bundle. Here two distinct OAuth principals each independently
+// plan_bundle_change the *same* bundle (allowed — plan ownership, not page
+// ownership, is what's caller-scoped) and then race apply_bundle_plan
+// against each other under go test -race, with ContentMu pre-locked to
+// force genuine overlap. Exactly one must win (bundle_conflict for the
+// loser, whose captured BundleRevision goes stale the instant the winner
+// writes), and each principal's own get_mutation_status must reflect only
+// its own outcome with zero cross-caller leakage, mirroring
+// TestConcurrentUpdatePageByDistinctPrincipalsIsolatesMutationStatus's shape
+// for a bundle mutation instead of a single-page one.
+func TestConcurrentApplyBundlePlanByDistinctPrincipalsIsolatesMutationStatus(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	contentRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = contentRoot
+	cfg.HugoRoot = t.TempDir()
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const callerA = "bundle-race-principal-a"
+	const callerB = "bundle-race-principal-b"
+	addBearerToken(t, storePath, callerA, "write")
+	addBearerToken(t, storePath, callerB, "write")
+
+	const slug = "posts/bundle-race"
+	createRec := doMCPCall(t, srv, callerA, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"%s","lang":"en","title":"Title","body":"Body v0","tags":[],"categories":[]}}}`, slug)))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create_page status = %d body = %q", createRec.Code, createRec.Body.String())
+	}
+
+	planFor := func(caller, body string) string {
+		t.Helper()
+		payload := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"plan_bundle_change","arguments":{"slug":"%s","translations":[{"lang":"en","operations":[{"op":"update_body","body":"%s"}]}]}}}`, slug, body))
+		rec := doMCPCall(t, srv, caller, payload)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("plan_bundle_change(%s) status = %d body = %q", caller, rec.Code, rec.Body.String())
+		}
+		data := toolCallResultData(t, rec.Body.String())["data"].(map[string]any)
+		planID, _ := data["plan_id"].(string)
+		if planID == "" {
+			t.Fatalf("plan_bundle_change(%s) returned empty plan_id: %q", caller, rec.Body.String())
+		}
+		return planID
+	}
+	planA := planFor(callerA, "Body from A")
+	planB := planFor(callerB, "Body from B")
+
+	const keyA = "bundle-race-principal-a-key"
+	const keyB = "bundle-race-principal-b-key"
+	payloadA := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"apply_bundle_plan","arguments":{"plan_id":"%s","idempotency_key":"%s"}}}`, planA, keyA))
+	payloadB := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"apply_bundle_plan","arguments":{"plan_id":"%s","idempotency_key":"%s"}}}`, planB, keyB))
+
+	hugosite.ContentMu.Lock()
+	started := make(chan struct{}, 2)
+	recA := make(chan *httptest.ResponseRecorder, 1)
+	recB := make(chan *httptest.ResponseRecorder, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		started <- struct{}{}
+		recA <- doMCPCall(t, srv, callerA, payloadA)
+	}()
+	go func() {
+		defer wg.Done()
+		started <- struct{}{}
+		recB <- doMCPCall(t, srv, callerB, payloadB)
+	}()
+	<-started
+	<-started
+	hugosite.ContentMu.Unlock()
+	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	aRec, bRec := <-recA, <-recB
+	if aRec.Code != http.StatusOK || bRec.Code != http.StatusOK {
+		t.Fatalf("apply_bundle_plan race transport failure: A status=%d body=%q; B status=%d body=%q", aRec.Code, aRec.Body.String(), bRec.Code, bRec.Body.String())
+	}
+
+	statusOf := func(rec *httptest.ResponseRecorder) (ok bool, conflict bool) {
+		if toolCallBodyHasError(rec, "bundle_conflict") {
+			return false, true
+		}
+		data := toolCallResultData(t, rec.Body.String())["data"].(map[string]any)
+		return data["bundle_status"] == "applied", false
+	}
+	aOK, aConflict := statusOf(aRec)
+	bOK, bConflict := statusOf(bRec)
+	if !((aOK && bConflict) || (bOK && aConflict)) {
+		t.Fatalf("same-bundle race across principals must resolve to exactly one success and one bundle_conflict, got A(ok=%v,conflict=%v) B(ok=%v,conflict=%v): A=%q B=%q",
+			aOK, aConflict, bOK, bConflict, aRec.Body.String(), bRec.Body.String())
+	}
+
+	statusPayloadA := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_mutation_status","arguments":{"tool":"apply_bundle_plan","idempotency_key":"%s"}}}`, keyA))
+	statusPayloadB := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_mutation_status","arguments":{"tool":"apply_bundle_plan","idempotency_key":"%s"}}}`, keyB))
+
+	wantStatus := func(conflict bool) string {
+		if conflict {
+			return "unknown"
+		}
+		return "succeeded"
+	}
+	aStatusRec := doMCPCall(t, srv, callerA, statusPayloadA)
+	aStatusData := toolCallResultData(t, aStatusRec.Body.String())["data"].(map[string]any)
+	if got, _ := aStatusData["status"].(string); got != wantStatus(aConflict) {
+		t.Fatalf("get_mutation_status (caller A, own key) = %q, want %q: %#v", got, wantStatus(aConflict), aStatusData)
+	}
+	bStatusRec := doMCPCall(t, srv, callerB, statusPayloadB)
+	bStatusData := toolCallResultData(t, bStatusRec.Body.String())["data"].(map[string]any)
+	if got, _ := bStatusData["status"].(string); got != wantStatus(bConflict) {
+		t.Fatalf("get_mutation_status (caller B, own key) = %q, want %q: %#v", got, wantStatus(bConflict), bStatusData)
+	}
+
+	// Cross-caller: neither principal's key is visible to the other, even
+	// immediately after the race that just touched both.
+	bCrossRec := doMCPCall(t, srv, callerB, statusPayloadA)
+	bCrossData := toolCallResultData(t, bCrossRec.Body.String())["data"].(map[string]any)
+	if got, _ := bCrossData["status"].(string); got != "unknown" {
+		t.Fatalf("get_mutation_status (caller B, A's key) = %q, want unknown — leaked across the race", got)
+	}
+	aCrossRec := doMCPCall(t, srv, callerA, statusPayloadB)
+	aCrossData := toolCallResultData(t, aCrossRec.Body.String())["data"].(map[string]any)
+	if got, _ := aCrossData["status"].(string); got != "unknown" {
+		t.Fatalf("get_mutation_status (caller A, B's key) = %q, want unknown — leaked across the race", got)
+	}
+}
+
+// TestConcurrentUpdatePageByDistinctPrincipalsIsolatesMutationStatus is the
+// #1067 multi-principal concurrency test: internal/tools/write's own
+// concurrent-mutation tests (mutation_coordination_test.go) prove the
+// content lock resolves deterministically, but they only ever drive a
+// single MCP session/caller through both goroutines — they cannot catch a
+// race in the per-caller ownership boundary itself (idempotency store,
+// mutation-status records), because there is only one caller's key space in
+// play. This test races two distinct OAuth principals — real bearer
+// tokens, real HTTP requests — against the same page at the same instant
+// under `go test -race`, then proves each principal's own
+// get_mutation_status call reflects only its own outcome with zero
+// cross-caller leakage even though the underlying writes were racing.
+func TestConcurrentUpdatePageByDistinctPrincipalsIsolatesMutationStatus(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	contentRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = contentRoot
+	cfg.HugoRoot = t.TempDir()
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const callerA = "race-principal-a-token"
+	const callerB = "race-principal-b-token"
+	addBearerToken(t, storePath, callerA, "write")
+	addBearerToken(t, storePath, callerB, "write")
+
+	createRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"posts/e2e-concurrent-race","title":"Title","body":"Body v0","tags":[],"categories":[]}}}`))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create_page status = %d body = %q", createRec.Code, createRec.Body.String())
+	}
+	createData := toolCallResultData(t, createRec.Body.String())["data"].(map[string]any)
+	sharedRevision, _ := createData["new_revision"].(string)
+	if sharedRevision == "" {
+		t.Fatal("create_page returned empty new_revision")
+	}
+
+	const keyA = "race-principal-a-key"
+	const keyB = "race-principal-b-key"
+	payloadA := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_page","arguments":{"slug":"posts/e2e-concurrent-race","body":"Body from A","expected_revision":"%s","idempotency_key":"%s"}}}`, sharedRevision, keyA))
+	payloadB := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_page","arguments":{"slug":"posts/e2e-concurrent-race","body":"Body from B","expected_revision":"%s","idempotency_key":"%s"}}}`, sharedRevision, keyB))
+
+	// Pre-lock the content mutex so both goroutines queue up and are
+	// released together, forcing genuine overlap instead of a race that
+	// might happen to serialize by scheduling luck (same technique as
+	// internal/tools/write/mutation_coordination_test.go).
+	hugosite.ContentMu.Lock()
+	started := make(chan struct{}, 2)
+	recA := make(chan *httptest.ResponseRecorder, 1)
+	recB := make(chan *httptest.ResponseRecorder, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		started <- struct{}{}
+		recA <- doMCPCall(t, srv, callerA, payloadA)
+	}()
+	go func() {
+		defer wg.Done()
+		started <- struct{}{}
+		recB <- doMCPCall(t, srv, callerB, payloadB)
+	}()
+	<-started
+	<-started
+	hugosite.ContentMu.Unlock()
+	wg.Wait()
+	// If doMCPCall hit t.Fatalf inside a goroutine, runtime.Goexit unwound
+	// it without ever sending on recA/recB — wg.Wait() still returns (the
+	// deferred wg.Done() runs during Goexit), but reading the channels below
+	// would then block forever instead of failing clearly. Bail out now so
+	// a real failure reports its own message instead of a silent timeout.
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	aRec, bRec := <-recA, <-recB
+	if aRec.Code != http.StatusOK || bRec.Code != http.StatusOK {
+		t.Fatalf("update_page race transport failure: A status=%d body=%q; B status=%d body=%q", aRec.Code, aRec.Body.String(), bRec.Code, bRec.Body.String())
+	}
+
+	statusOf := func(rec *httptest.ResponseRecorder) (ok bool, conflict bool) {
+		if toolCallBodyHasError(rec, "revision_conflict") {
+			return false, true
+		}
+		data := toolCallResultData(t, rec.Body.String())["data"].(map[string]any)
+		return data["status"] == "updated", false
+	}
+	aOK, aConflict := statusOf(aRec)
+	bOK, bConflict := statusOf(bRec)
+	if !((aOK && bConflict) || (bOK && aConflict)) {
+		t.Fatalf("same-slug race across principals must resolve to exactly one success and one revision_conflict, got A(ok=%v,conflict=%v) B(ok=%v,conflict=%v): A=%q B=%q",
+			aOK, aConflict, bOK, bConflict, aRec.Body.String(), bRec.Body.String())
+	}
+
+	// The load-bearing multi-principal assertion: even though the writes
+	// raced, each principal's mutation-status lookup — scoped by its own
+	// bearer token — must reflect only its own outcome, never the other's.
+	statusPayloadA := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_mutation_status","arguments":{"tool":"update_page","idempotency_key":"%s"}}}`, keyA))
+	statusPayloadB := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_mutation_status","arguments":{"tool":"update_page","idempotency_key":"%s"}}}`, keyB))
+
+	// Only a successful mutation is ever recorded in the idempotency store
+	// (see update_page's rt.idem.remember call, reached solely on the
+	// success path past the revision check) — a revision_conflict never
+	// reaches it, so the losing principal's own key legitimately reports
+	// "unknown", not a distinct failure status.
+	aStatusRec := doMCPCall(t, srv, callerA, statusPayloadA)
+	aStatusData := toolCallResultData(t, aStatusRec.Body.String())["data"].(map[string]any)
+	wantAStatus := "succeeded"
+	if aConflict {
+		wantAStatus = "unknown"
+	}
+	if got, _ := aStatusData["status"].(string); got != wantAStatus {
+		t.Fatalf("get_mutation_status (caller A, own key) = %q, want %q: %#v", got, wantAStatus, aStatusData)
+	}
+
+	bStatusRec := doMCPCall(t, srv, callerB, statusPayloadB)
+	bStatusData := toolCallResultData(t, bStatusRec.Body.String())["data"].(map[string]any)
+	wantBStatus := "succeeded"
+	if bConflict {
+		wantBStatus = "unknown"
+	}
+	if got, _ := bStatusData["status"].(string); got != wantBStatus {
+		t.Fatalf("get_mutation_status (caller B, own key) = %q, want %q: %#v", got, wantBStatus, bStatusData)
+	}
+
+	// Cross-caller: B must never see A's record under A's key, and vice
+	// versa, even immediately after the race that just touched both.
+	bCrossRec := doMCPCall(t, srv, callerB, statusPayloadA)
+	bCrossData := toolCallResultData(t, bCrossRec.Body.String())["data"].(map[string]any)
+	if got, _ := bCrossData["status"].(string); got != "unknown" {
+		t.Fatalf("get_mutation_status (caller B, A's key) = %q, want unknown — leaked across the race", got)
+	}
+	aCrossRec := doMCPCall(t, srv, callerA, statusPayloadB)
+	aCrossData := toolCallResultData(t, aCrossRec.Body.String())["data"].(map[string]any)
+	if got, _ := aCrossData["status"].(string); got != "unknown" {
+		t.Fatalf("get_mutation_status (caller A, B's key) = %q, want unknown — leaked across the race", got)
+	}
+}
+
+// TestConcurrentCreatePageByDistinctPrincipalsRacesRateLimitBucketsCorrectly
+// is #1067's remaining rate-limit gap: the mutation-tool rate limiter
+// (internal/tools/write's mutationLimiters map, keyed by mutationCallerKey —
+// the OAuth principal, separate from the IP-based internal/oauth.RateLimiter
+// HTTP middleware) is a single shared map accessed by every mutation call.
+// Existing rate-limit tests are all sequential, single-goroutine loops —
+// none exercise two distinct principals hitting that shared map from
+// separate goroutines at the same instant. This races real concurrent
+// access under -race and proves each principal's bucket accounts for
+// exactly its own calls, never the other's — the isolation a
+// map-keyed-by-principal design implies but a lock-scoping bug could still
+// violate under real concurrent load.
+func TestConcurrentCreatePageByDistinctPrincipalsRacesRateLimitBucketsCorrectly(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	contentRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = contentRoot
+	cfg.HugoRoot = t.TempDir()
+	cfg.RateLimit.CreateUpdatePerMin = 5
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const callerA = "ratelimit-race-principal-a"
+	const callerB = "ratelimit-race-principal-b"
+	addBearerToken(t, storePath, callerA, "write")
+	addBearerToken(t, storePath, callerB, "write")
+
+	const callsPerCaller = 3
+	payloadFor := func(caller string, i int) []byte {
+		return []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"posts/ratelimit-race-%s-%d","title":"Title","body":"Body","tags":[],"categories":[]}}}`, caller, i))
+	}
+
+	// Pre-lock the content mutex so all 2*callsPerCaller goroutines queue up
+	// and are released together, forcing genuine concurrent map access on
+	// the shared mutationLimiters map instead of a race that might happen
+	// to serialize by scheduling luck (same technique used throughout this
+	// file's other race tests).
+	hugosite.ContentMu.Lock()
+	started := make(chan struct{}, 2*callsPerCaller)
+	recs := make(chan *httptest.ResponseRecorder, 2*callsPerCaller)
+	var wg sync.WaitGroup
+	fire := func(caller string) {
+		for i := 0; i < callsPerCaller; i++ {
+			wg.Add(1)
+			payload := payloadFor(caller, i)
+			go func() {
+				defer wg.Done()
+				started <- struct{}{}
+				recs <- doMCPCall(t, srv, caller, payload)
+			}()
+		}
+	}
+	fire(callerA)
+	fire(callerB)
+	for i := 0; i < 2*callsPerCaller; i++ {
+		<-started
+	}
+	hugosite.ContentMu.Unlock()
+	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+	for i := 0; i < 2*callsPerCaller; i++ {
+		rec := <-recs
+		if rec.Code != http.StatusOK {
+			t.Fatalf("create_page race transport failure: status=%d body=%q", rec.Code, rec.Body.String())
+		}
+	}
+
+	remainingFor := func(caller string) int {
+		t.Helper()
+		rec := doMCPCall(t, srv, caller, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_rate_limits","arguments":{}}}`))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("get_rate_limits status = %d body = %q", rec.Code, rec.Body.String())
+		}
+		data := toolCallResultData(t, rec.Body.String())["data"].(map[string]any)
+		bucket := data["create_update_upload"].(map[string]any)
+		return int(bucket["remaining"].(float64))
+	}
+
+	wantRemaining := cfg.RateLimit.CreateUpdatePerMin - callsPerCaller
+	if got := remainingFor(callerA); got != wantRemaining {
+		t.Fatalf("caller A remaining = %d, want %d (%d/%d quota consumed by exactly its own %d concurrent calls, none of caller B's)", got, wantRemaining, callsPerCaller, cfg.RateLimit.CreateUpdatePerMin, callsPerCaller)
+	}
+	if got := remainingFor(callerB); got != wantRemaining {
+		t.Fatalf("caller B remaining = %d, want %d — a cross-principal leak in the shared rate-limit map under concurrent access", got, wantRemaining)
+	}
+}
+
+// racePNG is a minimal PNG signature, enough for the asset-upload path's
+// content-type sniffing; content correctness isn't what this race exercises.
+var racePNG = []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0, 0, 0, 0, 0}
+
+// TestConcurrentDeletePageAssetByDistinctPrincipalsIsolatesMutationStatus is
+// #1067's remaining asset-operation race scenario: two distinct OAuth
+// principals both attempt to delete the same asset with the same
+// expected_sha256 concurrency guard at the same instant. Mirrors
+// TestConcurrentUpdatePageByDistinctPrincipalsIsolatesMutationStatus's shape
+// (real bearer tokens, real HTTP, pre-locked ContentMu forcing genuine
+// overlap under -race) but for an asset op instead of a page mutation, and
+// proves the same per-principal mutation-status isolation holds there too.
+func TestConcurrentDeletePageAssetByDistinctPrincipalsIsolatesMutationStatus(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	contentRoot := t.TempDir()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = contentRoot
+	cfg.HugoRoot = t.TempDir()
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const callerA = "asset-race-principal-a"
+	const callerB = "asset-race-principal-b"
+	addBearerToken(t, storePath, callerA, "write")
+	addBearerToken(t, storePath, callerB, "write")
+
+	const slug = "posts/asset-race"
+	createRec := doMCPCall(t, srv, callerA, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{"slug":"%s","title":"Title","body":"Body v0","tags":[],"categories":[]}}}`, slug)))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create_page status = %d body = %q", createRec.Code, createRec.Body.String())
+	}
+	uploadRec := doMCPCall(t, srv, callerA, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"upload_page_asset","arguments":{"slug":"%s","filename":"cover.png","content_base64":"%s"}}}`, slug, base64.StdEncoding.EncodeToString(racePNG))))
+	if uploadRec.Code != http.StatusOK {
+		t.Fatalf("upload_page_asset status = %d body = %q", uploadRec.Code, uploadRec.Body.String())
+	}
+	uploadData := toolCallResultData(t, uploadRec.Body.String())["data"].(map[string]any)
+	sha256Hex, _ := uploadData["sha256"].(string)
+	if sha256Hex == "" {
+		t.Fatal("upload_page_asset returned empty sha256")
+	}
+
+	const keyA = "asset-race-principal-a-key"
+	const keyB = "asset-race-principal-b-key"
+	payloadA := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_page_asset","arguments":{"slug":"%s","filename":"cover.png","expected_sha256":"%s","idempotency_key":"%s"}}}`, slug, sha256Hex, keyA))
+	payloadB := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_page_asset","arguments":{"slug":"%s","filename":"cover.png","expected_sha256":"%s","idempotency_key":"%s"}}}`, slug, sha256Hex, keyB))
+
+	hugosite.ContentMu.Lock()
+	started := make(chan struct{}, 2)
+	recA := make(chan *httptest.ResponseRecorder, 1)
+	recB := make(chan *httptest.ResponseRecorder, 1)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		started <- struct{}{}
+		recA <- doMCPCall(t, srv, callerA, payloadA)
+	}()
+	go func() {
+		defer wg.Done()
+		started <- struct{}{}
+		recB <- doMCPCall(t, srv, callerB, payloadB)
+	}()
+	<-started
+	<-started
+	hugosite.ContentMu.Unlock()
+	wg.Wait()
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	aRec, bRec := <-recA, <-recB
+	if aRec.Code != http.StatusOK || bRec.Code != http.StatusOK {
+		t.Fatalf("delete_page_asset race transport failure: A status=%d body=%q; B status=%d body=%q", aRec.Code, aRec.Body.String(), bRec.Code, bRec.Body.String())
+	}
+
+	aDeleted := !toolCallBodyHasError(aRec, "not_found")
+	bDeleted := !toolCallBodyHasError(bRec, "not_found")
+	if aDeleted == bDeleted {
+		t.Fatalf("same-asset race across principals must resolve to exactly one deletion, got A(deleted=%v) B(deleted=%v): A=%q B=%q",
+			aDeleted, bDeleted, aRec.Body.String(), bRec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(contentRoot, slug, "cover.png")); !os.IsNotExist(err) {
+		t.Fatalf("asset must be gone after the race regardless of which principal won, stat err = %v", err)
+	}
+
+	statusPayloadA := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_mutation_status","arguments":{"tool":"delete_page_asset","idempotency_key":"%s"}}}`, keyA))
+	statusPayloadB := []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_mutation_status","arguments":{"tool":"delete_page_asset","idempotency_key":"%s"}}}`, keyB))
+
+	wantStatus := func(deleted bool) string {
+		if deleted {
+			return "succeeded"
+		}
+		return "unknown"
+	}
+	aStatusRec := doMCPCall(t, srv, callerA, statusPayloadA)
+	aStatusData := toolCallResultData(t, aStatusRec.Body.String())["data"].(map[string]any)
+	if got, _ := aStatusData["status"].(string); got != wantStatus(aDeleted) {
+		t.Fatalf("get_mutation_status (caller A, own key) = %q, want %q: %#v", got, wantStatus(aDeleted), aStatusData)
+	}
+	bStatusRec := doMCPCall(t, srv, callerB, statusPayloadB)
+	bStatusData := toolCallResultData(t, bStatusRec.Body.String())["data"].(map[string]any)
+	if got, _ := bStatusData["status"].(string); got != wantStatus(bDeleted) {
+		t.Fatalf("get_mutation_status (caller B, own key) = %q, want %q: %#v", got, wantStatus(bDeleted), bStatusData)
+	}
+
+	// Cross-caller: neither principal's key is visible to the other, even
+	// immediately after the race that just touched both.
+	bCrossRec := doMCPCall(t, srv, callerB, statusPayloadA)
+	bCrossData := toolCallResultData(t, bCrossRec.Body.String())["data"].(map[string]any)
+	if got, _ := bCrossData["status"].(string); got != "unknown" {
+		t.Fatalf("get_mutation_status (caller B, A's key) = %q, want unknown — leaked across the race", got)
+	}
+	aCrossRec := doMCPCall(t, srv, callerA, statusPayloadB)
+	aCrossData := toolCallResultData(t, aCrossRec.Body.String())["data"].(map[string]any)
+	if got, _ := aCrossData["status"].(string); got != "unknown" {
+		t.Fatalf("get_mutation_status (caller A, B's key) = %q, want unknown — leaked across the race", got)
+	}
+}
+
+func TestPreviewToolsAreIsolatedByCallerAcrossHTTP(t *testing.T) {
+	mockDir := writeServerPreviewMockHugo(t, "<html><head><title>Demo</title><meta name=\"description\" content=\"Preview\"></head><body>preview</body></html>")
+	t.Setenv("PATH", mockDir+":"+os.Getenv("PATH"))
+
+	storePath := filepath.Join(t.TempDir(), "tokens.db")
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.ContentRoot = filepath.Join("..", "..", "testdata", "fixtures", "content")
+	cfg.HugoRoot = t.TempDir()
+	cfg.DBPath = filepath.Join(t.TempDir(), "runtime-state.sqlite")
+	srv := mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+
+	const callerA = "preview-owner-token"
+	const callerB = "preview-intruder-token"
+	addBearerToken(t, storePath, callerA, "write")
+	addBearerToken(t, storePath, callerB, "write")
+
+	createRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_preview","arguments":{}}}`))
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create_preview status = %d body = %q", createRec.Code, createRec.Body.String())
+	}
+	createData := toolCallResultData(t, createRec.Body.String())["data"].(map[string]any)
+	previewID := createData["preview_id"].(string)
+	if previewID == "" {
+		t.Fatal("create_preview returned empty preview_id")
+	}
+	entryURL := createData["url"].(string)
+	entryReq := httptest.NewRequest(http.MethodGet, entryURL, nil)
+	entryRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(entryRec, entryReq)
+	if entryRec.Code != http.StatusFound || len(entryRec.Result().Cookies()) != 1 {
+		t.Fatalf("initial preview token exchange = %d cookies=%v", entryRec.Code, entryRec.Result().Cookies())
+	}
+	oldCookie := entryRec.Result().Cookies()[0]
+
+	// Recreate the full runtime against the same operational DB. Lease
+	// ownership and TTL remain visible, but the old URL token and cookie are
+	// process-memory secrets and must no longer authorize preview content.
+	srv = mustOAuthSQLiteServerWithConfig(t, cfg, storePath)
+	oldEntryReq := httptest.NewRequest(http.MethodGet, entryURL, nil)
+	oldEntryRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(oldEntryRec, oldEntryReq)
+	if oldEntryRec.Code != http.StatusNotFound {
+		t.Fatalf("old entry token after restart status = %d, want 404", oldEntryRec.Code)
+	}
+	oldCookieReq := httptest.NewRequest(http.MethodGet, "https://mcp.test"+previewstore.CleanPath(previewID, ""), nil)
+	oldCookieReq.AddCookie(oldCookie)
+	oldCookieRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(oldCookieRec, oldCookieReq)
+	if oldCookieRec.Code != http.StatusNotFound {
+		t.Fatalf("old preview cookie after restart status = %d, want 404", oldCookieRec.Code)
+	}
+
+	bListRec := doMCPCall(t, srv, callerB, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_previews","arguments":{}}}`))
+	if bListRec.Code != http.StatusOK {
+		t.Fatalf("list_previews intruder status = %d body = %q", bListRec.Code, bListRec.Body.String())
+	}
+	bListData := toolCallResultData(t, bListRec.Body.String())["data"].(map[string]any)
+	if previews, _ := bListData["previews"].([]any); len(previews) != 0 {
+		t.Fatalf("intruder list_previews leaked owner preview: %#v", previews)
+	}
+
+	bInspectRec := doMCPCall(t, srv, callerB, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"inspect_preview","arguments":{"slug":"posts/hello","preview_id":"%s"}}}`, previewID)))
+	if bInspectRec.Code != http.StatusOK {
+		t.Fatalf("inspect_preview intruder status = %d body = %q", bInspectRec.Code, bInspectRec.Body.String())
+	}
+	if !toolCallBodyHasError(bInspectRec, "preview_not_found") {
+		t.Fatalf("inspect_preview intruder body = %q, want preview_not_found", bInspectRec.Body.String())
+	}
+
+	bRevokeRec := doMCPCall(t, srv, callerB, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"revoke_preview","arguments":{"preview_id":"%s"}}}`, previewID)))
+	if bRevokeRec.Code != http.StatusOK {
+		t.Fatalf("revoke_preview intruder status = %d body = %q", bRevokeRec.Code, bRevokeRec.Body.String())
+	}
+	if !toolCallBodyHasError(bRevokeRec, "preview_not_found") {
+		t.Fatalf("revoke_preview intruder body = %q, want preview_not_found", bRevokeRec.Body.String())
+	}
+	bRevokeAllRec := doMCPCall(t, srv, callerB, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"revoke_all_previews","arguments":{}}}`))
+	if bRevokeAllRec.Code != http.StatusOK {
+		t.Fatalf("revoke_all_previews intruder status = %d body = %q", bRevokeAllRec.Code, bRevokeAllRec.Body.String())
+	}
+	bRevokeAllData := toolCallResultData(t, bRevokeAllRec.Body.String())["data"].(map[string]any)
+	if got := int(bRevokeAllData["revoked_count"].(float64)); got != 0 {
+		t.Fatalf("intruder revoke_all count = %d, want 0", got)
+	}
+
+	aListRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_previews","arguments":{}}}`))
+	if aListRec.Code != http.StatusOK {
+		t.Fatalf("list_previews owner status = %d body = %q", aListRec.Code, aListRec.Body.String())
+	}
+	aListData := toolCallResultData(t, aListRec.Body.String())["data"].(map[string]any)
+	previews, _ := aListData["previews"].([]any)
+	if len(previews) != 1 {
+		t.Fatalf("owner list_previews count = %d, want 1: %#v", len(previews), previews)
+	}
+	previewItem := previews[0].(map[string]any)
+	if got, _ := previewItem["preview_id"].(string); got != previewID {
+		t.Fatalf("owner list_previews preview_id = %q, want %q", got, previewID)
+	}
+	if got, _ := previewItem["access_status"].(string); got != "restart_invalidated" {
+		t.Fatalf("recovered preview access_status = %q, want restart_invalidated", got)
+	}
+	if got, _ := previewItem["url"].(string); got != "" {
+		t.Fatalf("recovered preview url = %q, want empty because old browser credentials are invalid", got)
+	}
+
+	aInspectRec := doMCPCall(t, srv, callerA, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"inspect_preview","arguments":{"slug":"posts/hello","preview_id":"%s"}}}`, previewID)))
+	if aInspectRec.Code != http.StatusOK {
+		t.Fatalf("inspect_preview owner status = %d body = %q", aInspectRec.Code, aInspectRec.Body.String())
+	}
+	aInspectData := toolCallResultData(t, aInspectRec.Body.String())["data"].(map[string]any)
+	if got, _ := aInspectData["preview_id"].(string); got != previewID {
+		t.Fatalf("inspect_preview owner preview_id = %q, want %q", got, previewID)
+	}
+
+	// Keep a second owner lease so both single and bulk revocation paths are
+	// proven after restart, including the distinct owner-filtered SQL delete.
+	secondCreateRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_preview","arguments":{}}}`))
+	if secondCreateRec.Code != http.StatusOK {
+		t.Fatalf("second create_preview status = %d body = %q", secondCreateRec.Code, secondCreateRec.Body.String())
+	}
+
+	aRevokeRec := doMCPCall(t, srv, callerA, []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"revoke_preview","arguments":{"preview_id":"%s"}}}`, previewID)))
+	if aRevokeRec.Code != http.StatusOK {
+		t.Fatalf("revoke_preview owner status = %d body = %q", aRevokeRec.Code, aRevokeRec.Body.String())
+	}
+	aRevokeData := toolCallResultData(t, aRevokeRec.Body.String())["data"].(map[string]any)
+	if got, _ := aRevokeData["status"].(string); got != "revoked" {
+		t.Fatalf("revoke_preview owner status = %q, want revoked: %#v", got, aRevokeData)
+	}
+	aRevokeAllRec := doMCPCall(t, srv, callerA, []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"revoke_all_previews","arguments":{}}}`))
+	if aRevokeAllRec.Code != http.StatusOK {
+		t.Fatalf("revoke_all_previews owner status = %d body = %q", aRevokeAllRec.Code, aRevokeAllRec.Body.String())
+	}
+	aRevokeAllData := toolCallResultData(t, aRevokeAllRec.Body.String())["data"].(map[string]any)
+	if got := int(aRevokeAllData["revoked_count"].(float64)); got != 1 {
+		t.Fatalf("owner revoke_all count = %d, want 1", got)
+	}
+}
+
+// mustBearerlessServerWithWriteEnabled builds an HTTP server with OAuth
+// disabled but ContentRoot set (write tools ARE registered on the internal
+// write-scoped *mcp.Server, since that's independent of OAuth). This is the
+// exact shape needed to prove the #782 stdio-transport boundary: stdio
+// grants write access unconditionally (NewStdio), and the only thing that
+// keeps that from leaking into the HTTP transport is the scope-routing
+// callback in server.New() — never modified by NewStdio's addition. If that
+// boundary ever broke, this is the test that would catch it.
+func mustBearerlessServerWithWriteEnabled(t *testing.T) *server.Server {
+	t.Helper()
+	cfg := config.Default()
+	cfg.SiteRoot = copyServerFixtureTree(t, filepath.Join("..", "..", "testdata", "fixtures", "public", "minimal"))
+	cfg.HugoRoot = t.TempDir()
+	cfg.ContentRoot = filepath.Join("..", "..", "testdata", "fixtures", "content")
+	cfg.OAuth.Enabled = false
+	idx, err := site.NewIndex(cfg)
+	if err != nil {
+		t.Fatalf("NewIndex() error = %v", err)
+	}
+	srv, err := server.New(cfg, idx)
+	if err != nil {
+		t.Fatalf("server.New() error = %v", err)
+	}
+	return srv
+}
+
+// TestBearerlessHTTPCannotReachWriteTools is the discriminating regression
+// test for #782's stdio transport: NewStdio grants write access
+// unconditionally (stdio's whole premise is a trusted local single-user
+// process, no OAuth), which is only safe because stdio is a completely
+// separate construction path (server.NewStdio) that never touches HTTP's
+// scope-routing callback in server.New(). This proves that boundary holds:
+// an unauthenticated HTTP caller — even with write tools fully registered
+// server-side (ContentRoot set) — must see only the read-scope tool set and
+// must not be able to invoke a write tool by name.
+func TestBearerlessHTTPCannotReachWriteTools(t *testing.T) {
+	srv := mustBearerlessServerWithWriteEnabled(t)
+
+	names := doMCPToolsList(t, srv, "")
+	for _, n := range names {
+		if n == "create_page" || n == "update_page" || n == "delete_page" || n == "build_site" || n == "publish_changes" {
+			t.Fatalf("bearerless tools/list must not include write tool %q: %v", n, names)
+		}
+	}
+	if len(names) == 0 {
+		t.Fatal("bearerless tools/list returned no tools at all — test fixture problem, not a pass")
+	}
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_page","arguments":{}}}`)
+	rec := doMCPCall(t, srv, "", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tools/call transport status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unknown tool") && !strings.Contains(rec.Body.String(), "forbidden_tool") {
+		t.Fatalf("bearerless create_page must be rejected as unknown/forbidden, got: %q", rec.Body.String())
+	}
+}
+
+// TestToolResponseCarriesRequestIDAndDurationMeta is the #860 contract test:
+// every tool response served through the tool-call middleware must carry a
+// meta.request_id and a meta.duration_ms, injected centrally so an agent gets
+// consistent correlation + timing without each tool opting in. Exercised over
+// the real served HTTP path (not a direct handler call), so it also proves the
+// added ResponseMeta fields survive the SDK's outbound schema validation.
+func TestToolResponseCarriesRequestIDAndDurationMeta(t *testing.T) {
+	srv := mustTestServer(t) // bearerless (OAuth disabled): anonymous tools callable directly
+	rec := doMCPCall(t, srv, "", []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_capabilities"}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get_capabilities status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	meta := extractResultMeta(t, rec.Body.String())
+	reqID, _ := meta["request_id"].(string)
+	if !strings.HasPrefix(reqID, "req-") {
+		t.Fatalf("meta.request_id = %v, want a req- prefixed id (#860); meta=%v", meta["request_id"], meta)
+	}
+	if _, ok := meta["duration_ms"]; !ok {
+		t.Fatalf("meta.duration_ms missing (#860); meta=%v", meta)
+	}
+	if _, ok := meta["duration_ms"].(float64); !ok {
+		t.Fatalf("meta.duration_ms type = %T, want number", meta["duration_ms"])
+	}
+	// Two calls must get distinct request ids (per-call correlation, not static).
+	rec2 := doMCPCall(t, srv, "", []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_capabilities"}}`))
+	meta2 := extractResultMeta(t, rec2.Body.String())
+	if reqID == meta2["request_id"] {
+		t.Fatalf("two calls shared request_id %q, want distinct per-call ids", reqID)
+	}
+}
+
+// TestRawHTTPToolErrorKeepsContentNotFoundInStructuredResult covers #991 at
+// the last server-controlled boundary. A bridge may label every MCP tool
+// failure INVALID_ARGUMENT, but the server itself returns a normal JSON-RPC
+// result whose structured semantic code remains content_not_found.
+func TestRawHTTPToolErrorKeepsContentNotFoundInStructuredResult(t *testing.T) {
+	srv := mustTestServer(t)
+	rec := doMCPCall(t, srv, "", []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_page","arguments":{"slug":"/posts/guaranteed-missing-991/"}}}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("get_page transport status = %d body = %q", rec.Code, rec.Body.String())
+	}
+	payload := rec.Body.String()
+	if i := strings.Index(payload, "{"); i > 0 {
+		payload = payload[i:]
+	}
+	var rpc struct {
+		Error  json.RawMessage `json:"error"`
+		Result struct {
+			IsError           bool           `json:"isError"`
+			StructuredContent map[string]any `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(payload), &rpc); err != nil {
+		t.Fatalf("unmarshal tools/call response: %v\nbody=%q", err, rec.Body.String())
+	}
+	if len(rpc.Error) != 0 && string(rpc.Error) != "null" {
+		t.Fatalf("business failure became JSON-RPC error: %s", rpc.Error)
+	}
+	if !rpc.Result.IsError {
+		t.Fatalf("result.isError = false, want true; body=%q", rec.Body.String())
+	}
+	if _, exists := rpc.Result.StructuredContent["error_code"]; exists {
+		t.Fatalf("server added non-canonical error_code: %#v", rpc.Result.StructuredContent)
+	}
+	errors, ok := rpc.Result.StructuredContent["errors"].([]any)
+	if !ok || len(errors) != 1 {
+		t.Fatalf("structured errors = %#v, want one entry", rpc.Result.StructuredContent["errors"])
+	}
+	entry, ok := errors[0].(map[string]any)
+	if !ok || entry["code"] != "content_not_found" {
+		t.Fatalf("structured error = %#v, want content_not_found", errors[0])
+	}
+}
+
+// extractResultMeta parses an MCP tools/call HTTP response (JSON or SSE
+// framed) and returns result.structuredContent.meta.
+func extractResultMeta(t *testing.T, body string) map[string]any {
+	t.Helper()
+	// SSE framing prefixes JSON with "data: "; strip to the first '{'.
+	payload := body
+	if i := strings.Index(payload, "{"); i > 0 {
+		payload = payload[i:]
+	}
+	var rpc struct {
+		Result struct {
+			StructuredContent map[string]any `json:"structuredContent"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(payload), &rpc); err != nil {
+		t.Fatalf("unmarshal tools/call response: %v\nbody=%q", err, body)
+	}
+	meta, ok := rpc.Result.StructuredContent["meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("result.structuredContent.meta missing; body=%q", body)
+	}
+	return meta
+}

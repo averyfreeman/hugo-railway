@@ -1,0 +1,14 @@
+clients:
+  - id: claude-admin
+    secret: REPLACE_WITH_A_LONG_RANDOM_SECRET
+    scopes: ["read", "write", "admin"]
+    redirect_uris:
+      - https://claude.ai/*
+    enabled: true
+
+  - id: chatgpt-write
+    secret: REPLACE_WITH_A_LONG_RANDOM_SECRET
+    scopes: ["read", "write"]
+    redirect_uris:
+      - https://chatgpt.com/connector/oauth/*
+    enabled: true

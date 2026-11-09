@@ -1,0 +1,105 @@
+{{ define "main" }}
+  {{ $caseStudies := sort (where .Site.RegularPages "Section" "case-studies") "Params.order" "asc" }}
+  {{ $repositories := hugo.Data.portfolio.repositories.repositories }}
+  {{ $focuses := slice }}
+  {{ range $caseStudies }}
+    {{ if not (in $focuses .Params.focus) }}{{ $focuses = $focuses | append .Params.focus }}{{ end }}
+  {{ end }}
+  {{ $focuses = sort $focuses }}
+
+  <section class="archive page-shell portfolio-page">
+    <header class="archive__header">
+      <p class="eyebrow">PORTFOLIO / SELECTED WORK + OPEN SOURCE</p>
+      <h1>{{ .Title }}</h1>
+      <p class="lede">{{ .Description }}</p>
+    </header>
+
+    <section class="portfolio-pathways" aria-labelledby="case-studies-title">
+      <div class="section-heading-row">
+        <h2 id="case-studies-title">Start with the<br><em>project story.</em></h2>
+        <p>Five curated case studies explain the problem, the work, key decisions, and the evidence behind each project.</p>
+      </div>
+      <div class="case-study-grid">
+        {{ range $caseStudies }}
+          <a class="case-study-card card signal-surface" href="{{ .RelPermalink }}">
+            <span class="case-study-card__order badge badge-outline">{{ printf "%02d" .Params.order }} / {{ .Params.focus }}</span>
+            <h3>{{ .Title }}</h3>
+            <p>{{ .Params.summary }}</p>
+            <span class="case-study-card__link">Read case study <span aria-hidden="true">↗</span></span>
+          </a>
+        {{ end }}
+      </div>
+    </section>
+
+    <section class="repository-collection" id="repository-collection" aria-labelledby="repository-collection-title">
+      <header class="section-heading-row repository-collection__header">
+        <div><p class="eyebrow">PUBLIC REPOSITORY SNAPSHOT · {{ len $repositories }} RECORDS</p><h2 id="repository-collection-title">The full collection.</h2></div>
+        <p>Public GitHub metadata rendered at build time. The source code and live demos stay one click away.</p>
+      </header>
+
+      <div class="repository-filters card" data-repository-filters>
+        <label class="filter-control filter-control--search">Search repositories
+          <input class="input input-bordered" type="search" name="q" autocomplete="off" placeholder="Name, language, topic…" data-filter-query>
+        </label>
+        <label class="filter-control">Language
+          <select class="select select-bordered" name="language" data-filter-language>
+            <option value="">All languages</option>
+            {{ $languages := slice }}
+            {{ range $repositories }}{{ if and .language (not (in $languages .language)) }}{{ $languages = $languages | append .language }}{{ end }}{{ end }}
+            {{ range sort $languages }}<option value="{{ . }}">{{ . }}</option>{{ end }}
+          </select>
+        </label>
+        <label class="filter-control">Case-study focus
+          <select class="select select-bordered" name="focus" data-filter-focus>
+            <option value="">All focus areas</option>
+            {{ range $focuses }}<option value="{{ . }}">{{ . }}</option>{{ end }}
+          </select>
+        </label>
+        <button class="btn btn-outline filter-clear" type="button" data-filter-clear>Clear filters</button>
+      </div>
+      <p class="filter-status" data-filter-status aria-live="polite" aria-atomic="true">Showing all {{ len $repositories }} repositories.</p>
+      <noscript><p class="filter-noscript">Filters need JavaScript; the complete repository collection is listed below.</p></noscript>
+
+      <div class="repository-grid" data-repository-grid>
+        {{ range sort $repositories "pinned_order" "asc" }}
+          {{ $repository := . }}
+          {{ $linkedCases := where $caseStudies "Params.repository" (lower .name) }}
+          {{ $repoFocuses := slice }}
+          {{ $searchTerms := slice .name .full_name .description .language }}
+          {{ range $linkedCases }}
+            {{ $repoFocuses = $repoFocuses | append .Params.focus }}
+            {{ $searchTerms = $searchTerms | append .Title | append .Params.focus }}
+            {{ range .Params.tags }}{{ $searchTerms = $searchTerms | append . }}{{ end }}
+          {{ end }}
+          {{ $searchText := delimit $searchTerms " " }}
+          {{ $previewExists := and .preview (fileExists (printf "static%s" .preview)) }}
+          <article class="repository-card card signal-surface" data-repository-card data-name="{{ .name }}" data-language="{{ .language }}" data-focus="{{ delimit $repoFocuses "|" }}" data-search="{{ $searchText }}">
+            <a class="repository-card__media" href="{{ .html_url }}" target="_blank" rel="noopener noreferrer" aria-label="Open {{ .full_name }} on GitHub">
+              {{ if $previewExists }}
+                <img src="{{ .preview | relURL }}" alt="{{ .name }} repository preview" loading="lazy" decoding="async">
+              {{ else }}
+                <span class="repository-preview-fallback" aria-hidden="true"><span>PREVIEW</span><b>{{ .name }}</b><small>Source available on GitHub</small></span>
+              {{ end }}
+            </a>
+            <div class="repository-card__body">
+              <div class="repository-card__top">
+                <span class="badge badge-outline">{{ .language | default "Repository" }}</span>
+                {{ if .pinned }}<span class="repository-pinned badge badge-outline">Pinned {{ printf "%02.0f" (add .pinned_order 1) }}</span>{{ end }}
+              </div>
+              <h3><a href="{{ .html_url }}" target="_blank" rel="noopener noreferrer">{{ .name }}</a></h3>
+              <p>{{ .description | default "Public source repository." }}</p>
+              {{ with index $linkedCases 0 }}<a class="repository-case-link" href="{{ .RelPermalink }}">{{ .Title }} case study <span aria-hidden="true">↗</span></a>{{ end }}
+              <div class="repository-card__links">
+                <a href="{{ $repository.html_url }}" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a>
+                {{ with $repository.homepage }}<a href="{{ . }}" target="_blank" rel="noopener noreferrer">Live site <span aria-hidden="true">↗</span></a>{{ end }}
+              </div>
+            </div>
+          </article>
+        {{ end }}
+      </div>
+      <div class="empty-state card signal-surface" data-filter-empty hidden>
+        <span class="status-dot"></span><p>No repositories match these filters.</p>
+      </div>
+    </section>
+  </section>
+{{ end }}

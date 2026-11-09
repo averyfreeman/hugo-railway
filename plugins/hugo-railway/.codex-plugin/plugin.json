@@ -1,0 +1,35 @@
+{
+  "name": "hugo-railway",
+  "version": "0.1.0+codex.20260924110424",
+  "description": "Local Hugo publishing tools for the Signal CV monorepo.",
+  "author": {
+    "name": "Signal CV contributors"
+  },
+  "license": "MIT",
+  "keywords": [
+    "hugo",
+    "static-site",
+    "content",
+    "markdown",
+    "notebooks",
+    "mcp"
+  ],
+  "interface": {
+    "displayName": "Signal CV Hugo",
+    "shortDescription": "Edit and validate this Hugo site locally.",
+    "longDescription": "Launches the embedded Hugo MCP server against the Signal CV monorepo so Codex can inspect, draft, validate, and publish static content with the site's safety checks.",
+    "developerName": "Signal CV contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write",
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "List the latest Signal CV articles.",
+      "Draft a new Hugo article in the right content bundle.",
+      "Build the site and report any content or link issues."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

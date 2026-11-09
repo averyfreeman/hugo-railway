@@ -1,0 +1,28 @@
+# binaries
+/mcp-hugo-server-go
+*.exe
+
+# goreleaser local build/snapshot output
+/dist/
+
+# npm wrapper (#782 Phase 4): postinstall downloads the real binary here at
+# install time — never committed. The JS shim (npm/bin/mcp-hugo-server-go.js)
+# is a separate tracked file and is unaffected by this pattern.
+/npm/bin/mcp-hugo-server-go
+/npm/bin/mcp-hugo-server-go.exe
+/npm/node_modules/
+
+# test cache
+/tmp/
+codex-mcp-live-audit*
+*.mcp-smoke.log
+scripts/.env.local
+scripts/.env.mcp-smoke.local
+
+# secrets
+*.env
+config.local.yaml
+oauth-clients.yaml
+
+# superpowers sdd workspace
+.superpowers/

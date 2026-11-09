@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-10-08T22:49:37.44261Z",
+  "decision_count": 5,
+  "decisions": [
+    {
+      "number": 1,
+      "title": "Keep the site, theme, and MCP server in one fresh-history monorepo",
+      "filename": "0001-monorepo-boundaries.md",
+      "path": "docs/adr/0001-monorepo-boundaries.md",
+      "body": "# Keep the site, theme, and MCP server in one fresh-history monorepo\n\nAccepted: the root repository owns the demo site, `themes/railway-cv/` owns reusable presentation, and `mcp-hugo-server-go/` remains a sibling publishing service. The existing nested Git metadata will be removed so the working tree can evolve together without upstream synchronization; licenses and upstream attribution stay in their source directories.\n\n## Consequences\n\nThe root build and validation commands become the integration boundary. Upstream changes to the imported theme or MCP server are no longer pulled automatically, so future upgrades must be deliberate copies or merges.\n"
+    },
+    {
+      "number": 2,
+      "title": "Render notebooks statically first",
+      "filename": "0002-static-first-notebook-rendering.md",
+      "path": "docs/adr/0002-static-first-notebook-rendering.md",
+      "body": "# Render notebooks statically first\n\nAccepted: notebook bundles are authored as Hugo content and rendered during the build, following the working HugoBlox pattern already present in the starter. A future live-kernel adapter can be added behind the same content boundary without making local site builds depend on a running notebook service.\n\n## Consequences\n\nMarkdown, LaTeX, and notebook artifacts remain reviewable and deployable as static files. Live execution is intentionally a later adapter rather than a prerequisite for the starter site.\n"
+    },
+    {
+      "number": 3,
+      "title": "Use progressive signal motion for the theme",
+      "filename": "0003-progressive-signal-motion.md",
+      "path": "docs/adr/0003-progressive-signal-motion.md",
+      "body": "# Use progressive signal motion for the theme\n\nAccepted: the theme uses a custom CSS token layer and small JavaScript enhancements for terminal lines, reveal states, and counters. DaisyUI is not a runtime dependency in the first slice; the component vocabulary stays framework-light so Hugo templates remain portable and the Railway-inspired visual language stays distinctive.\n\n## Consequences\n\nThe design can be tuned with a small set of tokens and works without a JavaScript framework. Any future DaisyUI adoption should consume the existing tokens rather than replace the theme's layout primitives.\n"
+    },
+    {
+      "number": 4,
+      "title": "Protect the demo while staging the VitePress migration",
+      "filename": "0004-protected-demo-staged-vitepress-migration.md",
+      "path": "docs/adr/0004-protected-demo-staged-vitepress-migration.md",
+      "body": "# Protect the demo while staging the VitePress migration\n\nAccepted: the existing Railway-inspired demo is a reviewable artifact, not an empty placeholder. VitePress material is imported beside it under temporary `_2` sections and a namespaced static/data area. The migration tool refuses protected demo paths, never writes to the VitePress source repository, and refreshes only its own staged outputs. Reconciliation, canonical route selection, and homepage changes are deferred until the demo and migration can be reviewed together.\n\nSuperseded by [ADR 0005](0005-hiring-first-hugo-portfolio.md). The review period is complete: the root site now publishes Avery's portfolio, while the fictional research demo is preserved in `themes/railway-cv/examples/`. The temporary `_2` routes have been removed.\n\n## Consequences\n\nThe repository temporarily contains parallel demo and migration routes. This costs a small amount of duplicated navigation and styling, but it makes the migration reversible and keeps the existing examples, homepage, and Railway-inspired landing work intact. Source/process documents remain references rather than published pages, while the migration manifest records counts and excluded material for later reconciliation.\n"
+    },
+    {
+      "number": 5,
+      "title": "Make the Hugo root a hiring-first portfolio demo",
+      "filename": "0005-hiring-first-hugo-portfolio.md",
+      "path": "docs/adr/0005-hiring-first-hugo-portfolio.md",
+      "body": "# Make the Hugo root a hiring-first portfolio demo\n\nAccepted: the Hugo root publishes Avery Freeman's developer portfolio and demonstrates the reusable Railway-CV theme. The homepage answers a hiring reader's first questions with a role, value statement, Portfolio action, and LinkedIn link; the page then leads into three case studies, recent published writing, and recently updated public repositories. Keep the Signal CV visual identity and progressive motion. Preserve the fictional research demo under `themes/railway-cv/examples/`.\n\nPublish case studies as Hugo bundles at `/case-studies/\u003cslug\u003e/` with `repository`, `focus`, `order`, `summary`, and `tags` front matter. `/portfolio/` presents the five curated pathways before the complete public repository collection. Build that collection from the checked-in public-only projection in `data/portfolio/repositories.json`, pin in configured order, and keep search, language, and focus filters in shareable `q`, `language`, and `focus` URL parameters. No visitor-side GitHub requests are part of the contract.\n\nPromote 70 recovered historical posts and one later-authored post explicitly marked `type: post` and `status: publish` to the canonical `/posts/` archive. Keep original year/month/slug routes and `/wp-content/uploads/` media paths. Publish Avery's About and Skills pages. Reserve `/policy/` as a minimal stub and exclude the three policy notes until an explicit content decision. Keep the source VitePress repository read-only.\n\n## Consequences\n\nThe root site becomes a realistic owner-specific theme demonstration rather than a fictional research sample. The theme examples retain that sample for reuse. Case studies separate durable project narratives from freshness-oriented repository metadata; the checked-in snapshot can age until deliberately refreshed. The blog remains available through Hugo's static output and Pagefind. Public claims and contact links stay grounded in the reviewed profile source, and proposed usability checks are not treated as measured conversion results.\n"
+    }
+  ]
+}

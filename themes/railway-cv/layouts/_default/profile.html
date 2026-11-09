@@ -1,0 +1,10 @@
+{{ define "main" }}
+  <article class="content-page page-shell profile-page">
+    <header class="content-page__header">
+      <p class="eyebrow">{{ .Title | upper }} / AVERY FREEMAN</p>
+      <h1>{{ .Title }}</h1>
+      {{ with .Description }}<p class="lede">{{ . }}</p>{{ end }}
+    </header>
+    <div class="content-page__body prose">{{ .Content }}</div>
+  </article>
+{{ end }}

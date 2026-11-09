@@ -1,0 +1,21 @@
+{
+  "name": "hugo-railway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Avery Freeman's Hugo developer portfolio and reusable Signal CV theme.",
+  "scripts": {
+    "css:build": "pnpm --dir themes/railway-cv run css:build",
+    "dev": "pnpm run css:build && hugo server --disableFastRender",
+    "build": "pnpm run css:build && hugo --cleanDestinationDir --minify",
+    "build:search": "pnpm run build && pagefind --site public",
+    "test": "node --test tests/*.test.mjs",
+    "check:portfolio": "node scripts/check-portfolio-build.mjs",
+    "preview": "pnpm run css:build && hugo server --disableFastRender --buildDrafts",
+    "content:sync": "node scripts/sync-vitepress-content.mjs"
+  },
+  "devDependencies": {
+    "pagefind": "^1.5.2",
+    "yaml": "^2.8.1"
+  },
+  "packageManager": "pnpm@12.6.0"
+}

@@ -1,0 +1,102 @@
+identity:
+  mark: "S/"
+  name: "Mara Voss"
+  role: "Systems researcher / interface builder"
+  descriptor: "research systems"
+  eyebrow: "RESEARCH SYSTEMS · FIELD NOTES · 2026"
+  summary: "I design calm surfaces for complex systems — the kind that make evidence legible, motion intentional, and the next decision easier to find."
+  location: "Portland · remote"
+  availability: "Open to selected collaborations"
+  email: "hello@example.com"
+  links:
+    - label: "GitHub"
+      url: "https://github.com/"
+    - label: "Scholar"
+      url: "https://scholar.google.com/"
+    - label: "Notes"
+      url: "/articles/"
+hero:
+  heading: 'Research systems<br><em>made legible.</em>'
+  command: "signal --observe --ship"
+  prompt: "mara@fieldwork:~$"
+  terminal_lines:
+    - "indexing 04 research surfaces"
+    - "mapping evidence → action"
+    - "status: quietly shipping"
+  primary_label: "Read the field notes"
+  primary_url: "/articles/"
+  secondary_label: "Open the notebook"
+  secondary_url: "/notebooks/field-signals/"
+  secondary_external: false
+navigation:
+  - label: Projects
+    url: /projects/
+  - label: Articles
+    url: /articles/
+  - label: Notebooks
+    url: /notebooks/
+  - label: Publications
+    url: /publications/
+  - label: Scholar
+    url: https://scholar.google.com/
+    external: true
+    cta: true
+interests:
+  - RESEARCH SYSTEMS
+  - EVIDENCE & INTERFACES
+  - NOTEBOOKS & METHODS
+  - FIELD NOTES
+stats:
+  - value: "12"
+    suffix: "+"
+    label: "systems shipped"
+  - value: "08"
+    suffix: ""
+    label: "years in the field"
+  - value: "03"
+    suffix: "×"
+    label: "faster decisions"
+principles:
+  - index: "01"
+    label: "Make the edge visible"
+    body: "Clear borders, timestamps, and state changes beat ornamental noise."
+  - index: "02"
+    label: "Keep motion honest"
+    body: "Every animated detail should explain a transition or invite a next step."
+  - index: "03"
+    label: "Leave a trail"
+    body: "Articles, notebooks, and source files make the work inspectable after the demo ends."
+featured:
+  - index: "A / 01"
+    title: "Observatory"
+    type: "Research prototype"
+    body: "A control surface for turning distributed traces into a calm operational narrative."
+    href: "/projects/observatory/"
+    accent: "mint"
+  - index: "A / 02"
+    title: "Legible infrastructure"
+    type: "Working paper"
+    body: "A field study on interfaces that make complex systems easier to reason about."
+    href: "/publications/legible-infrastructure/"
+    accent: "violet"
+  - index: "A / 03"
+    title: "Field signals"
+    type: "Python notebook"
+    body: "A reproducible notebook bundle that keeps the evidence next to its explanation."
+    href: "/notebooks/field-signals/"
+    accent: "amber"
+writing:
+  label: "Recent writing"
+  archive_label: "All articles"
+  archive_url: "/articles/"
+  intro: "Notes from the space between infrastructure, research, and the interfaces that connect them."
+cta:
+  kicker: "Have a system that wants to be understood?"
+  title: "Let's make the signal clear."
+  body: "I work with teams who want the impressive part of their technology to be the part people can actually use."
+  label: "Start a conversation"
+  href: "mailto:hello@example.com"
+footer:
+  tagline: "Research systems, field notes, and illustrative work."
+  rss_url: "/articles/index.xml"
+  note: "Fictional theme example"

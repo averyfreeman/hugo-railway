@@ -1,0 +1,2897 @@
+package write
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/assets"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/buildinfo"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/buildstatus"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/caller"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/changeset"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/cloudflare"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/config"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/contentmodel"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/db"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/fileutil"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/hugosite"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/oauth"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/security"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/site"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/toolcontract"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/tools"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/time/rate"
+	"gopkg.in/yaml.v3"
+)
+
+type createPageInput struct {
+	Slug                    string   `json:"slug"`
+	Lang                    string   `json:"lang,omitempty"`
+	Title                   string   `json:"title"`
+	Body                    string   `json:"body"`
+	Tags                    []string `json:"tags"`
+	Categories              []string `json:"categories"`
+	NormalizeTaxonomyCasing bool     `json:"normalize_taxonomy_casing,omitempty"`
+	IdempotencyKey          string   `json:"idempotency_key,omitempty"`
+	// ChangeSetID (#1135) attributes this mutation to a caller-owned
+	// change-set obtained from create_change_set, rather than the implicit
+	// per-principal default used when omitted. See create_change_set's
+	// description for when this matters.
+	ChangeSetID string `json:"change_set_id,omitempty"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+	// TestContent (#661) is a deliberate, explicit opt-in — never inferred
+	// from slug/title — marking this page as disposable test/audit content.
+	// When set, the page is always created with draft:true regardless of
+	// any other setting, and frontmatter records test_content:true,
+	// test_content_owner (if given), and test_content_expires_at (now +
+	// TTLHours, default 24h). #608's post-build stale-content check honors
+	// test_content_expires_at unconditionally, independent of the
+	// server-wide stale_test_content_threshold_hours setting — the caller
+	// explicitly asked for TTL tracking on this specific page, so it must
+	// work even when the server-wide sweep is disabled.
+	TestContent *testContentInput `json:"test_content,omitempty"`
+}
+
+// testContentInput is create_page's opt-in test-content marker (#661).
+// TTLHours is a pointer so omitted and explicit 0 stay distinguishable:
+// omission keeps the default, while explicit 0 is now rejected (#833).
+type testContentInput struct {
+	TTLHours *int   `json:"ttl_hours,omitempty"`
+	Owner    string `json:"owner,omitempty"`
+}
+
+const testContentDefaultTTLHours = 24
+const testContentMaxTTLHours = 24 * 7
+
+type createPageOutput struct {
+	toolcontract.ToolResponse[createPageData]
+	// RequestContext echoes the caller's normalized slug/lang on failure
+	// (#455) — always populated by toolcontract.WrapTool when the handler
+	// wraps its error via toolcontract.WithRequestContext. This is an
+	// error-path-only field, not a success-payload duplicate, so it survives
+	// the root/data convergence below (#520).
+	RequestContext *toolcontract.RequestContext `json:"request_context,omitempty"`
+	// RateLimitRemaining is intentionally still mirrored at the root on both
+	// success and error (#466, #510, #522) — a documented, deliberately kept
+	// exception to the root/data duplication removed here (#520), not an
+	// oversight: it lets an agent self-regulate pacing from the root alone
+	// without inspecting data on every call.
+	RateLimitRemaining int `json:"rate_limit_remaining"`
+}
+
+type createPageData struct {
+	Status             string               `json:"status,omitempty"`
+	Slug               string               `json:"slug,omitempty"`
+	SourceKey          string               `json:"source_key,omitempty"`
+	Path               string               `json:"path,omitempty"`
+	ResolvedLang       *string              `json:"resolved_lang,omitempty"`
+	ResolvedSourcePath *string              `json:"resolved_source_path,omitempty"`
+	DryRun             bool                 `json:"dry_run,omitempty"`
+	Content            string               `json:"content,omitempty"`
+	Warning            string               `json:"warning,omitempty"`
+	NewRevision        string               `json:"new_revision,omitempty"`
+	RevisionKind       string               `json:"revision_kind,omitempty"`
+	State              *site.LifecycleState `json:"state,omitempty"`
+	RateLimit          *rateLimitBucket     `json:"rate_limit,omitempty"`
+	// TaxonomyCasingNormalized/TaxonomyCasingAmbiguous — see the comment on
+	// updatePageData's fields of the same name (#589); create_page shares
+	// the identical normalize_taxonomy_casing contract.
+	TaxonomyCasingNormalized []taxonomyCasingChangeDTO  `json:"taxonomy_casing_normalized,omitempty"`
+	TaxonomyCasingAmbiguous  []taxonomyCasingSkippedDTO `json:"taxonomy_casing_ambiguous,omitempty"`
+	// TestContentExpiresAt echoes the effective test_content expiry (#661)
+	// back to the caller when the request opted in via `test_content` —
+	// confirms the TTL actually applied (in case ttl_hours was omitted and
+	// the default was used) without requiring a follow-up read.
+	TestContentExpiresAt string `json:"test_content_expires_at,omitempty"`
+	// RateLimitRemaining is deliberately never set on a success response
+	// (#520, #605) — see the comment on newCreatePageOutput. omitempty (not
+	// present in prior success responses' JSON either, since it was always
+	// explicitly set) keeps the field itself in the schema so the error path
+	// below, which populates it via toolcontract.WithDataFields as a
+	// documented root+data duplication (#466/#510/#522), remains valid
+	// against the same shared OutputSchema.
+	RateLimitRemaining int `json:"rate_limit_remaining,omitempty"`
+}
+
+type updatePageInput struct {
+	Slug  string `json:"slug"`
+	Lang  string `json:"lang,omitempty"`
+	Title string `json:"title,omitempty"`
+	// Body is a pointer so the handler can distinguish omission from an
+	// explicitly supplied empty string when enforcing mutual exclusion with
+	// OldStr/NewStr. The longstanding empty-body behavior remains a no-op.
+	Body *string `json:"body,omitempty"`
+	// OldStr/NewStr provide a surgical body-only replacement (#1255). Both
+	// fields must be supplied together, OldStr must occur exactly once in the
+	// current Markdown body, and Body must be omitted. Pointers distinguish an
+	// omitted new_str from an explicitly empty replacement (deletion).
+	OldStr *string `json:"old_str,omitempty"`
+	NewStr *string `json:"new_str,omitempty"`
+	// ConfirmSectionIndex is required when targeting an existing Hugo section
+	// index, including the homepage. Structural pages have a larger blast
+	// radius than ordinary leaf content (#1254).
+	ConfirmSectionIndex bool     `json:"confirm_section_index,omitempty"`
+	Tags                []string `json:"tags,omitempty"`
+	Categories          []string `json:"categories,omitempty"`
+	Draft               *bool    `json:"draft,omitempty"`
+	Description         *string  `json:"description,omitempty"`
+	// FeaturedImage (#809) sets the theme's `featuredImage` frontmatter key
+	// verbatim — e.g. the path generate_hero_image's `data.path` response
+	// resolves to (typically "/images/{slug}-featured.jpg"). Without it, a
+	// generated hero image is never picked up by the theme's list-card
+	// template even though the file itself exists under static/images.
+	FeaturedImage           *string `json:"featured_image,omitempty"`
+	NormalizeTaxonomyCasing bool    `json:"normalize_taxonomy_casing,omitempty"`
+	ExpectedRevision        string  `json:"expected_revision,omitempty"`
+	// ExpectedBundleRevision (#857 AC3) is an OPTIONAL, additive whole-bundle
+	// guard on top of the per-file ExpectedRevision. When supplied on a page
+	// bundle (content/<slug>/), the write is rejected with bundle_conflict if
+	// ANY sibling translation or bundle-local asset changed since the caller
+	// last read the bundle (the contentmodel.BundleRevision anchor). When
+	// omitted, behavior is 100% unchanged — every existing caller sees zero
+	// difference.
+	ExpectedBundleRevision string `json:"expected_bundle_revision,omitempty"`
+	IdempotencyKey         string `json:"idempotency_key,omitempty"`
+	// ChangeSetID (#1135) — see createPageInput's field of the same name.
+	ChangeSetID string `json:"change_set_id,omitempty"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+}
+
+type updatePageOutput struct {
+	toolcontract.ToolResponse[updatePageData]
+	// RequestContext — see the comment on createPageOutput.RequestContext.
+	RequestContext *toolcontract.RequestContext `json:"request_context,omitempty"`
+	// RateLimitRemaining — see the comment on createPageOutput.RateLimitRemaining (#466, #520).
+	RateLimitRemaining int `json:"rate_limit_remaining"`
+}
+
+type updatePageData struct {
+	Status             string  `json:"status,omitempty"`
+	Slug               string  `json:"slug,omitempty"`
+	SourceKey          string  `json:"source_key,omitempty"`
+	ResolvedLang       *string `json:"resolved_lang,omitempty"`
+	ResolvedSourcePath *string `json:"resolved_source_path,omitempty"`
+	DryRun             bool    `json:"dry_run,omitempty"`
+	Diff               string  `json:"diff,omitempty"`
+	// Changed (#860) makes a no-op update explicit: false when the resulting
+	// content is byte-identical to what was already on disk (nothing to
+	// write), true when the call actually changed the page. A pointer so the
+	// value is always present on an update_page success response (including
+	// the false case) rather than being elided by omitempty — an agent must
+	// be able to tell "succeeded, no change" apart from "succeeded, changed"
+	// without diffing revisions itself.
+	Changed      *bool                `json:"changed,omitempty"`
+	Warning      string               `json:"warning,omitempty"`
+	NewRevision  string               `json:"new_revision,omitempty"`
+	RevisionKind string               `json:"revision_kind,omitempty"`
+	State        *site.LifecycleState `json:"state,omitempty"`
+	RateLimit    *rateLimitBucket     `json:"rate_limit,omitempty"`
+	// BundleRevision (#1192) mirrors get_page_for_edit's field of the same
+	// name (#857): the optimistic-concurrency token for the WHOLE bundle
+	// directory this page belongs to, freshly recomputed after this write
+	// (or, on dry_run, reflecting the current on-disk state this call
+	// previewed against). Lets a caller chain a second update_page call on
+	// a sibling translation (via expected_bundle_revision) without a
+	// separate get_page_for_edit round-trip just to read a fresh token.
+	// Omitted (not empty-string) when this page isn't part of a bundle
+	// directory (leaf `<slug>.md`), same as get_page_for_edit.
+	BundleRevision string `json:"bundle_revision,omitempty"`
+	// TaxonomyCasingNormalized lists tags/categories rewritten to match a
+	// casing already present elsewhere in the index (#589), populated only
+	// when the caller opted in via normalize_taxonomy_casing. Present only
+	// on non-dry-run success; dry_run previews the diff but does not
+	// resolve casing, so this stays empty on a dry-run response.
+	TaxonomyCasingNormalized []taxonomyCasingChangeDTO `json:"taxonomy_casing_normalized,omitempty"`
+	// TaxonomyCasingAmbiguous lists tags/categories left exactly as typed
+	// because the index already has more than one distinct casing for that
+	// term (pre-existing drift, the #577 casing_variant scenario) —
+	// normalize_taxonomy_casing never guesses which of several existing
+	// spellings is correct.
+	TaxonomyCasingAmbiguous []taxonomyCasingSkippedDTO `json:"taxonomy_casing_ambiguous,omitempty"`
+	// TagsDelta/CategoriesDelta give update_page's whole-list-replacement
+	// tags/categories the same "which parts of my request would actually
+	// apply" visibility plan_content_change's operations_applied/rejected
+	// gives its add_tag/remove_tag vocabulary (#645) — narrowly scoped to
+	// tags/categories specifically, since update_page already computes a
+	// delta-like signal for them (normalize_taxonomy_casing's rewrite
+	// detection), unlike title/body/draft/description, which stay a single
+	// whole-value diff. Populated whenever the caller explicitly includes
+	// `tags`/`categories` in the request (even an empty list, meaning
+	// "clear them all") — omitted when the key is left out entirely,
+	// matching applyPageUpdates's own nil-means-unchanged contract. A pure,
+	// cheap list comparison against the existing page's current tags/
+	// categories (post taxonomy-casing-normalization, if requested) — no
+	// index lookups beyond what normalize_taxonomy_casing already does — so
+	// unlike TaxonomyCasingNormalized/TaxonomyCasingAmbiguous this is always
+	// populated on both dry_run and a real write, not withheld on either.
+	TagsDelta       *taxonomyDeltaDTO `json:"tags_delta,omitempty"`
+	CategoriesDelta *taxonomyDeltaDTO `json:"categories_delta,omitempty"`
+	// RateLimitRemaining — see the comment on createPageData's field of the
+	// same name (#520, #605).
+	RateLimitRemaining int `json:"rate_limit_remaining,omitempty"`
+	// CurrentRevision / CurrentBundleRevision (#893) are error-only fields
+	// declared here so the additive WithDataFields injection on a
+	// revision_conflict / bundle_conflict survives the typed error-output
+	// round-trip (errorOutput unmarshals the failure payload back into this
+	// struct; an undeclared data field would be dropped, exactly as
+	// rate_limit_remaining is declared for the same reason). On a
+	// revision_conflict the fresh per-file revision is echoed here; on a
+	// bundle_conflict the fresh whole-bundle revision — so a caller can retry
+	// immediately without an extra read round-trip. Never set on success.
+	CurrentRevision       string `json:"current_revision,omitempty"`
+	CurrentBundleRevision string `json:"current_bundle_revision,omitempty"`
+}
+
+// taxonomyDeltaDTO reports which tags/categories a whole-list-replacement
+// update_page call actually adds, removes, or leaves unchanged relative to
+// the page's current value (#645) — each list omitted when empty, so an
+// unchanged field's delta reads as an empty object rather than three empty
+// arrays.
+type taxonomyDeltaDTO struct {
+	Added     []string `json:"added,omitempty"`
+	Removed   []string `json:"removed,omitempty"`
+	Unchanged []string `json:"unchanged,omitempty"`
+}
+
+// computeTaxonomyDelta compares old (the page's current value) against
+// next (the value that will actually be written, post any taxonomy-casing
+// normalization) and reports the per-term outcome. Order-independent,
+// duplicate-safe (a term appearing twice in either list is reported once).
+func computeTaxonomyDelta(old, next []string) taxonomyDeltaDTO {
+	oldSet := make(map[string]bool, len(old))
+	for _, v := range old {
+		oldSet[v] = true
+	}
+	nextSet := make(map[string]bool, len(next))
+	for _, v := range next {
+		nextSet[v] = true
+	}
+	var d taxonomyDeltaDTO
+	seen := make(map[string]bool, len(next))
+	for _, v := range next {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		if oldSet[v] {
+			d.Unchanged = append(d.Unchanged, v)
+		} else {
+			d.Added = append(d.Added, v)
+		}
+	}
+	seenOld := make(map[string]bool, len(old))
+	for _, v := range old {
+		if seenOld[v] || nextSet[v] {
+			continue
+		}
+		seenOld[v] = true
+		d.Removed = append(d.Removed, v)
+	}
+	return d
+}
+
+type deletePageInput struct {
+	Slug             string `json:"slug"`
+	Lang             string `json:"lang,omitempty"`
+	ExpectedRevision string `json:"expected_revision,omitempty"`
+	IdempotencyKey   string `json:"idempotency_key,omitempty"`
+	// ChangeSetID (#1135) — see createPageInput's field of the same name.
+	ChangeSetID  string `json:"change_set_id,omitempty"`
+	DryRun       bool   `json:"dry_run,omitempty"`
+	ResponseMode string `json:"response_mode,omitempty"`
+	// Owner is an optional caller-supplied label for disposable test content,
+	// mirroring create_page's test_content.owner frontmatter field (#661).
+	// It is advisory metadata only: delete_page never infers identity or
+	// authorization from it, and it does not alter rate limits or privileges.
+	Owner string `json:"owner,omitempty"`
+	// ConfirmDeleteOfPublishedPage is checked only when the deployment has
+	// require_delete_confirmation:true configured (config.Config); ignored
+	// otherwise. See that config field's doc comment for the full rationale.
+	ConfirmDeleteOfPublishedPage bool `json:"confirm_delete_of_published_page,omitempty"`
+}
+
+type deletePageBacklinkDTO struct {
+	Slug  string `json:"slug"`
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+type deletePageGeneratedAssetDTO struct {
+	Name       string `json:"name"`
+	Path       string `json:"path"`
+	Kind       string `json:"kind"`
+	SizeBytes  int64  `json:"size_bytes"`
+	ModifiedAt string `json:"modified_at"`
+	Sha256     string `json:"sha256"`
+}
+
+type deletePageOutput struct {
+	toolcontract.ToolResponse[deletePageData]
+	// RequestContext echoes the caller's normalized slug on failure (#455)
+	// — see the comment on createPageOutput.RequestContext.
+	RequestContext *toolcontract.RequestContext `json:"request_context,omitempty"`
+	// RateLimitRemaining — see the comment on createPageOutput.RateLimitRemaining (#466, #520).
+	RateLimitRemaining int `json:"rate_limit_remaining"`
+}
+
+type deletePageData struct {
+	Status             string                         `json:"status,omitempty"`
+	Slug               string                         `json:"slug,omitempty"`
+	SourceKey          string                         `json:"source_key,omitempty"`
+	ResolvedLang       *string                        `json:"resolved_lang,omitempty"`
+	ResolvedSourcePath *string                        `json:"resolved_source_path,omitempty"`
+	DryRun             bool                           `json:"dry_run,omitempty"`
+	Content            string                         `json:"content,omitempty"`
+	Backlinks          *[]deletePageBacklinkDTO       `json:"backlinks,omitempty"`
+	GeneratedAssets    *[]deletePageGeneratedAssetDTO `json:"generated_assets,omitempty"`
+	RateLimit          *rateLimitBucket               `json:"rate_limit,omitempty"`
+	// BacklinksCount is only ever populated on a dry_run response (compact
+	// or not) — it's a pointer with omitempty so it stays entirely absent
+	// from a real (non-dry-run) delete's response, where no backlink scan
+	// ever ran and a bare 0 would misleadingly read as "verified zero
+	// backlinks" rather than "not computed" (#687).
+	BacklinksCount *int                 `json:"backlinks_count,omitempty"`
+	Warning        string               `json:"warning,omitempty"`
+	State          *site.LifecycleState `json:"state,omitempty"`
+	// BundleFullyRemoved (#682) is true when the entire page bundle
+	// directory (every language file, plus any shared assets) was removed —
+	// either because no lang was in play (no source file at all) or because
+	// the deleted language was the last one remaining. false means only the
+	// single resolved language's source file was removed and the bundle
+	// (other language(s), assets) still exists on disk. A pointer with
+	// omitempty so it can be explicitly absent on a dry_run response (where
+	// it was never computed) without ambiguity against a real delete's
+	// legitimate `false` — matching BacklinksCount's pattern above (#762).
+	BundleFullyRemoved *bool `json:"bundle_fully_removed,omitempty"`
+	// BundleWillBeFullyRemoved is the dry-run prediction counterpart to
+	// BundleFullyRemoved: it is emitted only on dry_run responses so callers
+	// do not have to infer predictive meaning from the real-execution field.
+	BundleWillBeFullyRemoved *bool `json:"bundle_will_be_fully_removed,omitempty"`
+	// RateLimitRemaining — see the comment on createPageData's field of the
+	// same name (#520, #605).
+	RateLimitRemaining int `json:"rate_limit_remaining,omitempty"`
+}
+
+// strPtr distinguishes "resolved to the empty string" (e.g. the default
+// language, which legitimately has no lang code) from "resolution never
+// happened" (#455) — a plain string can't carry that distinction since both
+// cases marshal to "", so ResolvedLang/ResolvedSourcePath use *string and are
+// only ever set via this helper once resolution actually succeeds.
+func strPtr(s string) *string { return &s }
+
+func writeSuccessEnvelope[T any](data T) toolcontract.ToolResponse[T] {
+	return toolcontract.Success(data, toolcontract.NewMeta(buildinfo.Version, time.Now().UTC()))
+}
+
+func writeSuccessEnvelopeWithWarning[T any](data T, warning string) toolcontract.ToolResponse[T] {
+	envelope := writeSuccessEnvelope(data)
+	if warning = strings.TrimSpace(warning); warning != "" {
+		envelope.Warnings = []string{warning}
+	}
+	return envelope
+}
+
+// newCreatePageOutput/newUpdatePageOutput/newDeletePageOutput take
+// rateLimitRemaining as an explicit parameter rather than reading it off
+// data (#520, #605): data itself never carries this field — it is
+// documented as root-only (docs/mcp-contract.md) — so there is nothing to
+// mirror from, and the two copies previously silently duplicated the value.
+func newCreatePageOutput(data createPageData, rateLimitRemaining int) createPageOutput {
+	return createPageOutput{
+		ToolResponse:       writeSuccessEnvelopeWithWarning(data, data.Warning),
+		RateLimitRemaining: rateLimitRemaining,
+	}
+}
+
+func newUpdatePageOutput(data updatePageData, rateLimitRemaining int) updatePageOutput {
+	return updatePageOutput{
+		ToolResponse:       writeSuccessEnvelopeWithWarning(data, data.Warning),
+		RateLimitRemaining: rateLimitRemaining,
+	}
+}
+
+func newDeletePageOutput(data deletePageData, rateLimitRemaining int) deletePageOutput {
+	return deletePageOutput{
+		ToolResponse:       writeSuccessEnvelopeWithWarning(data, data.Warning),
+		RateLimitRemaining: rateLimitRemaining,
+	}
+}
+
+// appendLastBuildWarning appends a lightweight advisory to warning (#467) if
+// the most recent build_site attempt in this process failed — so an agent
+// writing content notices a broken publish pipeline from this write call
+// itself, instead of only discovering it by calling build_site at the end of
+// its write cycle. Never blocks the write; purely advisory. Existing/empty
+// warning is preserved and the two messages are combined if both are set.
+func appendLastBuildWarning(warning string) string {
+	snap := buildstatus.Last()
+	if !snap.Attempted || snap.Status != "failed" {
+		return warning
+	}
+	advisory := fmt.Sprintf("the last build_site attempt failed (%s) — this write succeeded but may not go live until build_site is retried", snap.ErrorClass)
+	if warning == "" {
+		return advisory
+	}
+	return warning + "; " + advisory
+}
+
+// normalizeInputSlug accepts the two write-side slug forms this server
+// intentionally supports:
+//   - source-key form: posts/foo
+//   - canonical public form: /posts/foo/
+//
+// It deliberately does not strip a lone leading slash anymore. Before #691's
+// hostile-path corpus, an input like "/tmp/escape" was silently normalized to
+// "tmp/escape", turning an absolute-path-looking hostile input into a valid
+// writable slug. Leaving that leading slash intact makes the existing
+// slug/path validation reject it fail-closed instead of normalizing it into a
+// relative path under content_root.
+func normalizeInputSlug(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "/" {
+		return "/"
+	}
+	switch {
+	case strings.HasPrefix(s, "/") && strings.HasSuffix(s, "/"):
+		return strings.Trim(s, "/")
+	case strings.HasPrefix(s, "/"):
+		return s
+	default:
+		return strings.TrimRight(s, "/")
+	}
+}
+
+// canonicalPublicSlug converts a source-relative slug ("posts/x") to the
+// canonical public-route form ("/posts/x/") already used by read tools
+// (read.canonicalSourceSlug, #519). Write tools' success responses use this
+// for the public-facing Slug field while SourceKey keeps the raw
+// source-relative form (#554) — the same distinction read tools already
+// draw between source_key and slug.
+//
+// This is a draft-scope port: it does not yet special-case Hugo section
+// index pages (_index.md) the way read.canonicalSourceSlug does, since none
+// of the four write tools in scope here (create_page/update_page/
+// upload_page_asset/delete_page) can target a section index. If that
+// changes, share the logic with read.canonicalSourceSlug instead of
+// duplicating the section-index handling here.
+func canonicalPublicSlug(sourceSlug string) string {
+	slug := strings.Trim(sourceSlug, "/")
+	if slug == "" {
+		if strings.TrimSpace(sourceSlug) == "/" {
+			return "/"
+		}
+		return ""
+	}
+	return "/" + slug + "/"
+}
+
+func sourceKeyForInputSlug(sourceSlug string) string {
+	if strings.TrimSpace(sourceSlug) == "/" {
+		return ""
+	}
+	return strings.Trim(sourceSlug, "/")
+}
+
+// reservedSlugs are Hugo-reserved content names that must never appear as a
+// path segment of a create_page slug (#890). `404` builds the site's 404
+// page; `index`/`_index` are Hugo's special bundle/section index filenames.
+// Creating a (non-draft) page whose slug shadows one of these silently masks
+// the site's real 404 page or section index. #37's broader case/unicode
+// slug-collision scope stays deferred — this is only the concrete
+// reserved-name denylist.
+var reservedSlugs = map[string]bool{
+	"_index": true,
+	"index":  true,
+	"404":    true,
+}
+
+// reservedSlugConflict reports the first path segment of slug that collides
+// with a Hugo-reserved name, if any. Matching is per exact segment, not
+// substring: "posts/404-explained" is fine (its segment is
+// "404-explained", not "404"), while "posts/404" or "404" is rejected. slug
+// is expected already normalized (normalizeInputSlug strips surrounding
+// slashes) so empty segments from a stray "//" are skipped defensively.
+func reservedSlugConflict(slug string) (string, bool) {
+	for _, seg := range strings.Split(slug, "/") {
+		if seg == "" {
+			continue
+		}
+		if reservedSlugs[seg] {
+			return seg, true
+		}
+	}
+	return "", false
+}
+
+var validLangPattern = regexp.MustCompile(`^[A-Za-z0-9-]{2,5}$`)
+
+// mutationCallerKey builds the stable per-principal rate-limit key shared by
+// every mutation quota bucket. OAuth-backed requests prefer the authenticated
+// principal identity carried in context (client_id / agent registration id),
+// then fall back to the bearer-token hash, and finally to caller IP on
+// bearerless deployments or low-level tests.
+func mutationCallerKey(ctx context.Context) string {
+	if key := caller.Key(ctx); key != "" {
+		return key
+	}
+	return "unknown"
+}
+
+// isolationCallerKey scopes plan/rollback-snapshot ownership to the exact
+// bearer token (see caller.TokenKey), not the broader OAuth principal that
+// caller.Key() now prefers for rate-limit quotas (#950) — otherwise a token
+// refresh or a second session under the same principal could consume or
+// roll back another session's plan, reopening #932/#934.
+func isolationCallerKey(ctx context.Context) string {
+	if key := caller.TokenKey(ctx); key != "" {
+		return key
+	}
+	return "unknown"
+}
+
+// idempotencyCallerKey isolates the idempotency store by requesting bearer
+// token (#627): distinct tokens always belong to distinct OAuth clients (or
+// distinct sessions of the same client), so keying on the token hash already
+// carried in context (oauth.CtxTokenID) closes the cross-client leak where
+// any caller could look up or replay another caller's idempotency-key
+// result via the same tool+key. Falls back to the stable "local" principal
+// when OAuth is disabled (stdio/single-user mode). The durable SQLite journal
+// rejects an empty caller, and a stable local identity is what makes replay
+// survive a process restart in that deployment mode.
+func idempotencyCallerKey(ctx context.Context) string {
+	id, _ := ctx.Value(oauth.CtxTokenID).(string)
+	if id != "" {
+		return id
+	}
+	return "local"
+}
+
+// callerLimiter returns (or creates) a per-caller rate.Limiter allowing
+// perMinute calls/minute with a burst equal to perMinute, generalizing the
+// pattern originally hardcoded to delete_page's 5/min. perMinute <= 0
+// disables the limiter (Allow always returns true) rather than dividing by
+// zero, so a zero-valued/unset config field fails open instead of panicking
+// — callers that want a hard deny-by-default should set an explicit
+// positive value.
+func callerLimiter(mu *sync.Mutex, m map[string]*rate.Limiter, key string, perMinute int) *rate.Limiter {
+	mu.Lock()
+	defer mu.Unlock()
+	if l, ok := m[key]; ok {
+		return l
+	}
+	var l *rate.Limiter
+	if perMinute <= 0 {
+		l = rate.NewLimiter(rate.Inf, 0)
+	} else {
+		l = rate.NewLimiter(rate.Every(time.Minute/time.Duration(perMinute)), perMinute)
+	}
+	m[key] = l
+	return l
+}
+
+// rateLimitRemaining reports the caller's current available quota on l,
+// rounded down to a whole call (#466) — surfaced directly in tool responses
+// so an agent can self-regulate pacing instead of inferring a safe rate from
+// the tool description alone. l.Tokens() is a pure read (it doesn't mutate
+// limiter state), so this is safe to call after Allow() without disturbing
+// the budget it just consumed.
+func rateLimitRemaining(l *rate.Limiter) int {
+	if l == nil {
+		return 0
+	}
+	tokens := l.Tokens()
+	if tokens < 0 {
+		return 0
+	}
+	return int(tokens)
+}
+
+// rateLimitRetryAfterSeconds reports how long the caller must wait before
+// its next call to l would succeed, or 0 if a call would succeed now (#466).
+func rateLimitRetryAfterSeconds(l *rate.Limiter) float64 {
+	if l == nil {
+		return 0
+	}
+	tokens := l.Tokens()
+	if tokens >= 1 {
+		return 0
+	}
+	limit := float64(l.Limit())
+	if limit <= 0 {
+		return 0
+	}
+	wait := (1 - tokens) / limit
+	if wait < 0 {
+		return 0
+	}
+	return wait
+}
+
+// rateLimitExceededErr builds the rate_limit_exceeded error for tool,
+// embedding retry_after_seconds in the message (#466) so
+// toolcontract.ParseToolError can surface it in ErrorResolution without a
+// separate error-wrapping mechanism — the same message-embedding convention
+// already used for allowed-values parsing.
+func rateLimitExceededErr(tool string, perMinute int, l *rate.Limiter) error {
+	return fmt.Errorf("rate_limit_exceeded: %s is limited to %d per minute (retry_after_seconds=%.1f)", tool, perMinute, rateLimitRetryAfterSeconds(l))
+}
+
+func validateLangParam(lang string) (string, error) {
+	lang = strings.TrimSpace(lang)
+	if lang == "" {
+		return "", nil
+	}
+	if !validLangPattern.MatchString(lang) || strings.Contains(lang, "..") || strings.ContainsAny(lang, `/\`) {
+		return "", fmt.Errorf("invalid_params: lang must be a simple language code")
+	}
+	return lang, nil
+}
+
+// unknownLangWarning returns a non-empty warning when create_page is asked to
+// mint content in a well-shaped but unrecognized language, so a caller that
+// typoed a language code (e.g. "de" for "en", or "zz") gets an explicit signal
+// instead of a silent orphan: index.<lang>.md that Hugo never builds and that
+// no read tool distinguishes from real content (#891). Returns "" (no warning)
+// when the language is recognized or is the default (empty lang).
+//
+// This deliberately warns rather than rejects. Rejection would need the site's
+// *configured* language set to avoid false positives, but the server has no
+// such set at runtime: config.Config carries only DefaultLanguage and nothing
+// parses Hugo's own [languages] config. The only runtime signal is which
+// languages already have content — a strict subset of the configured set — so a
+// reject-if-unobserved rule would block the first page of every legitimately
+// new language (the core bilingual-site workflow), a deadlock proven by the
+// existing create-explicit-lang tests. The issue's suggested fix pre-authorized
+// this tiebreaker: "emit an explicit warning if outright rejection risks being
+// too strict for some legitimate future-language-prep workflow." Warn delivers
+// the signal the issue wants (its complaint was "zero signal" on a typo)
+// without the deadlock. Only create_page mints new files; update/delete/plan/
+// rollback resolve an existing file and already fail not_found for an unknown
+// lang, so they need no check here.
+//
+// The known set is derived from source content (defaultLang plus every lang
+// with an existing source page), so an existing translation never triggers a
+// false warning even when the public build index is stale or absent.
+// configuredLangs, when non-empty (#899), means the lang already survived
+// rejectUnconfiguredLang's authoritative check — the operator has
+// deliberately declared it, even if it has no content yet, so warning about
+// it here would be a redundant false alarm on every legitimate first page
+// of that language. Pass cfg.ConfiguredLanguages; nil/empty preserves the
+// original derived-from-content warning for every operator who hasn't set it.
+func unknownLangWarning(lang string, idx *hugosite.SourceIndex, defaultLang string, configuredLangs []string) string {
+	lang = strings.TrimSpace(lang)
+	if lang == "" {
+		return ""
+	}
+	if lang == strings.TrimSpace(defaultLang) {
+		return ""
+	}
+	for _, c := range configuredLangs {
+		if strings.TrimSpace(c) == lang {
+			return ""
+		}
+	}
+	known := idx.Languages()
+	for _, k := range known {
+		if k == lang {
+			return ""
+		}
+	}
+	knownSet := append([]string(nil), known...)
+	if d := strings.TrimSpace(defaultLang); d != "" {
+		knownSet = append(knownSet, d)
+	}
+	seen := make(map[string]bool, len(knownSet))
+	deduped := knownSet[:0]
+	for _, value := range knownSet {
+		value = strings.TrimSpace(value)
+		if value != "" && !seen[value] {
+			seen[value] = true
+			deduped = append(deduped, value)
+		}
+	}
+	knownSet = deduped
+	sort.Strings(knownSet)
+	return fmt.Sprintf("lang %q has no existing content and is not this site's default language (known languages: %s); if this is a typo the page will become an orphan Hugo never builds, if it is a deliberately new language it must be added to the Hugo site config to build — call get_capabilities to see recognized languages", lang, strings.Join(knownSet, ", "))
+}
+
+// rejectUnconfiguredLang is #899's true reject, layered on top of (not
+// replacing) unknownLangWarning's warn-not-reject default. It only fires
+// when the operator has explicitly set cfg.ConfiguredLanguages — the
+// authoritative set unknownLangWarning's own doc comment explains the
+// server otherwise has no way to obtain (observed content is a strict
+// subset of configured languages, so a reject-from-content rule would
+// deadlock the first page of every legitimately new language). When
+// ConfiguredLanguages is unset (the default for every existing deployment),
+// this is always a no-op — the field is opt-in specifically so it can never
+// break an operator who hasn't configured it.
+//
+// Checked before any file is written (create_page's only mint path), so a
+// rejection here writes nothing, matching #899's acceptance criteria.
+// update_page/delete_page/plan/rollback need no equivalent check: they only
+// ever resolve an *existing* file, and a lang with no existing translation
+// already fails not_found there regardless of ConfiguredLanguages.
+func rejectUnconfiguredLang(lang string, cfg config.Config) error {
+	lang = strings.TrimSpace(lang)
+	if lang == "" || len(cfg.ConfiguredLanguages) == 0 {
+		return nil
+	}
+	if lang == strings.TrimSpace(cfg.DefaultLanguage) {
+		return nil
+	}
+	for _, c := range cfg.ConfiguredLanguages {
+		if strings.TrimSpace(c) == lang {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid_params: lang %q is not in this site's configured_languages (%s); call get_capabilities to see the authoritative list", lang, strings.Join(cfg.ConfiguredLanguages, ", "))
+}
+
+// Register wires every write-scope tool. changeSets is the shared
+// change-set ownership/mutation-attribution registry (#1135); pass nil to
+// have this call construct its own (fine for standalone write-package
+// tests that never need admin's build_site/publish_changes to see the same
+// mutation history). Real server wiring (internal/server) must pass the
+// same *changeset.Registry instance also given to admin.Register/
+// admin.RegisterPublishChanges (#1140) — two independent registries would
+// each see only their own package's mutations, since #1135's mutation
+// record is in-memory-only and never shared any other way.
+func Register(s *mcp.Server, pg *security.PathGuard, idx *hugosite.SourceIndex, cfg config.Config, siteDB *db.DB, changeSets *changeset.Registry, siteIdxs ...*site.Index) {
+	if s == nil {
+		return
+	}
+	if changeSets == nil {
+		changeSets = changeset.NewRegistry(siteDB)
+	}
+	rt := newWriteRegisterRuntime(cfg, siteDB, changeSets, siteIdxs...)
+	registerCreateChangeSet(s, rt.changeSets)
+	registerContentPlanTools(s, pg, idx, cfg, siteDB, rt.siteIdx, &rt.mutationMu, rt.mutationLimiters, rt.idem, rt.plans, rt.snapshots, rt.changeSets)
+	registerRollbackChange(s, pg, idx, cfg, siteDB, rt.siteIdx, &rt.mutationMu, rt.mutationLimiters, rt.idem, rt.snapshots, rt.changeSets)
+	registerListPageSnapshots(s, cfg, rt.snapshots)
+	registerBundleTools(s, pg, idx, cfg, siteDB, rt.siteIdx, &rt.mutationMu, rt.mutationLimiters, rt.idem, rt.bundlePlans, rt.bundleSnapshots, rt.changeSets)
+	registerBundleLifecycleTools(s, pg, idx, cfg, siteDB, rt)
+	registerCreatePageTool(s, pg, idx, cfg, siteDB, rt)
+	registerUpdatePageTool(s, pg, idx, cfg, siteDB, rt)
+	registerDeletePageTool(s, pg, idx, cfg, siteDB, rt)
+	registerUploadPageAsset(s, pg, idx, cfg, rt.idem, &rt.mutationMu, rt.mutationLimiters, rt.changeSets)
+	registerDeletePageAsset(s, pg, idx, cfg, rt.idem, &rt.deleteMu, rt.deleteLimiters, rt.changeSets)
+	registerBeginPageAssetUpload(s, pg, idx, cfg, &rt.mutationMu, rt.mutationLimiters, rt.chunkedUploads)
+	registerUploadPageAssetChunk(s, rt.chunkedUploads)
+	registerCommitPageAssetUpload(s, pg, idx, cfg, rt.idem, &rt.mutationMu, rt.mutationLimiters, rt.changeSets, rt.chunkedUploads)
+	registerGetMutationStatus(s, rt.idem)
+	registerGetRateLimits(s, cfg, &rt.mutationMu, rt.mutationLimiters, &rt.deleteMu, rt.deleteLimiters)
+}
+
+type writeRegisterRuntime struct {
+	siteIdx          *site.Index
+	deleteMu         sync.Mutex
+	deleteLimiters   map[string]*rate.Limiter
+	mutationMu       sync.Mutex
+	mutationLimiters map[string]*rate.Limiter
+	idem             *idempotencyStore
+	plans            *planStore
+	snapshots        *snapshotStore
+	bundlePlans      *bundlePlanStore
+	bundleSnapshots  *bundleSnapshotStore
+	changeSets       *changeset.Registry
+	chunkedUploads   *chunkedUploadStore
+}
+
+func newWriteRegisterRuntime(cfg config.Config, siteDB *db.DB, changeSets *changeset.Registry, siteIdxs ...*site.Index) *writeRegisterRuntime {
+	var siteIdx *site.Index
+	if len(siteIdxs) > 0 {
+		siteIdx = siteIdxs[0]
+	}
+	// #1196: a fresh in-memory chunkedUploadStore always starts empty, so
+	// any .upload-*.part staging file already on disk under ContentRoot at
+	// this point is orphaned residue from a previous process life — sweep
+	// it before any new upload can begin. Best-effort: a sweep failure
+	// (unreadable directory, etc.) never blocks server startup.
+	if removed, err := sweepOrphanedUploadStaging(cfg.ContentRoot); err != nil {
+		slog.Warn("write.Register: orphaned upload-staging sweep failed", "error", err)
+	} else if removed > 0 {
+		slog.Info("write.Register: removed orphaned upload-staging files", "count", removed)
+	}
+	return &writeRegisterRuntime{
+		siteIdx:          siteIdx,
+		deleteLimiters:   make(map[string]*rate.Limiter),
+		mutationLimiters: make(map[string]*rate.Limiter),
+		idem:             newIdempotencyStore(idempotencyTTLFromConfig(cfg), 256, siteDB),
+		plans:            newPlanStore(planTTL, planMaxEntries, siteDB),
+		snapshots:        newSnapshotStore(snapshotTTL, snapshotMaxEntries, siteDB),
+		bundlePlans:      newBundlePlanStore(planTTL, planMaxEntries, siteDB),
+		bundleSnapshots:  newBundleSnapshotStore(snapshotTTL, snapshotMaxEntries, siteDB),
+		changeSets:       changeSets,
+		chunkedUploads:   newChunkedUploadStore(chunkedUploadTTL),
+	}
+}
+
+func registerCreatePageTool(s *mcp.Server, pg *security.PathGuard, idx *hugosite.SourceIndex, cfg config.Config, siteDB *db.DB, rt *writeRegisterRuntime) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name:         "create_page",
+		Title:        "Publish page",
+		Description:  "Create a new Hugo content page at {slug}/index.md with front matter and body content. Fails with `already_exists` if the destination already exists; use update_page for edits. Repeating the same non-dry-run request normally fails once the page exists, but callers may provide `idempotency_key` to safely replay the exact same create attempt after a timeout or uncertain delivery. Successful non-dry-run responses include a `state` object that tells agents whether the page only exists in source so far or is already publicly available. Before writing, consider calling suggest_links(tags, categories, body) on your draft to surface internal-linking candidates while the content is still easy to adjust (#623). For disposable test/audit content (e.g. a live audit exercising the write cycle), set `test_content: {ttl_hours?, owner?}` — a deliberate, explicit opt-in, never inferred from `slug`/`title` (so a real published page that happens to start with e.g. `codex-` is never wrongly constrained). Omitting `ttl_hours` uses the 24h default; explicit values must be between 1 and 168 hours. This forces `draft: true` regardless of any other setting and writes `test_content`/`test_content_owner`/`test_content_expires_at` into the page's own frontmatter; the effective expiry is echoed back in `data.test_content_expires_at`. `build_site`/`publish_changes`'s post-build advisory (#608) honors `test_content_expires_at` unconditionally, independent of the server-wide `stale_test_content_threshold_hours` setting, so cleanup is nagged for even when that server-wide sweep is disabled — it never auto-deletes, only surfaces a warning recommending `delete_page` (#661). IMPORTANT for `normalize_taxonomy_casing`: it is scoped to the *exact* `lang` you pass on this call (or the empty-string bucket if you omit `lang`); on a bilingual site where every real page specifies `lang` explicitly, omitting `lang` here typically no-ops — the empty bucket has no existing forms to match against — so always pass `lang` explicitly when using it (#604, #677). Set `normalize_taxonomy_casing: true` (default off) to rewrite each submitted tag/category that only differs in casing from a single existing spelling elsewhere in the index to that existing spelling — preventing new drift instead of just letting get_site_health report it afterward (#589); rewrites are reported in `data.taxonomy_casing_normalized`, and a term left untouched because the index already has two or more conflicting spellings for it (pre-existing drift, never guessed at) is reported in `data.taxonomy_casing_ambiguous` instead. `body` is rejected with `invalid_params` if it invokes a server-configured blocked shortcode (default: `raw`, `rawhtml`, `script`, `style`) — a best-effort denylist of theme shortcodes known to render unescaped HTML/JavaScript/CSS on the public page, bypassing Hugo's own Markdown-level sanitization; not a guarantee every theme's shortcode surface is safe, and this check cannot be opted out of per call (#590). `rate_limit_remaining` reports the caller's remaining budget on this shared create/update/upload quota (#466); if exceeded, the error's `resolution.retry_after_seconds` gives a concrete wait time instead of forcing you to guess a safe pacing. `lang` for a language the site does not recognize: if the operator has set `configured_languages`, an unrecognized `lang` is rejected with `invalid_params` and nothing is written (#899); otherwise (the default) it is only a warning — the page is still written, since the server can't tell a typo from a deliberately new language without that operator-declared set. Either way, call get_capabilities first to see the authoritative/known language list.",
+		InputSchema:  tools.MustSchema[createPageInput](),
+		OutputSchema: tools.MustSchema[createPageOutput](),
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    false,
+			DestructiveHint: fileutil.BoolPtr(false),
+			IdempotentHint:  false,
+			OpenWorldHint:   fileutil.BoolPtr(true),
+		},
+	}, toolcontract.WrapTool(func(ctx context.Context, _ *mcp.CallToolRequest, in createPageInput) (*mcp.CallToolResult, createPageOutput, error) {
+		if cfg.ForceDryRunAll {
+			in.DryRun = true
+		}
+		in.Slug = normalizeInputSlug(in.Slug)
+		wrapErr := func(err error) error {
+			return toolcontract.WithRequestContext(err, toolcontract.RequestContext{Slug: in.Slug, RequestedLang: in.Lang})
+		}
+		callerKey := mutationCallerKey(ctx)
+		limiter := callerLimiter(&rt.mutationMu, rt.mutationLimiters, callerKey, cfg.RateLimit.CreateUpdatePerMin)
+		wrapErrWithLimiter := func(err error) error {
+			return toolcontract.WithDataFields(
+				toolcontract.WithRootFields(wrapErr(err), rateLimitRootFields(limiter)),
+				rateLimitDataFields(limiter, cfg.RateLimit.CreateUpdatePerMin, rateLimitScopeCreateUpdateUpload, time.Now().UTC()),
+			)
+		}
+		if in.Slug == "" {
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: slug must not be empty"))
+		}
+		resolvedLang, err := validateLangParam(in.Lang)
+		if err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(err)
+		}
+		if err := rejectUnconfiguredLang(resolvedLang, cfg); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(err)
+		}
+		if in.Title == "" {
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: title must not be empty"))
+		}
+		if seg, ok := reservedSlugConflict(in.Slug); ok {
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: slug segment %q is a Hugo-reserved name (404, index, _index) and would shadow the site's own page", seg))
+		}
+		if err := validateSlugFormat(in.Slug); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(err)
+		}
+		if err := validateTitleFormat(in.Title); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(err)
+		}
+		if err := validateBodyFormat(in.Body, cfg.BlockedShortcodes); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(err)
+		}
+		if err := validateTaxonomyTerms("tag", in.Tags); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(err)
+		}
+		if err := validateTaxonomyTerms("category", in.Categories); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(err)
+		}
+		if err := validateIdempotencyKey(in.IdempotencyKey); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(err)
+		}
+		resolvedChangeSetID, err := rt.changeSets.Resolve(ctx, in.ChangeSetID, time.Now().UTC())
+		if err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(err)
+		}
+		if in.TestContent != nil && in.TestContent.TTLHours != nil {
+			ttl := *in.TestContent.TTLHours
+			if ttl <= 0 || ttl > testContentMaxTTLHours {
+				return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: test_content.ttl_hours must be between 1 and %d hours when provided", testContentMaxTTLHours))
+			}
+		}
+		// #887: Allow() is deliberately NOT consumed here. Under the unified
+		// quota rule (see the package-level comment on quotaConsumptionRule),
+		// quota is spent only once a call is a valid request against an
+		// eligible target and is about to make a genuine mutation attempt —
+		// so every free pre-flight gate above (input validation) and below
+		// (build_in_progress lock wait, idempotency replay) never spends it.
+		// For a create the eligibility gate IS the atomic write itself, so the
+		// Allow() below sits immediately before it: already_exists (the
+		// write-time collision) legitimately consumes, matching delete_page's
+		// existence-gated placement.
+		dir, err := pg.SafeJoin(in.Slug)
+		if err != nil {
+			slog.Warn("create_page: path validation failed", "slug", in.Slug, "error", err)
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: path validation failed"))
+		}
+
+		filePath := filepath.Join(dir, "index.md")
+		if resolvedLang != "" {
+			filePath = filepath.Join(dir, "index."+resolvedLang+".md")
+		}
+		// normalize_taxonomy_casing (#589) resolves against the index as it
+		// stands right now, before this page is written — deliberately
+		// computed from the caller's original in.Tags/in.Categories, not
+		// reused for the idempotency hash below, so a retry's hash never
+		// shifts just because intervening writes changed what "existing
+		// casing" means.
+		writeTags, writeCategories := in.Tags, in.Categories
+		var taxonomyNormalized []taxonomyCasingChangeDTO
+		var taxonomyAmbiguous []taxonomyCasingSkippedDTO
+		if in.NormalizeTaxonomyCasing {
+			var tagChanges, catChanges []taxonomyCasingChangeDTO
+			var tagSkipped, catSkipped []taxonomyCasingSkippedDTO
+			writeTags, tagChanges, tagSkipped = normalizeTaxonomyCasing(taxonomyRawForms(idx, "tag"), "tag", resolvedLang, in.Tags)
+			writeCategories, catChanges, catSkipped = normalizeTaxonomyCasing(taxonomyRawForms(idx, "category"), "category", resolvedLang, in.Categories)
+			taxonomyNormalized = append(tagChanges, catChanges...)
+			taxonomyAmbiguous = append(tagSkipped, catSkipped...)
+		}
+		content, testContentExpiresAt := buildFrontmatter(in.Title, writeTags, writeCategories, in.Body, in.TestContent)
+
+		// Round-trip guard: verify the generated content parses correctly.
+		if err := validateFrontmatterRoundTrip(content); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("validation_error: %w", err))
+		}
+
+		if in.DryRun {
+			if _, err := os.Stat(filePath); err == nil {
+				return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("already_exists: page already exists at slug %q", in.Slug))
+			} else if !os.IsNotExist(err) {
+				slog.Error("create_page: dry-run stat failed", "slug", in.Slug, "error", err)
+				return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("read_error: failed to inspect destination path"))
+			}
+			logicalPath := fileutil.LogicalContentPath(cfg.ContentRoot, filePath)
+			langWarning := unknownLangWarning(resolvedLang, idx, cfg.DefaultLanguage, cfg.ConfiguredLanguages)
+			return nil, newCreatePageOutput(createPageData{
+				Status:                   "would_create",
+				Slug:                     canonicalPublicSlug(in.Slug),
+				SourceKey:                in.Slug,
+				ResolvedLang:             strPtr(resolvedLang),
+				ResolvedSourcePath:       strPtr(logicalPath),
+				DryRun:                   true,
+				Content:                  content,
+				Warning:                  langWarning,
+				RateLimit:                ptrRateLimitBucket(newRateLimitBucket(limiter, cfg.RateLimit.CreateUpdatePerMin, rateLimitScopeCreateUpdateUpload, time.Now().UTC())),
+				TaxonomyCasingNormalized: taxonomyNormalized,
+				TaxonomyCasingAmbiguous:  taxonomyAmbiguous,
+				TestContentExpiresAt:     testContentExpiresAt,
+			}, rateLimitRemaining(limiter)), nil
+		}
+
+		const lockWait = 10 * time.Second
+		deadline := time.Now().Add(lockWait)
+		for {
+			if hugosite.ContentMu.TryLock() {
+				slog.Debug("create_page: lock_acquired")
+				break
+			}
+			if time.Now().After(deadline) {
+				slog.Error("create_page: lock_timeout", "timeout_s", lockWait.Seconds())
+				return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("build_in_progress: content lock is held, retry in a moment"))
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		defer func() {
+			hugosite.ContentMu.Unlock()
+			slog.Debug("create_page: lock_released")
+		}()
+
+		// Idempotency replay check must happen under the content lock: two
+		// genuinely concurrent retries with the same key (the exact
+		// uncertain-delivery scenario this feature protects against) would
+		// otherwise both miss the cache before either has a chance to
+		// remember its result, and the loser would see already_exists
+		// instead of the intended idempotent replay.
+		idemHash := ""
+		if strings.TrimSpace(in.IdempotencyKey) != "" {
+			hash, hashErr := requestHash(struct {
+				Slug       string   `json:"slug"`
+				Lang       string   `json:"lang,omitempty"`
+				Title      string   `json:"title"`
+				Body       string   `json:"body"`
+				Tags       []string `json:"tags"`
+				Categories []string `json:"categories"`
+			}{
+				Slug:       in.Slug,
+				Lang:       resolvedLang,
+				Title:      in.Title,
+				Body:       in.Body,
+				Tags:       in.Tags,
+				Categories: in.Categories,
+			})
+			if hashErr != nil {
+				return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("internal_error: failed to hash idempotency request"))
+			}
+			idemHash = hash
+			var cached createPageOutput
+			hit, replayErr := rt.idem.replay(idempotencyCallerKey(ctx), "create_page", in.IdempotencyKey, idemHash, &cached)
+			if replayErr != nil {
+				return nil, createPageOutput{}, wrapErrWithLimiter(replayErr)
+			}
+			if hit {
+				return nil, cached, nil
+			}
+		}
+
+		// #887 quota-consumption boundary: this create has a valid request and
+		// (via the idempotency miss above) is a genuine, non-replayed mutation
+		// attempt about to write. Consume the create/update/upload quota now, so
+		// already_exists below — discovered at the atomic write — costs a token
+		// while every earlier rejection (validation, build_in_progress,
+		// idempotency replay) stays free.
+		if !limiter.Allow() {
+			return nil, createPageOutput{}, wrapErrWithLimiter(rateLimitExceededErr("create_page", cfg.RateLimit.CreateUpdatePerMin, limiter))
+		}
+		if err := pg.RevalidateForWrite(filePath); err != nil {
+			slog.Warn("create_page: symlink-swap detected before write", "slug", in.Slug, "error", err)
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("security_error: symlink detected in write path"))
+		}
+		createdRevision := contentmodel.SourceRevisionBytes([]byte(content))
+		logicalRecoveryPath := fileutil.LogicalContentPath(cfg.ContentRoot, filePath)
+		recoveryOp, err := beginSourceWriteRecovery(siteDB, filePath, "", createdRevision, recoveryIdempotencyFor(ctx, "create_page", in.IdempotencyKey, idemHash, map[string]any{
+			"slug": canonicalPublicSlug(in.Slug), "source_key": in.Slug, "path": logicalRecoveryPath,
+			"resolved_lang": resolvedLang, "resolved_source_path": logicalRecoveryPath,
+			"new_revision": createdRevision, "revision_kind": "content_snapshot",
+		}))
+		if err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to record source create intent"))
+		}
+		if err := fileutil.AtomicCreateChecked(filePath, content, pg); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("already_exists: page already exists at slug %q", in.Slug))
+			}
+			slog.Error("create_page: write failed", "slug", in.Slug, "error", err)
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("write_error: failed to write page"))
+		}
+		if err := recoveryFilesystemBoundary("create_page", "after_source_write"); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: interrupted after source write"))
+		}
+		if err := recoveryOp.record(siteDB, "file_written"); err != nil {
+			slog.Warn("create_page: could not advance recovery journal", "slug", in.Slug, "error", err)
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		frontmatterRaw := map[string]any{"title": in.Title, "date": now, "draft": in.TestContent != nil}
+		if in.TestContent != nil {
+			frontmatterRaw["test_content"] = true
+			if in.TestContent.Owner != "" {
+				frontmatterRaw["test_content_owner"] = in.TestContent.Owner
+			}
+			frontmatterRaw["test_content_expires_at"] = testContentExpiresAt
+		}
+		created := hugosite.SourcePage{
+			Slug:           in.Slug,
+			FilePath:       filePath,
+			Lang:           resolvedLang,
+			Title:          in.Title,
+			Date:           now,
+			Tags:           writeTags,
+			Categories:     writeCategories,
+			Body:           in.Body,
+			Draft:          in.TestContent != nil,
+			FrontmatterRaw: frontmatterRaw,
+			BuildPending:   true,
+		}
+		// Compute the unknown-language warning against the index state *before*
+		// inserting this page, so the page's own lang doesn't mask the signal
+		// (#891). This is under hugosite.ContentMu, so the read is race-safe.
+		langWarning := unknownLangWarning(resolvedLang, idx, cfg.DefaultLanguage, cfg.ConfiguredLanguages)
+		idx.Upsert(created)
+		// Do NOT insert into the public site index — the page is source-only until
+		// Hugo builds it. UpsertPage here would break allow_source_fallback detection.
+		status := "created"
+		warning := ""
+		if siteDB != nil {
+			if err := siteDB.SyncSourcePage(created); err != nil {
+				slog.Warn("create_page: db sync failed", "slug", in.Slug, "error", err)
+				status = "partial_success"
+				warning = fmt.Sprintf("source created but derived DB could not be updated: %v", err)
+			}
+		}
+		if langWarning != "" {
+			if warning != "" {
+				warning = langWarning + "; " + warning
+			} else {
+				warning = langWarning
+			}
+		}
+
+		state := createPageState()
+		logicalPath := fileutil.LogicalContentPath(cfg.ContentRoot, filePath)
+		out := newCreatePageOutput(createPageData{
+			Status:                   status,
+			Slug:                     canonicalPublicSlug(in.Slug),
+			SourceKey:                in.Slug,
+			Path:                     logicalPath,
+			ResolvedLang:             strPtr(resolvedLang),
+			ResolvedSourcePath:       strPtr(logicalPath),
+			NewRevision:              contentmodel.SourceRevisionBytes([]byte(content)),
+			RevisionKind:             "content_snapshot",
+			Warning:                  appendLastBuildWarning(warning),
+			State:                    &state,
+			RateLimit:                ptrRateLimitBucket(newRateLimitBucket(limiter, cfg.RateLimit.CreateUpdatePerMin, rateLimitScopeCreateUpdateUpload, time.Now().UTC())),
+			TaxonomyCasingNormalized: taxonomyNormalized,
+			TaxonomyCasingAmbiguous:  taxonomyAmbiguous,
+			TestContentExpiresAt:     testContentExpiresAt,
+		}, rateLimitRemaining(limiter))
+		if err := recoveryOp.stageResult(siteDB, out); err != nil {
+			return nil, createPageOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to stage recoverable mutation result"))
+		}
+		if idemHash != "" {
+			if err := rt.idem.remember(idempotencyCallerKey(ctx), "create_page", in.IdempotencyKey, idemHash, out); err != nil {
+				slog.Warn("create_page: could not persist idempotency result", "slug", in.Slug, "error", err)
+			}
+		}
+		if err := recoveryOp.record(siteDB, "committed"); err != nil {
+			slog.Warn("create_page: could not commit recovery journal", "slug", in.Slug, "error", err)
+		}
+		rt.changeSets.RecordMutation(resolvedChangeSetID, mutationCallerKey(ctx), "create_page", in.Slug, "create", time.Now().UTC())
+		return nil, out, nil
+	}))
+}
+
+func registerUpdatePageTool(s *mcp.Server, pg *security.PathGuard, idx *hugosite.SourceIndex, cfg config.Config, siteDB *db.DB, rt *writeRegisterRuntime) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name:  "update_page",
+		Title: "Update page",
+		Description: "Update an existing Hugo content page while preserving unspecified front matter fields. " +
+			"Use title/body to revise content. For a localized body edit, supply `old_str` and `new_str` instead of `body`: both are required, `old_str` must match the current Markdown body exactly once, and only that match is replaced (an empty `new_str` deletes it); zero or multiple matches fail with `invalid_params` rather than guessing (#1255). Use tags/categories/draft/description/featured_image to update front matter fields. Section indexes (`_index.md`/`_index.<lang>.md`, including the homepage) require `confirm_section_index:true` and an exact `old_str`/`new_str` body patch; full-body replacement is not supported for these structural pages (#1254). " +
+			"`data.changed` (#860) is an explicit no-op signal: it is `false` when the resulting content is byte-identical to what was already on disk (the call succeeded but changed nothing) and `true` when the page was actually modified — present on both `dry_run` and real writes, so a caller never has to diff revisions itself to tell a no-op apart from a real edit. " +
+			"`featured_image` sets the theme's `featuredImage` frontmatter key to a local public path — typically the path from a prior generate_hero_image call's `data.path` response (e.g. \"/images/{slug}-featured.jpg\"); sending `featured_image:\"\"` explicitly clears that frontmatter key, while omitting the field leaves it unchanged (#825, #835). " +
+			"`tags`/`categories` are a whole-list replacement, not an add/remove delta — but the response reports one anyway: `data.tags_delta`/`data.categories_delta` (`added`/`removed`/`unchanged`) compare the submitted list against the page's current value, on both dry_run and a real write, whenever `tags`/`categories` is included in the request at all (an empty list is a valid, explicit \"clear them all\"; omitting the key entirely leaves the field unchanged and reports no delta) (#645). " +
+			"For bilingual sites, provide lang (e.g. \"fr\", \"en\") to target the correct language file; " +
+			"omitting lang on a page with multiple language files returns an ambiguous_language error listing available langs. " +
+			"Non-dry-run calls require `expected_revision`, the `revision` value from a prior read of this page (e.g. get_page); " +
+			"a missing value fails with `invalid_params` and a stale value fails with `revision_conflict`, telling the agent to re-read and replan; the `revision_conflict` error's `data.current_revision` carries the fresh revision so you can retry immediately without an extra read (#893). " +
+			"Optionally, on a page bundle (content/<slug>/), also pass `expected_bundle_revision` (the `bundle_revision` from a prior get_page_for_edit) to additionally guard against a *sibling* translation or bundle-local asset changing since you read the bundle — a stale value fails with `bundle_conflict`, distinct from `revision_conflict` so a caller passing both tokens can tell which one tripped; that error's `data.current_bundle_revision` likewise carries the fresh bundle revision for immediate retry (#893); omitting it is fully backward-compatible and leaves behavior unchanged (#857). Every success response (dry_run included) also carries `data.bundle_revision` (#1192) — the fresh whole-bundle token for this page's bundle directory, mirroring get_page_for_edit's field of the same name — so a caller updating several translations in sequence can chain straight into the next update_page's `expected_bundle_revision` without a separate get_page_for_edit round-trip just to read a fresh token; omitted (not empty-string) for a leaf page that isn't part of a bundle directory. A `bundle_conflict`/`revision_conflict` failure still reports the fresh token as `data.current_bundle_revision` (#893) instead, not `bundle_revision`. " +
+			"Callers may provide `idempotency_key` to safely replay the exact same non-dry-run update after a timeout or uncertain delivery. " +
+			"Successful non-dry-run responses include a `state` object that tells agents whether the source changed ahead of the public build/index state. " +
+			"If the page still carries `test_content: true`, attempts to set `draft: false` are rejected — the explicit test-content marker remains an ongoing publication-safety invariant while that marker is present, not just a creation-time convenience (#728). " +
+			"IMPORTANT for `normalize_taxonomy_casing`: it is scoped to the *exact* `lang` you pass on this call (or the empty-string bucket if you omit `lang`); on a bilingual site where every real page specifies `lang` explicitly, omitting `lang` here typically no-ops — the empty bucket has no existing forms to match against — so always pass `lang` explicitly when using it (#604, #677). " +
+			"Set `normalize_taxonomy_casing: true` (default off) to rewrite each submitted tag/category that only differs in casing from a single existing spelling elsewhere in the index to that existing spelling — preventing new drift instead of just letting get_site_health report it afterward (#589); rewrites are reported in `data.taxonomy_casing_normalized`, and a term left untouched because the index already has two or more conflicting spellings for it (pre-existing drift, never guessed at) is reported in `data.taxonomy_casing_ambiguous` instead. " +
+			"`body`, and the final body produced by `old_str`/`new_str`, are rejected with `invalid_params` (including on `dry_run`) if they invoke a server-configured blocked shortcode (default: `raw`, `rawhtml`, `script`, `style`) — a best-effort denylist of theme shortcodes known to render unescaped HTML/JavaScript/CSS on the public page, bypassing Hugo's own Markdown-level sanitization; not a guarantee every theme's shortcode surface is safe, and this check cannot be opted out of per call (#590, #1255). " +
+			"`rate_limit_remaining` reports the caller's remaining budget on this shared create/update/upload quota (#466); if exceeded, the error's `resolution.retry_after_seconds` gives a concrete wait time instead of forcing you to guess a safe pacing.",
+		InputSchema:  tools.MustSchema[updatePageInput](),
+		OutputSchema: tools.MustSchema[updatePageOutput](),
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    false,
+			DestructiveHint: fileutil.BoolPtr(false),
+			IdempotentHint:  true,
+			OpenWorldHint:   fileutil.BoolPtr(true),
+		},
+	}, toolcontract.WrapTool(func(ctx context.Context, _ *mcp.CallToolRequest, in updatePageInput) (*mcp.CallToolResult, updatePageOutput, error) {
+		return handleUpdatePage(ctx, in, pg, idx, cfg, siteDB, rt)
+	}))
+}
+
+func handleUpdatePage(ctx context.Context, in updatePageInput, pg *security.PathGuard, idx *hugosite.SourceIndex, cfg config.Config, siteDB *db.DB, rt *writeRegisterRuntime) (*mcp.CallToolResult, updatePageOutput, error) {
+	if cfg.ForceDryRunAll {
+		in.DryRun = true
+	}
+	in.Slug = normalizeInputSlug(in.Slug)
+	wrapErr := func(err error) error {
+		return toolcontract.WithRequestContext(err, toolcontract.RequestContext{Slug: in.Slug, RequestedLang: in.Lang})
+	}
+	callerKey := mutationCallerKey(ctx)
+	limiter := callerLimiter(&rt.mutationMu, rt.mutationLimiters, callerKey, cfg.RateLimit.CreateUpdatePerMin)
+	wrapErrWithLimiter := func(err error) error {
+		return toolcontract.WithDataFields(
+			toolcontract.WithRootFields(wrapErr(err), rateLimitRootFields(limiter)),
+			rateLimitDataFields(limiter, cfg.RateLimit.CreateUpdatePerMin, rateLimitScopeCreateUpdateUpload, time.Now().UTC()),
+		)
+	}
+	lang, err := validateUpdatePageInput(in, cfg)
+	if err != nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(err)
+	}
+	resolvedChangeSetID, err := rt.changeSets.Resolve(ctx, in.ChangeSetID, time.Now().UTC())
+	if err != nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(err)
+	}
+	// #887: Allow() is NOT consumed here anymore. Under the unified quota
+	// rule (see quotaConsumptionRule) it now sits below, after the target's
+	// existence is confirmed (not_found is free) and after the missing
+	// expected_revision input-shape check (also free), immediately before
+	// the stale-revision conflict check — so update_page matches
+	// delete_page: not_found and a missing required guard are free, while a
+	// genuine stale-revision conflict against the confirmed page consumes.
+	if err := acquireUpdatePageContentLock(); err != nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(err)
+	}
+	defer func() {
+		hugosite.ContentMu.Unlock()
+		slog.Debug("update_page: lock_released")
+	}()
+
+	if _, err := pg.SafeJoin(in.Slug); err != nil {
+		slog.Warn("update_page: path validation failed", "slug", in.Slug, "error", err)
+		return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: path validation failed"))
+	}
+
+	resolvedSource, langErr := resolveExistingSource(cfg.ContentRoot, in.Slug, lang)
+	if langErr != nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(langErr)
+	}
+	filePath := resolvedSource.SourcePath
+	var currentSource *hugosite.SourcePage
+	var ok bool
+	if resolvedSource.SectionIndex {
+		if !in.ConfirmSectionIndex {
+			return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: confirm_section_index:true is required to update a Hugo section index"))
+		}
+		if in.OldStr == nil || in.NewStr == nil {
+			return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: section indexes require an old_str/new_str body patch; full-body replacement is not supported"))
+		}
+		currentSource, ok = idx.GetByFilePath(filePath)
+	} else {
+		currentSource, ok = idx.GetBySlug(in.Slug)
+		if p, found := idx.GetBySlugLang(in.Slug, resolvedSource.Lang); found {
+			currentSource = p
+		}
+	}
+	if !ok || currentSource == nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("not_found: page not found"))
+	}
+
+	idemHash, cached, err := replayUpdatePage(ctx, in, lang, rt)
+	if err != nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(err)
+	}
+	if cached != nil {
+		return nil, *cached, nil
+	}
+
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		slog.Error("update_page: read failed", "slug", in.Slug, "path", filePath, "error", err)
+		return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("read_error: failed to read page"))
+	}
+	currentRevision := contentmodel.SourceRevisionBytes(raw)
+	if err := verifyUpdatePageGuards(in, pg, cfg, currentRevision, limiter, wrapErrWithLimiter); err != nil {
+		return nil, updatePageOutput{}, err
+	}
+	prepared, err := prepareUpdatePage(in, idx, currentSource, resolvedSource.Lang, raw, cfg.BlockedShortcodes)
+	if err != nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(err)
+	}
+	content := prepared.content
+	writeTags, writeCategories := prepared.tags, prepared.categories
+	taxonomyNormalized, taxonomyAmbiguous := prepared.normalized, prepared.ambiguous
+	tagsDelta, categoriesDelta := prepared.tagsDelta, prepared.categoriesDelta
+	if in.DryRun {
+		return nil, buildUpdatePageDryRunOutput(in, cfg, resolvedSource.Lang, filePath, raw, prepared, limiter), nil
+	}
+
+	if err := pg.RevalidateForWrite(filePath); err != nil {
+		slog.Warn("update_page: symlink-swap detected before write", "slug", in.Slug, "error", err)
+		return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("security_error: symlink detected in write path"))
+	}
+	// Retain the exact pre-write bytes before the source rename. The
+	// snapshot journal is part of the rollback guarantee, not a derived
+	// index: accepting this mutation when it cannot be made durable would
+	// create a successful but unrollbackable update after a restart.
+	if err := rt.snapshots.put(filePath, currentRevision, isolationCallerKey(ctx), string(raw)); err != nil {
+		slog.Error("update_page: rollback snapshot persistence failed", "slug", in.Slug, "error", err)
+		return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to retain rollback snapshot"))
+	}
+	afterRevision := contentmodel.SourceRevisionBytes([]byte(content))
+	logicalRecoveryPath := fileutil.LogicalContentPath(cfg.ContentRoot, filePath)
+	recoveryOp, err := beginSourceWriteRecovery(siteDB, filePath, currentRevision, afterRevision, recoveryIdempotencyFor(ctx, "update_page", in.IdempotencyKey, idemHash, map[string]any{
+		"slug": canonicalPublicSlug(in.Slug), "source_key": sourceKeyForInputSlug(in.Slug),
+		"resolved_lang": resolvedSource.Lang, "resolved_source_path": logicalRecoveryPath,
+		"changed": true, "new_revision": afterRevision, "revision_kind": "content_snapshot",
+	}))
+	if err != nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to record source write intent"))
+	}
+	if err := fileutil.AtomicWriteChecked(filePath, content, pg); err != nil {
+		slog.Error("update_page: write failed", "slug", in.Slug, "error", err)
+		return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("write_error: failed to write page"))
+	}
+	snapshotWarning := ""
+	if err := recoveryFilesystemBoundary("update_page", "after_source_write"); err != nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: interrupted after source write"))
+	}
+	if err := recoveryOp.record(siteDB, "file_written"); err != nil {
+		slog.Warn("update_page: could not advance recovery journal after source write", "slug", in.Slug, "error", err)
+	}
+	updated, hadPublic := reconcileUpdatePageIndexes(in, currentSource, resolvedSource.Lang, filePath, content, prepared.effectiveBody, writeTags, writeCategories, idx, rt.siteIdx)
+	realChanged := content != string(raw)
+	status := "unchanged"
+	if realChanged {
+		status = "updated"
+	}
+	warning := ""
+	if snapshotWarning != "" {
+		warning = snapshotWarning
+	}
+	if siteDB != nil {
+		if err := siteDB.SyncSourcePage(updated); err != nil {
+			slog.Warn("update_page: db sync failed", "slug", in.Slug, "error", err)
+			status = "partial_success"
+			warning = fmt.Sprintf("source updated but derived DB could not be updated: %v", err)
+		}
+	}
+	// Stale-hero-image advisory (#812 follow-up): the title just changed
+	// but featured_image wasn't part of this same call, and the page
+	// already had a featuredImage set — its baked-in title text (drawn
+	// by generate_hero_image) may no longer match the new title. Purely
+	// advisory, never blocks the write: not every hero image bakes the
+	// page title verbatim, and regenerating on every title edit would be
+	// unwanted churn for callers who don't want that coupling.
+	if in.Title != "" && in.FeaturedImage == nil {
+		if raw, ok := currentSource.FrontmatterRaw["featuredImage"]; ok {
+			if s, ok := raw.(string); ok && strings.TrimSpace(s) != "" {
+				hint := "title changed but featuredImage was left unchanged — its baked-in text may no longer match; " +
+					"regenerate via generate_hero_image and set featured_image on update_page if it should reflect the new title"
+				if warning == "" {
+					warning = hint
+				} else {
+					warning = warning + "; " + hint
+				}
+			}
+		}
+	}
+
+	state := updatePageState(rt.siteIdx != nil, hadPublic)
+	logicalPath := fileutil.LogicalContentPath(cfg.ContentRoot, filePath)
+	bundleRevision, _ := contentmodel.BundleRevision(filepath.Dir(filePath))
+	out := newUpdatePageOutput(updatePageData{
+		Status:                   status,
+		Slug:                     canonicalPublicSlug(in.Slug),
+		SourceKey:                sourceKeyForInputSlug(in.Slug),
+		ResolvedLang:             strPtr(resolvedSource.Lang),
+		ResolvedSourcePath:       strPtr(logicalPath),
+		Changed:                  &realChanged,
+		NewRevision:              contentmodel.SourceRevisionBytes([]byte(content)),
+		RevisionKind:             "content_snapshot",
+		Warning:                  appendLastBuildWarning(warning),
+		State:                    &state,
+		RateLimit:                ptrRateLimitBucket(newRateLimitBucket(limiter, cfg.RateLimit.CreateUpdatePerMin, rateLimitScopeCreateUpdateUpload, time.Now().UTC())),
+		TaxonomyCasingNormalized: taxonomyNormalized,
+		TaxonomyCasingAmbiguous:  taxonomyAmbiguous,
+		TagsDelta:                tagsDelta,
+		CategoriesDelta:          categoriesDelta,
+		BundleRevision:           bundleRevision,
+	}, rateLimitRemaining(limiter))
+	if err := recoveryOp.stageResult(siteDB, out); err != nil {
+		return nil, updatePageOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to stage recoverable mutation result"))
+	}
+	if idemHash != "" {
+		if err := rt.idem.remember(idempotencyCallerKey(ctx), "update_page", in.IdempotencyKey, idemHash, out); err != nil {
+			slog.Warn("update_page: could not persist idempotency result", "slug", in.Slug, "error", err)
+		}
+	}
+	if err := recoveryOp.record(siteDB, "committed"); err != nil {
+		slog.Warn("update_page: could not commit recovery journal", "slug", in.Slug, "error", err)
+	}
+	rt.changeSets.RecordMutation(resolvedChangeSetID, mutationCallerKey(ctx), "update_page", in.Slug, "update", time.Now().UTC())
+	return nil, out, nil
+}
+
+// validateUpdatePageInput pins the input-only stage before any shared-state
+// lookup, lock acquisition, quota consumption, or filesystem access.
+func validateUpdatePageInput(in updatePageInput, cfg config.Config) (string, error) {
+	if in.Slug == "" {
+		return "", fmt.Errorf("invalid_params: slug must not be empty")
+	}
+	lang, err := validateLangParam(in.Lang)
+	if err != nil {
+		return "", err
+	}
+	if in.Slug != "/" {
+		if err := validateSlugFormat(in.Slug); err != nil {
+			return "", err
+		}
+	}
+	if in.Title != "" {
+		if err := validateTitleFormat(in.Title); err != nil {
+			return "", err
+		}
+	}
+	if in.Body != nil && *in.Body != "" {
+		if err := validateBodyFormat(*in.Body, cfg.BlockedShortcodes); err != nil {
+			return "", err
+		}
+	}
+	if (in.OldStr == nil) != (in.NewStr == nil) {
+		return "", fmt.Errorf("invalid_params: old_str and new_str must be supplied together")
+	}
+	if in.OldStr != nil {
+		if in.Body != nil {
+			return "", fmt.Errorf("invalid_params: body is mutually exclusive with old_str/new_str")
+		}
+		if *in.OldStr == "" {
+			return "", fmt.Errorf("invalid_params: old_str must not be empty")
+		}
+		if err := rejectUnsafeText(*in.OldStr); err != nil {
+			return "", fmt.Errorf("invalid_params: old_str %w", err)
+		}
+		if err := rejectUnsafeText(*in.NewStr); err != nil {
+			return "", fmt.Errorf("invalid_params: new_str %w", err)
+		}
+	}
+	if in.Description != nil {
+		if err := rejectUnsafeText(*in.Description); err != nil {
+			return "", fmt.Errorf("invalid_params: description %w", err)
+		}
+	}
+	if in.FeaturedImage != nil {
+		if err := validateFeaturedImagePath(*in.FeaturedImage); err != nil {
+			return "", err
+		}
+	}
+	if err := validateTaxonomyTerms("tag", in.Tags); err != nil {
+		return "", err
+	}
+	if err := validateTaxonomyTerms("category", in.Categories); err != nil {
+		return "", err
+	}
+	if err := validateIdempotencyKey(in.IdempotencyKey); err != nil {
+		return "", err
+	}
+	return lang, nil
+}
+
+type preparedUpdatePage struct {
+	content                    string
+	effectiveBody              *string
+	tags, categories           []string
+	normalized                 []taxonomyCasingChangeDTO
+	ambiguous                  []taxonomyCasingSkippedDTO
+	tagsDelta, categoriesDelta *taxonomyDeltaDTO
+}
+
+func prepareUpdatePage(in updatePageInput, idx *hugosite.SourceIndex, current *hugosite.SourcePage, lang string, raw []byte, blockedShortcodes []string) (preparedUpdatePage, error) {
+	prepared := preparedUpdatePage{tags: in.Tags, categories: in.Categories}
+	if in.NormalizeTaxonomyCasing {
+		var tagChanges, categoryChanges []taxonomyCasingChangeDTO
+		var tagSkipped, categorySkipped []taxonomyCasingSkippedDTO
+		prepared.tags, tagChanges, tagSkipped = normalizeTaxonomyCasing(taxonomyRawForms(idx, "tag"), "tag", lang, in.Tags)
+		prepared.categories, categoryChanges, categorySkipped = normalizeTaxonomyCasing(taxonomyRawForms(idx, "category"), "category", lang, in.Categories)
+		prepared.normalized = append(tagChanges, categoryChanges...)
+		prepared.ambiguous = append(tagSkipped, categorySkipped...)
+	}
+	if in.Tags != nil {
+		delta := computeTaxonomyDelta(current.Tags, prepared.tags)
+		prepared.tagsDelta = &delta
+	}
+	if in.Categories != nil {
+		delta := computeTaxonomyDelta(current.Categories, prepared.categories)
+		prepared.categoriesDelta = &delta
+	}
+	inputContent := string(raw)
+	if in.OldStr != nil {
+		var err error
+		var patchedBody string
+		inputContent, patchedBody, err = applyBodySnippetPatch(inputContent, *in.OldStr, *in.NewStr)
+		if err != nil {
+			return preparedUpdatePage{}, err
+		}
+		if err := validateBodyFormat(patchedBody, blockedShortcodes); err != nil {
+			return preparedUpdatePage{}, err
+		}
+		bodyForIndex := strings.TrimSpace(patchedBody)
+		prepared.effectiveBody = &bodyForIndex
+	} else if in.Body != nil && *in.Body != "" {
+		prepared.effectiveBody = in.Body
+	}
+	body := ""
+	if in.Body != nil {
+		body = *in.Body
+	}
+	content, err := applyPageUpdates(inputContent, in.Title, body, pageUpdateOpts{
+		Tags: prepared.tags, Categories: prepared.categories, Draft: in.Draft,
+		Description: in.Description, FeaturedImage: in.FeaturedImage,
+	})
+	if err != nil {
+		slog.Error("update_page: frontmatter update failed", "slug", in.Slug, "error", err)
+		return preparedUpdatePage{}, fmt.Errorf("parse_error: failed to update frontmatter")
+	}
+	if err := validateFrontmatterRoundTrip(content); err != nil {
+		slog.Error("update_page: round-trip guard failed", "slug", in.Slug, "error", err)
+		return preparedUpdatePage{}, fmt.Errorf("validation_error: %w", err)
+	}
+	prepared.content = content
+	return prepared, nil
+}
+
+// applyBodySnippetPatch replaces oldStr only inside the Markdown body. The
+// frontmatter bytes and every non-matching body byte are preserved exactly.
+// Refusing zero or multiple matches makes the operation fail closed when the
+// caller's view is stale or the snippet is not a unique edit anchor (#1255).
+func applyBodySnippetPatch(fileContent, oldStr, newStr string) (string, string, error) {
+	if !strings.HasPrefix(fileContent, "---\n") {
+		return "", "", fmt.Errorf("parse_error: failed to locate YAML frontmatter")
+	}
+	rest := fileContent[4:]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return "", "", fmt.Errorf("parse_error: failed to locate YAML frontmatter")
+	}
+	bodyStart := 4 + end + 4
+	body := fileContent[bodyStart:]
+	matches := strings.Count(body, oldStr)
+	if matches == 0 {
+		return "", "", fmt.Errorf("invalid_params: old_str does not match the current body")
+	}
+	if matches != 1 {
+		return "", "", fmt.Errorf("invalid_params: old_str must match the current body exactly once (matched %d times)", matches)
+	}
+	patchedBody := strings.Replace(body, oldStr, newStr, 1)
+	return fileContent[:bodyStart] + patchedBody, patchedBody, nil
+}
+
+func buildUpdatePageDryRunOutput(in updatePageInput, cfg config.Config, lang, filePath string, raw []byte, prepared preparedUpdatePage, limiter *rate.Limiter) updatePageOutput {
+	changed := prepared.content != string(raw)
+	status := "unchanged"
+	if changed {
+		status = "would_update"
+	}
+	bundleRevision, _ := contentmodel.BundleRevision(filepath.Dir(filePath))
+	return newUpdatePageOutput(updatePageData{
+		Status: status, Slug: canonicalPublicSlug(in.Slug), SourceKey: sourceKeyForInputSlug(in.Slug),
+		ResolvedLang: strPtr(lang), ResolvedSourcePath: strPtr(fileutil.LogicalContentPath(cfg.ContentRoot, filePath)),
+		DryRun: true, Diff: simpleDiff(in.Slug+"/"+filepath.Base(filePath), string(raw), prepared.content), Changed: &changed,
+		RateLimit:                ptrRateLimitBucket(newRateLimitBucket(limiter, cfg.RateLimit.CreateUpdatePerMin, rateLimitScopeCreateUpdateUpload, time.Now().UTC())),
+		TaxonomyCasingNormalized: prepared.normalized, TaxonomyCasingAmbiguous: prepared.ambiguous,
+		TagsDelta: prepared.tagsDelta, CategoriesDelta: prepared.categoriesDelta, BundleRevision: bundleRevision,
+	}, rateLimitRemaining(limiter))
+}
+
+func verifyUpdatePageGuards(in updatePageInput, pg *security.PathGuard, cfg config.Config, currentRevision string, limiter *rate.Limiter, wrap func(error) error) error {
+	if in.DryRun {
+		return nil
+	}
+	if strings.TrimSpace(in.ExpectedRevision) == "" {
+		return wrap(fmt.Errorf("invalid_params: expected_revision is required for non-dry-run update_page"))
+	}
+	if !limiter.Allow() {
+		return wrap(rateLimitExceededErr("update_page", cfg.RateLimit.CreateUpdatePerMin, limiter))
+	}
+	if in.ExpectedRevision != currentRevision {
+		return toolcontract.WithDataFields(wrap(fmt.Errorf("revision_conflict: page changed since it was read; read the latest revision and replan")), map[string]any{"current_revision": currentRevision})
+	}
+	if strings.TrimSpace(in.ExpectedBundleRevision) == "" {
+		return nil
+	}
+	bundleDir, _, err := resolveBundleDir(pg, cfg.ContentRoot, in.Slug)
+	if err != nil {
+		return wrap(fmt.Errorf("invalid_params: expected_bundle_revision was supplied but %q is not a page bundle (content/<slug>/ with index.* files); use expected_revision alone for leaf pages", in.Slug))
+	}
+	currentBundleRevision, err := contentmodel.BundleRevision(bundleDir)
+	if err != nil {
+		return wrap(fmt.Errorf("read_error: failed to compute bundle revision"))
+	}
+	if in.ExpectedBundleRevision != currentBundleRevision {
+		return toolcontract.WithDataFields(wrap(fmt.Errorf("bundle_conflict: a sibling translation or bundle-local asset changed since the bundle was read; re-read bundle_revision (get_page_for_edit) and replan")), map[string]any{"current_bundle_revision": currentBundleRevision})
+	}
+	return nil
+}
+
+func reconcileUpdatePageIndexes(in updatePageInput, current *hugosite.SourcePage, lang, filePath, content string, effectiveBody *string, tags, categories []string, idx *hugosite.SourceIndex, siteIdx *site.Index) (hugosite.SourcePage, bool) {
+	updated := *current
+	updated.FilePath, updated.Lang = filePath, lang
+	if in.Title != "" {
+		updated.Title = in.Title
+	}
+	if effectiveBody != nil {
+		updated.Body = *effectiveBody
+	}
+	if fm := parseFrontmatterMap([]byte(content)); fm != nil {
+		updated.FrontmatterRaw = fm
+		updated.Date = frontmatterString(fm["date"])
+		updated.Draft = frontmatterBool(fm["draft"])
+		updated.PublishDate = frontmatterTime(fm["publishDate"])
+		updated.ExpiryDate = frontmatterTime(fm["expiryDate"])
+	}
+	if tags != nil {
+		updated.Tags = tags
+	}
+	if categories != nil {
+		updated.Categories = categories
+	}
+	updated.BuildPending = true
+	idx.Upsert(updated)
+	if siteIdx == nil {
+		return updated, false
+	}
+	public, ok := siteIdx.GetBySlug(in.Slug)
+	if !ok {
+		return updated, false
+	}
+	publicUpdated := *public
+	if in.Title != "" {
+		publicUpdated.Title = in.Title
+	}
+	if tags != nil {
+		publicUpdated.Tags = tags
+	}
+	if categories != nil {
+		publicUpdated.Categories = categories
+	}
+	siteIdx.UpsertPage(publicUpdated)
+	return updated, true
+}
+
+func acquireUpdatePageContentLock() error {
+	const lockWait = 10 * time.Second
+	deadline := time.Now().Add(lockWait)
+	for {
+		if hugosite.ContentMu.TryLock() {
+			slog.Debug("update_page: lock_acquired")
+			return nil
+		}
+		if time.Now().After(deadline) {
+			slog.Error("update_page: lock_timeout", "timeout_s", lockWait.Seconds())
+			return fmt.Errorf("build_in_progress: content lock is held, retry in a moment")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// replayUpdatePage is deliberately evaluated before revision guards: a replay
+// is the same logical mutation, even when the file changed after its success.
+func replayUpdatePage(ctx context.Context, in updatePageInput, lang string, rt *writeRegisterRuntime) (string, *updatePageOutput, error) {
+	if in.DryRun || strings.TrimSpace(in.IdempotencyKey) == "" {
+		return "", nil, nil
+	}
+	hash, err := requestHash(struct {
+		Slug                   string   `json:"slug"`
+		Lang                   string   `json:"lang,omitempty"`
+		Title                  string   `json:"title,omitempty"`
+		Body                   *string  `json:"body,omitempty"`
+		OldStr                 *string  `json:"old_str,omitempty"`
+		NewStr                 *string  `json:"new_str,omitempty"`
+		ConfirmSectionIndex    bool     `json:"confirm_section_index,omitempty"`
+		Tags                   []string `json:"tags,omitempty"`
+		Categories             []string `json:"categories,omitempty"`
+		Draft                  *bool    `json:"draft,omitempty"`
+		Description            *string  `json:"description,omitempty"`
+		FeaturedImage          *string  `json:"featured_image,omitempty"`
+		ExpectedRevision       string   `json:"expected_revision,omitempty"`
+		ExpectedBundleRevision string   `json:"expected_bundle_revision,omitempty"`
+	}{
+		Slug: in.Slug, Lang: lang, Title: in.Title, Body: in.Body, OldStr: in.OldStr, NewStr: in.NewStr,
+		Tags: in.Tags, Categories: in.Categories, Draft: in.Draft,
+		Description: in.Description, FeaturedImage: in.FeaturedImage, ConfirmSectionIndex: in.ConfirmSectionIndex,
+		ExpectedRevision: in.ExpectedRevision, ExpectedBundleRevision: in.ExpectedBundleRevision,
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("internal_error: failed to hash idempotency request")
+	}
+	var cached updatePageOutput
+	hit, err := rt.idem.replay(idempotencyCallerKey(ctx), "update_page", in.IdempotencyKey, hash, &cached)
+	if err != nil {
+		return "", nil, err
+	}
+	if hit {
+		return hash, &cached, nil
+	}
+	return hash, nil, nil
+}
+
+func registerDeletePageTool(s *mcp.Server, pg *security.PathGuard, idx *hugosite.SourceIndex, cfg config.Config, siteDB *db.DB, rt *writeRegisterRuntime) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name:         "delete_page",
+		Title:        "Delete page",
+		Description:  "Delete a Hugo content page. This is destructive and rate limited to 5 deletions per minute. IMPORTANT for bilingual/multilingual bundles (index.fr.md + index.en.md under the same slug): pass `lang` to delete exactly that translation; omitting `lang` on a bundle with more than one language file fails with `ambiguous_language` rather than guessing (#682). Only the resolved language's source file is removed — the bundle directory, any shared assets, and other translations are left untouched unless the deleted language was the last one remaining, in which case the whole bundle is removed. On real execution, `data.bundle_fully_removed` reports which of those happened. On `dry_run:true`, the predictive field is instead `data.bundle_will_be_fully_removed`, so callers do not have to special-case the meaning of the real-execution field. `dry_run:true` also previews backlinks and, when the whole bundle would be removed, any generated hero image under `data.generated_assets` so agents can see global static cleanup impact before committing. Deleting the last (or only) language of a bundle removes public output/derived-index/DB entries too; deleting one of several surviving languages leaves public output untouched (surfaced as a warning) since reconciling it needs a rebuild. Non-dry-run calls require `expected_revision`, the `revision` value from a prior read of this page (e.g. get_page), unless the page has no source file to protect; a stale value fails with `revision_conflict`, telling the agent to re-read and replan. Callers may provide `idempotency_key` to safely replay the exact same non-dry-run delete after a timeout or uncertain delivery. Successful non-dry-run responses include a `state` object that tells agents whether source, public output, and derived indexes were all removed cleanly. `rate_limit_remaining` reports the caller's remaining delete budget (#466), separate from create_page/update_page/upload_page_asset's shared quota; if exceeded, the error's `resolution.retry_after_seconds` gives a concrete wait time instead of forcing you to guess a safe pacing. Optional `owner` is advisory metadata only: it can be echoed into disposable test-content frontmatter via create_page's `test_content: {owner}` and later used for filtering or audit correlation, but delete_page never derives identity, authorization, or quota treatment from that string. On a deployment with `require_delete_confirmation:true` configured (off by default), a non-dry-run delete of a real page (one with a source file that is not marked `test_content`) additionally requires `confirm_delete_of_published_page:true`, on top of `expected_revision` — the revision requirement forces a prior read, this forces a distinct, named destructive-intent decision; the response is `invalid_params` if omitted. Self-declared and unverifiable, like `create_change_set`'s `declared_untrusted_derivation`: the server cannot confirm a human approved anything, only that the caller explicitly asserted intent. A `test_content` page, or one with no source file, is exempt regardless of this setting. delete_page cannot delete a Hugo section index (`_index.md`/`_index.<lang>.md`, including the homepage via slug `\"/\"`): these are structural pages, not creatable/deletable content, and every such request fails with `invalid_params` on both `dry_run` and a real call (#1254, #1259).",
+		InputSchema:  tools.MustSchema[deletePageInput](),
+		OutputSchema: tools.MustSchema[deletePageOutput](),
+		Annotations: &mcp.ToolAnnotations{
+			ReadOnlyHint:    false,
+			DestructiveHint: fileutil.BoolPtr(true),
+			IdempotentHint:  false,
+			OpenWorldHint:   fileutil.BoolPtr(true),
+		},
+	}, toolcontract.WrapTool(func(ctx context.Context, _ *mcp.CallToolRequest, in deletePageInput) (*mcp.CallToolResult, deletePageOutput, error) {
+		return handleDeletePage(ctx, in, pg, idx, cfg, siteDB, rt)
+	}))
+}
+
+func handleDeletePage(ctx context.Context, in deletePageInput, pg *security.PathGuard, idx *hugosite.SourceIndex, cfg config.Config, siteDB *db.DB, rt *writeRegisterRuntime) (*mcp.CallToolResult, deletePageOutput, error) {
+	if cfg.ForceDryRunAll {
+		in.DryRun = true
+	}
+	in.Slug = normalizeInputSlug(in.Slug)
+	wrapErr := func(err error) error {
+		return toolcontract.WithRequestContext(err, toolcontract.RequestContext{Slug: in.Slug})
+	}
+	callerKey := mutationCallerKey(ctx)
+	limiter := callerLimiter(&rt.deleteMu, rt.deleteLimiters, callerKey, cfg.RateLimit.DestructivePerMin)
+	wrapErrWithLimiter := func(err error) error {
+		return toolcontract.WithDataFields(
+			toolcontract.WithRootFields(wrapErr(err), rateLimitRootFields(limiter)),
+			rateLimitDataFields(limiter, cfg.RateLimit.DestructivePerMin, rateLimitScopeDestructive, time.Now().UTC()),
+		)
+	}
+	// With no root _index.md present, resolveDeletePageSource legitimately
+	// reports "no source file" (its documented, pre-existing behavior for
+	// any slug with no matching file), and commitDeletePageSource's
+	// "no source file" branch removes the resolved directory outright with
+	// no expected_revision/confirmation requirement (both are scoped to
+	// resolvedSource.SourcePath != ""). For every other slug that directory
+	// is one page's own bundle folder; for "/" it is cfg.ContentRoot itself
+	// — os.RemoveAll of the site's entire content tree, unconfirmed. This
+	// has to be rejected before any resolution or filesystem work happens,
+	// not folded into the SectionIndex check further down (that check never
+	// fires here, since no file was found to resolve).
+	if err := rejectRootSlug("delete_page", in.Slug); err != nil {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(err)
+	}
+	validatedLang, mode, err := validateDeletePageInput(in)
+	if err != nil {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(err)
+	}
+	resolvedChangeSetID, err := rt.changeSets.Resolve(ctx, in.ChangeSetID, time.Now().UTC())
+	if err != nil {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(err)
+	}
+
+	lock := &deletePageContentLock{}
+	if !in.DryRun && strings.TrimSpace(in.IdempotencyKey) != "" {
+		if err := lock.acquire(); err != nil {
+			return nil, deletePageOutput{}, wrapErrWithLimiter(err)
+		}
+	}
+	defer lock.release()
+
+	// Idempotency replay must run before any current-state existence checks:
+	// a successful first delete removes the slug, so checking os.Stat(dir)
+	// first would turn the exact same retry into not_found instead of the
+	// promised replay of the original success (#724). It also stays under
+	// the content lock so same-key concurrent retries serialize correctly.
+	//
+	// For a keyed request, ContentMu is held continuously from this point
+	// through SafeJoin/os.Stat/ResolvePageSource/Allow() below, all the way
+	// to the actual delete + idempotency-cache write — not just around this
+	// replay check. That's deliberate, not scope creep: releasing the lock
+	// between the replay-miss and the delete would reopen the exact race
+	// #724 closed (two concurrent identical-key retries both missing the
+	// cache, then both racing to delete). The extra section the lock now
+	// spans is bounded to local stat/candidate-file lookups and in-memory
+	// rate-limiter bookkeeping — no network I/O, no Hugo build — so the
+	// added contention on other concurrent writers is a handful of
+	// filesystem stats' worth of hold time, not an unbounded one.
+	idemHash, cached, err := replayDeletePage(ctx, in, validatedLang, rt)
+	if err != nil {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(err)
+	}
+	if cached != nil {
+		return nil, *cached, nil
+	}
+
+	dir, err := pg.SafeJoin(in.Slug)
+	if err != nil {
+		slog.Warn("delete_page: path validation failed", "slug", in.Slug, "error", err)
+		return nil, deletePageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: path validation failed"))
+	}
+
+	// Return not_found when the source directory does not exist (#266).
+	// This still avoids burning the destructive quota because Allow() has
+	// not run yet, while now preserving the full rate_limit envelope (#725)
+	// and letting successful idempotent replays short-circuit before it.
+	if _, statErr := os.Stat(dir); os.IsNotExist(statErr) {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(fmt.Errorf("not_found: page not found for slug %q", in.Slug))
+	}
+
+	// Resolve to a single language file via the same
+	// contentmodel.ResolvePageSource machinery update_page already uses
+	// (#682), instead of the old inspectDeleteSource helper which just
+	// picked the alphabetically-first index.*.md file and never errored
+	// on ambiguity — that let one call silently target either language
+	// of a bilingual bundle depending on file naming. A page with no
+	// source file at all (public-only content) is not an error here;
+	// delete_page has always tolerated that case — but only when the
+	// caller never asked for a specific lang. If lang was explicitly
+	// given and simply doesn't match any file, that must be rejected
+	// outright, not silently downgraded to the source-less path: the
+	// source-less path skips the expected_revision requirement and
+	// drives the whole-bundle-deletion branch, which would let an
+	// invalid lang wipe every translation instead of failing cleanly
+	// (also caught by Strix on the first version of this fix).
+	resolvedSource, err := resolveDeletePageSource(in.Slug, validatedLang, cfg.ContentRoot)
+	if err != nil {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(err)
+	}
+
+	// #1254/#1259 taught contentmodel.ResolvePageSource to resolve Hugo
+	// section indexes (_index.md/_index.<lang>.md, including the root
+	// homepage via slug "/") for update_page's guarded patch support. That
+	// resolver is shared with delete_page, so without this check the same
+	// change would silently let delete_page target and remove a section
+	// index — including the homepage, the single highest-blast-radius file
+	// on the site — behind nothing but the ordinary
+	// confirm_delete_of_published_page gate any leaf page already accepts.
+	// delete_page has no lifecycle/confirmation design for structural pages
+	// (per #1259's own stated scope), so this stays a hard reject rather
+	// than a softer guard, and applies before dry_run too so a caller can't
+	// even preview what deleting a section index would look like.
+	if resolvedSource.SectionIndex {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: delete_page cannot delete a Hugo section index (including the homepage); this destructive capability is intentionally not supported"))
+	}
+
+	// dry_run: return page content + backlinks that would break, without touching disk (#267).
+	if in.DryRun {
+		return nil, buildDeletePageDryRunOutput(in, mode, dir, resolvedSource, cfg, rt.siteIdx, limiter), nil
+	}
+	if resolvedSource.SourcePath != "" && strings.TrimSpace(in.ExpectedRevision) == "" {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(fmt.Errorf("invalid_params: expected_revision is required for non-dry-run delete_page"))
+	}
+
+	// require_delete_confirmation (config.Config, opt-in, default off):
+	// a real (non-test_content) page with a source file must carry an
+	// explicit confirm_delete_of_published_page:true, on top of the
+	// expected_revision requirement above. expected_revision forces a
+	// prior read; this forces a distinct, named destructive-intent
+	// decision the calling agent's own system prompt/guardrails can
+	// hook a real human confirmation onto. Scoped to
+	// resolvedSource.SourcePath != "" — the same boundary
+	// expected_revision's own requirement already draws — since a
+	// source-less page has no frontmatter to check for the
+	// test_content exemption. Checked before Allow() so a rejected,
+	// unconfirmed call never consumes the destructive-action quota.
+	if err := validateDeletePageConfirmation(in, cfg, resolvedSource); err != nil {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(err)
+	}
+
+	// #887: Allow() fires here — after not_found and the missing-guard
+	// check above (both free), immediately before the revision_conflict
+	// check below (which consumes). This is the reference placement the
+	// whole #887 fix aligns the other tools to.
+	//
+	if !limiter.Allow() {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(rateLimitExceededErr("delete_page", cfg.RateLimit.DestructivePerMin, limiter))
+	}
+
+	if err := lock.acquire(); err != nil {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(err)
+	}
+
+	currentRevision := ""
+	if resolvedSource.SourcePath != "" {
+		currentRevision, err = contentmodel.SourceRevision(resolvedSource.SourcePath)
+		if err != nil {
+			slog.Error("delete_page: read revision failed", "slug", in.Slug, "path", resolvedSource.SourcePath, "error", err)
+			return nil, deletePageOutput{}, wrapErrWithLimiter(fmt.Errorf("read_error: failed to read page revision"))
+		}
+	}
+	if in.ExpectedRevision != currentRevision {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(fmt.Errorf("revision_conflict: page changed since it was read; read the latest revision and replan"))
+	}
+
+	// Delete only the resolved language's source file, not the whole
+	// bundle directory (#682) — a bilingual bundle (index.fr.md +
+	// index.en.md) must survive the deletion of one translation. The
+	// bundle directory (and any shared assets) is only removed once no
+	// index.*.md file remains, or when there was never a source file to
+	// begin with (public-only content, matching the pre-#682 behavior
+	// for that case).
+	bundleFullyRemoved, recoveryOp, err := commitDeletePageSource(ctx, in, dir, resolvedSource, currentRevision, idemHash, pg, cfg, siteDB)
+	if err != nil {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(err)
+	}
+
+	if bundleFullyRemoved {
+		idx.Delete(in.Slug)
+	} else {
+		idx.DeleteLang(in.Slug, resolvedSource.Lang)
+	}
+	var deleteWarning string
+	degradedDelete := false
+	dbDeleteFailed := false
+	if bundleFullyRemoved && rt.siteIdx != nil {
+		rt.siteIdx.RemoveBySlug(in.Slug)
+	}
+	if siteDB != nil {
+		var dbDeleteErr error
+		if bundleFullyRemoved {
+			if err := siteDB.DeleteBundleRepresentations(in.Slug, "source"); err != nil {
+				dbDeleteErr = err
+			} else {
+				dbDeleteErr = siteDB.DeletePage(in.Slug)
+			}
+		} else {
+			dbDeleteErr = siteDB.DeleteContentRepresentation(in.Slug, resolvedSource.Lang, "source")
+		}
+		if dbDeleteErr != nil {
+			// Source and in-memory indexes are already gone; surface the DB
+			// staleness explicitly so callers know get_broken_links may be
+			// stale until the next build (#242).
+			deleteWarning = fmt.Sprintf("source deleted but derived DB could not be updated: %v", dbDeleteErr)
+			dbDeleteFailed = true
+			degradedDelete = true
+			slog.Warn("delete_page: db delete failed", "slug", in.Slug, "error", dbDeleteErr)
+		}
+	}
+	publicCleanupFailed := false
+	if !bundleFullyRemoved {
+		// A translation survives on disk — removing SiteRoot/slug would
+		// wipe that survivor's live public output too, since Hugo's
+		// rendered output for a bundle is not scoped per language file
+		// the same way the source tree is (#682). Getting per-language
+		// public-output mapping exactly right is a separate, harder
+		// problem; for now, surface that a rebuild is needed instead of
+		// silently deleting the surviving language's public page.
+		publicPath := filepath.Join(cfg.SiteRoot, in.Slug)
+		if _, statErr := os.Stat(publicPath); statErr == nil {
+			deleteWarning = "public output for the removed language was not touched — the page bundle still has other language(s); run build_site/publish_changes to reconcile public output"
+		}
+	} else if cfg.SiteRoot != "" {
+		publicPath := filepath.Join(cfg.SiteRoot, in.Slug)
+		if rmErr := os.RemoveAll(publicPath); rmErr != nil {
+			// Source is already gone; surface the zombie so the caller knows
+			// the public output is still live (#239).
+			msg := fmt.Sprintf("source deleted but public output cleanup failed: %v", rmErr)
+			if deleteWarning != "" {
+				deleteWarning += "; " + msg
+			} else {
+				deleteWarning = msg
+			}
+			publicCleanupFailed = true
+			degradedDelete = true
+			slog.Warn("delete_page: could not remove public dir", "path", publicPath, "error", rmErr)
+		} else if siteDB != nil {
+			if err := siteDB.DeleteBundleRepresentations(in.Slug, "public"); err != nil {
+				msg := fmt.Sprintf("public output removed but derived public shadow could not be updated: %v", err)
+				if deleteWarning != "" {
+					deleteWarning += "; " + msg
+				} else {
+					deleteWarning = msg
+				}
+				degradedDelete = true
+				slog.Warn("delete_page: public shadow cleanup failed", "slug", in.Slug, "error", err)
+			}
+		}
+	}
+
+	// Best-effort removal of any hero image generate_hero_image left
+	// behind for this slug (#606). generate_hero_image writes to
+	// {HugoRoot}/static/images/{slug}-featured.jpg, a location outside
+	// the page's own content bundle, so the bundle removal above never
+	// touches it and it would otherwise accumulate as an orphaned file
+	// every time a page with a generated hero image is deleted. Skipped
+	// entirely when the bundle survives (#682) — the hero image is a
+	// whole-page-level asset shared across translations, not scoped to
+	// one language. Never fatal — mirrors the public-dir/DB/audit-log
+	// cleanup steps above, which all surface failures as a non-blocking
+	// warning rather than failing the delete outright, since the source
+	// is already gone by this point and there's nothing to roll back to.
+	generatedAssets := previewGeneratedHeroAssets(cfg.HugoRoot, in.Slug, bundleFullyRemoved)
+	if bundleFullyRemoved && cfg.HugoRoot != "" {
+		if removed, rmErr := removeHeroImage(cfg.HugoRoot, in.Slug); rmErr != nil {
+			msg := fmt.Sprintf("hero image cleanup failed: %v", rmErr)
+			if deleteWarning != "" {
+				deleteWarning += "; " + msg
+			} else {
+				deleteWarning = msg
+			}
+			degradedDelete = true
+			slog.Warn("delete_page: hero image cleanup failed", "slug", in.Slug, "error", rmErr)
+		} else if removed {
+			slog.Debug("delete_page: removed orphaned hero image", "slug", in.Slug)
+		}
+	}
+
+	auditLog := filepath.Join(cfg.ContentRoot, ".mcp-audit.log")
+	entry := fmt.Sprintf("%s DELETE %s\n", time.Now().UTC().Format(time.RFC3339), in.Slug)
+	if auditErr := appendAuditLog(auditLog, entry); auditErr != nil {
+		// Deletion already committed — surface the audit failure as a warning
+		// rather than a hard error; retrying would be a no-op.
+		slog.Warn("delete_page: audit log write failed (delete already committed)", "slug", in.Slug, "error", auditErr)
+		auditMsg := "audit_error: " + auditErr.Error()
+		if deleteWarning != "" {
+			deleteWarning += "; " + auditMsg
+		} else {
+			deleteWarning = auditMsg
+		}
+		degradedDelete = true
+	}
+
+	if cfg.Cloudflare.Enabled() {
+		pageURL := strings.TrimRight(cfg.SiteURL, "/") + "/" + in.Slug + "/"
+		if err := cloudflare.PurgeURLs(cfg.Cloudflare, []string{pageURL}); err != nil {
+			slog.Warn("delete_page: cloudflare purge failed", "slug", in.Slug, "error", err)
+		}
+	}
+
+	state := deletePageState(cfg.SiteRoot != "", publicCleanupFailed, dbDeleteFailed)
+	status := "deleted"
+	if degradedDelete {
+		status = "partial_success"
+	}
+	var generatedAssetsValue *[]deletePageGeneratedAssetDTO
+	if len(generatedAssets) > 0 {
+		generatedAssetsValue = &generatedAssets
+	}
+	out := newDeletePageOutput(deletePageData{
+		Status:             status,
+		Slug:               canonicalPublicSlug(in.Slug),
+		SourceKey:          in.Slug,
+		ResolvedLang:       strPtr(resolvedSource.Lang),
+		ResolvedSourcePath: strPtr(fileutil.LogicalContentPath(cfg.ContentRoot, resolvedSource.SourcePath)),
+		Warning:            deleteWarning,
+		State:              &state,
+		GeneratedAssets:    generatedAssetsValue,
+		BundleFullyRemoved: fileutil.BoolPtr(bundleFullyRemoved),
+		RateLimit:          ptrRateLimitBucket(newRateLimitBucket(limiter, cfg.RateLimit.DestructivePerMin, rateLimitScopeDestructive, time.Now().UTC())),
+	}, rateLimitRemaining(limiter))
+	if err := recoveryOp.stageResult(siteDB, out); err != nil {
+		return nil, deletePageOutput{}, wrapErrWithLimiter(fmt.Errorf("persistence_error: failed to stage recoverable mutation result"))
+	}
+	if idemHash != "" {
+		if err := rt.idem.remember(idempotencyCallerKey(ctx), "delete_page", in.IdempotencyKey, idemHash, out); err != nil {
+			slog.Warn("delete_page: could not persist idempotency result", "slug", in.Slug, "error", err)
+		}
+	}
+	if err := recoveryOp.record(siteDB, "committed"); err != nil {
+		slog.Warn("delete_page: could not commit recovery journal", "slug", in.Slug, "error", err)
+	}
+	rt.changeSets.RecordMutation(resolvedChangeSetID, mutationCallerKey(ctx), "delete_page", in.Slug, "delete", time.Now().UTC())
+	return nil, out, nil
+}
+
+func validateDeletePageInput(in deletePageInput) (string, toolcontract.ResponseMode, error) {
+	if in.Slug == "" {
+		return "", "", fmt.Errorf("invalid_params: slug must not be empty")
+	}
+	lang, err := validateLangParam(in.Lang)
+	if err != nil {
+		return "", "", err
+	}
+	mode, err := toolcontract.ResolveResponseMode(in.ResponseMode)
+	if err != nil {
+		return "", "", err
+	}
+	if err := validateIdempotencyKey(in.IdempotencyKey); err != nil {
+		return "", "", err
+	}
+	return lang, mode, nil
+}
+
+type deletePageContentLock struct{ held bool }
+
+func (lock *deletePageContentLock) acquire() error {
+	if lock.held {
+		return nil
+	}
+	const lockWait = 10 * time.Second
+	deadline := time.Now().Add(lockWait)
+	for {
+		if hugosite.ContentMu.TryLock() {
+			lock.held = true
+			slog.Debug("delete_page: lock_acquired")
+			return nil
+		}
+		if time.Now().After(deadline) {
+			slog.Error("delete_page: lock_timeout", "timeout_s", lockWait.Seconds())
+			return fmt.Errorf("build_in_progress: content lock is held, retry in a moment")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func (lock *deletePageContentLock) release() {
+	if lock.held {
+		hugosite.ContentMu.Unlock()
+		slog.Debug("delete_page: lock_released")
+	}
+}
+
+func replayDeletePage(ctx context.Context, in deletePageInput, lang string, rt *writeRegisterRuntime) (string, *deletePageOutput, error) {
+	if in.DryRun || strings.TrimSpace(in.IdempotencyKey) == "" {
+		return "", nil, nil
+	}
+	hash, err := requestHash(struct {
+		Slug             string `json:"slug"`
+		Lang             string `json:"lang,omitempty"`
+		ExpectedRevision string `json:"expected_revision,omitempty"`
+	}{Slug: in.Slug, Lang: lang, ExpectedRevision: in.ExpectedRevision})
+	if err != nil {
+		return "", nil, fmt.Errorf("internal_error: failed to hash idempotency request")
+	}
+	var cached deletePageOutput
+	hit, err := rt.idem.replay(idempotencyCallerKey(ctx), "delete_page", in.IdempotencyKey, hash, &cached)
+	if err != nil {
+		return "", nil, err
+	}
+	if hit {
+		return hash, &cached, nil
+	}
+	return hash, nil, nil
+}
+
+func buildDeletePageDryRunOutput(in deletePageInput, mode toolcontract.ResponseMode, dir string, resolved contentmodel.ResolvedSource, cfg config.Config, siteIdx *site.Index, limiter *rate.Limiter) deletePageOutput {
+	content := ""
+	if resolved.SourcePath != "" {
+		if raw, err := os.ReadFile(resolved.SourcePath); err == nil {
+			content = string(raw)
+		}
+	}
+	backlinks := []deletePageBacklinkDTO{}
+	if siteIdx != nil {
+		for _, edge := range siteIdx.GetBacklinks(in.Slug) {
+			backlinks = append(backlinks, deletePageBacklinkDTO{Slug: edge.FromSlug, Title: edge.FromTitle, URL: edge.FromURL})
+		}
+	}
+	var contentValue string
+	var backlinksValue *[]deletePageBacklinkDTO
+	if mode != toolcontract.ResponseModeCompact {
+		contentValue, backlinksValue = content, &backlinks
+	}
+	fullyRemoved := bundleWouldBeFullyRemovedAfterDelete(dir, resolved.SourcePath)
+	generated := previewGeneratedHeroAssets(cfg.HugoRoot, in.Slug, fullyRemoved)
+	var generatedValue *[]deletePageGeneratedAssetDTO
+	if len(generated) > 0 {
+		generatedValue = &generated
+	}
+	backlinksCount := len(backlinks)
+	return newDeletePageOutput(deletePageData{
+		Status: "would_delete", Slug: canonicalPublicSlug(in.Slug), SourceKey: in.Slug,
+		ResolvedLang: strPtr(resolved.Lang), ResolvedSourcePath: strPtr(fileutil.LogicalContentPath(cfg.ContentRoot, resolved.SourcePath)),
+		DryRun: true, Content: contentValue, Backlinks: backlinksValue, GeneratedAssets: generatedValue,
+		BacklinksCount: &backlinksCount, BundleWillBeFullyRemoved: &fullyRemoved,
+		RateLimit: ptrRateLimitBucket(newRateLimitBucket(limiter, cfg.RateLimit.DestructivePerMin, rateLimitScopeDestructive, time.Now().UTC())),
+	}, rateLimitRemaining(limiter))
+}
+
+func resolveDeletePageSource(slug, lang, contentRoot string) (contentmodel.ResolvedSource, error) {
+	resolved, err := contentmodel.ResolvePageSource(slug, lang, contentRoot)
+	switch {
+	case err == nil:
+		return resolved, nil
+	case strings.HasPrefix(err.Error(), "ambiguous_language:"):
+		return contentmodel.ResolvedSource{}, fmt.Errorf("%s", err.Error())
+	case strings.HasPrefix(err.Error(), "source_file_not_found:") && lang == "":
+		return contentmodel.ResolvedSource{}, nil
+	default:
+		return contentmodel.ResolvedSource{}, err
+	}
+}
+
+func validateDeletePageConfirmation(in deletePageInput, cfg config.Config, resolved contentmodel.ResolvedSource) error {
+	if !cfg.RequireDeleteConfirmation || resolved.SourcePath == "" || in.ConfirmDeleteOfPublishedPage {
+		return nil
+	}
+	frontmatter, err := hugosite.ParseFrontmatterFile(resolved.SourcePath)
+	if err != nil {
+		slog.Warn("delete_page: could not read frontmatter to check test_content exemption; failing closed (treating as a real page)", "slug", in.Slug, "path", resolved.SourcePath, "error", err)
+	}
+	if err == nil && frontmatterBool(frontmatter["test_content"]) {
+		return nil
+	}
+	return fmt.Errorf("invalid_params: this deployment requires confirm_delete_of_published_page:true to delete a real (non-test_content) page; set it explicitly to confirm this destructive action")
+}
+
+func commitDeletePageSource(ctx context.Context, in deletePageInput, dir string, resolved contentmodel.ResolvedSource, currentRevision, idemHash string, pg *security.PathGuard, cfg config.Config, siteDB *db.DB) (bool, *recoveryOperation, error) {
+	recoveryPath := resolved.SourcePath
+	var cleanup []string
+	if recoveryPath == "" {
+		recoveryPath = dir
+	} else if !bundleHasOtherLangFiles(dir, resolved.SourcePath) {
+		cleanup = append(cleanup, dir)
+	}
+	op, err := beginSourceWriteRecovery(siteDB, recoveryPath, currentRevision, "", recoveryIdempotencyFor(ctx, "delete_page", in.IdempotencyKey, idemHash, map[string]any{
+		"slug": canonicalPublicSlug(in.Slug), "source_key": in.Slug,
+		"resolved_lang": resolved.Lang, "resolved_source_path": fileutil.LogicalContentPath(cfg.ContentRoot, resolved.SourcePath),
+		"bundle_fully_removed": len(cleanup) > 0,
+	}), cleanup...)
+	if err != nil {
+		return false, nil, fmt.Errorf("persistence_error: failed to record source delete intent")
+	}
+	fullyRemoved := true
+	if resolved.SourcePath != "" {
+		if err := pg.RevalidateForWrite(resolved.SourcePath); err != nil {
+			slog.Warn("delete_page: symlink detected before delete", "slug", in.Slug, "path", resolved.SourcePath, "error", err)
+			return false, nil, fmt.Errorf("security_error: symlink detected in delete path")
+		}
+		if err := os.Remove(resolved.SourcePath); err != nil {
+			slog.Error("delete_page: remove source file failed", "slug", in.Slug, "path", resolved.SourcePath, "error", err)
+			return false, nil, fmt.Errorf("delete_error: failed to delete page")
+		}
+		fullyRemoved = !bundleHasRemainingLangFiles(dir)
+		if err := recoveryFilesystemBoundary("delete_page", "after_source_unlink"); err != nil {
+			return false, nil, fmt.Errorf("persistence_error: interrupted after source unlink")
+		}
+		if fullyRemoved {
+			if err := os.RemoveAll(dir); err != nil {
+				slog.Error("delete_page: remove bundle dir failed", "slug", in.Slug, "error", err)
+				return false, nil, fmt.Errorf("delete_error: failed to delete page")
+			}
+		}
+	} else {
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Error("delete_page: remove failed", "slug", in.Slug, "error", err)
+			return false, nil, fmt.Errorf("delete_error: failed to delete page")
+		}
+		if err := recoveryFilesystemBoundary("delete_page", "after_source_cleanup"); err != nil {
+			return false, nil, fmt.Errorf("persistence_error: interrupted after source cleanup")
+		}
+	}
+	if err := op.record(siteDB, "file_written"); err != nil {
+		slog.Warn("delete_page: could not advance recovery journal", "slug", in.Slug, "error", err)
+	}
+	return fullyRemoved, op, nil
+}
+
+func createPageState() site.LifecycleState {
+	return site.LifecycleState{
+		SourceState: "present",
+		BuildState:  "pending",
+		PublicState: "not_yet_available",
+		IndexState:  "source_only",
+	}
+}
+
+func updatePageState(hasSiteIndex, hadPublic bool) site.LifecycleState {
+	state := site.LifecycleState{
+		SourceState: "present",
+		BuildState:  "pending",
+	}
+	switch {
+	case hadPublic:
+		state.PublicState = "stale"
+		state.IndexState = "stale"
+	case hasSiteIndex:
+		state.PublicState = "not_yet_available"
+		state.IndexState = "source_only"
+	default:
+		state.PublicState = "unknown"
+		state.IndexState = "unknown"
+	}
+	return state
+}
+
+func deletePageState(hasSiteRoot, publicCleanupFailed, dbDeleteFailed bool) site.LifecycleState {
+	state := site.LifecycleState{
+		SourceState: "deleted",
+		BuildState:  "not_applicable",
+		IndexState:  "removed",
+	}
+	switch {
+	case !hasSiteRoot:
+		state.PublicState = "unknown"
+	case publicCleanupFailed:
+		state.PublicState = "stale"
+	default:
+		state.PublicState = "removed"
+	}
+	if dbDeleteFailed {
+		state.IndexState = "stale"
+	}
+	return state
+}
+
+// removeHeroImage best-effort removes the {slug}{assets.HeroImageSuffix} hero
+// image admin.registerGenerateFeaturedImage (generate_hero_image) writes to
+// {hugoRoot}/static/images/, keyed only by slug rather than living inside
+// the page's own content bundle (#606). Deleting it here by re-deriving the
+// path from the shared assets.HeroImageSuffix constant — rather than
+// duplicating the "-featured.jpg" literal — keeps this in lockstep with
+// generate_hero_image's own path construction, so a future rename there
+// can't silently desync this cleanup logic from the code that actually
+// produced the file. It's otherwise safe with no rename/reuse ambiguity: a
+// different page necessarily has a different slug and therefore a different
+// filename, so this can never remove another page's hero image, and
+// static/images/ is not used for any other purpose elsewhere in this
+// codebase (page assets uploaded via upload_page_asset live under the
+// page's own content bundle, not here).
+//
+// Returns (removed, err). removed is true only when a file was actually
+// deleted; a hero image that was never generated for this slug is not an
+// error — most deleted pages won't have one.
+func removeHeroImage(hugoRoot, slug string) (bool, error) {
+	loc, err := assets.ResolveHeroImageLocation(hugoRoot, slug)
+	if err != nil {
+		return false, err
+	}
+	if err := os.Remove(loc.AbsPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func previewGeneratedHeroAssets(hugoRoot, slug string, include bool) []deletePageGeneratedAssetDTO {
+	if !include || strings.TrimSpace(hugoRoot) == "" {
+		return nil
+	}
+	loc, err := assets.ResolveHeroImageLocation(hugoRoot, slug)
+	if err != nil {
+		return nil
+	}
+	info, err := os.Stat(loc.AbsPath)
+	if err != nil || info.IsDir() {
+		return nil
+	}
+	raw, err := os.ReadFile(loc.AbsPath)
+	if err != nil {
+		return nil
+	}
+	return []deletePageGeneratedAssetDTO{{
+		Name:       loc.Name,
+		Path:       loc.LogicalPath,
+		Kind:       "global_static",
+		SizeBytes:  info.Size(),
+		ModifiedAt: info.ModTime().UTC().Format(time.RFC3339),
+		Sha256:     contentmodel.SourceRevisionBytes(raw),
+	}}
+}
+
+func bundleWouldBeFullyRemovedAfterDelete(dir, resolvedSourcePath string) bool {
+	if strings.TrimSpace(resolvedSourcePath) == "" {
+		return true
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	targetBase := filepath.Base(resolvedSourcePath)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == targetBase {
+			continue
+		}
+		if strings.HasPrefix(name, "index.") && strings.HasSuffix(name, ".md") {
+			return false
+		}
+	}
+	return true
+}
+
+type frontmatterDoc struct {
+	Title         string   `yaml:"title"`
+	Date          string   `yaml:"date"`
+	Tags          []string `yaml:"tags"`
+	Categories    []string `yaml:"categories"`
+	Draft         bool     `yaml:"draft"`
+	Description   string   `yaml:"description,omitempty"`
+	FeaturedImage string   `yaml:"featuredImage,omitempty"`
+	// TestContent/TestContentOwner/TestContentExpiresAt (#661) are only
+	// ever set via create_page's explicit opt-in test_content parameter —
+	// never inferred from slug/title, so a real published page that
+	// happens to start with e.g. "codex-" is never wrongly constrained.
+	TestContent          bool   `yaml:"test_content,omitempty"`
+	TestContentOwner     string `yaml:"test_content_owner,omitempty"`
+	TestContentExpiresAt string `yaml:"test_content_expires_at,omitempty"`
+}
+
+// buildFrontmatter renders a new page's frontmatter+body. testContent, when
+// non-nil (#661), forces Draft:true regardless of any other setting and
+// records test_content/test_content_owner/test_content_expires_at —
+// computed here so the caller-visible response and the on-disk frontmatter
+// always agree on the exact expiry that was applied.
+func buildFrontmatter(title string, tags, categories []string, body string, testContent *testContentInput) (string, string) {
+	return buildFrontmatterWithOptions(title, tags, categories, body, nil, nil, nil, testContent)
+}
+
+func buildFrontmatterWithOptions(title string, tags, categories []string, body string, draft *bool, description, featuredImage *string, testContent *testContentInput) (string, string) {
+	if tags == nil {
+		tags = []string{}
+	}
+	if categories == nil {
+		categories = []string{}
+	}
+	doc := frontmatterDoc{
+		Title:      title,
+		Date:       time.Now().UTC().Format(time.RFC3339),
+		Tags:       tags,
+		Categories: categories,
+		Draft:      draft != nil && *draft,
+	}
+	if testContent != nil {
+		ttlHours := testContentDefaultTTLHours
+		if testContent.TTLHours != nil {
+			ttlHours = *testContent.TTLHours
+		}
+		doc.Draft = true
+		doc.TestContent = true
+		doc.TestContentOwner = testContent.Owner
+		doc.TestContentExpiresAt = time.Now().UTC().Add(time.Duration(ttlHours) * time.Hour).Format(time.RFC3339)
+	}
+	if description != nil {
+		doc.Description = *description
+	}
+	if featuredImage != nil {
+		doc.FeaturedImage = *featuredImage
+	}
+	raw, _ := marshalWithIndent(doc, 2)
+	var sb strings.Builder
+	sb.WriteString("---\n")
+	sb.Write(raw)
+	sb.WriteString("---")
+	if body != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(body)
+	}
+	return sb.String(), doc.TestContentExpiresAt
+}
+
+func buildFrontmatterFromMap(fm map[string]any, body string) string {
+	raw, _ := marshalWithIndent(fm, 2)
+	var sb strings.Builder
+	sb.WriteString("---\n")
+	sb.Write(raw)
+	sb.WriteString("---")
+	if body != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(body)
+	}
+	return sb.String()
+}
+
+type pageUpdateOpts struct {
+	Tags        []string
+	Categories  []string
+	Draft       *bool
+	Description *string
+	// FeaturedImage — see the comment on updatePageInput.FeaturedImage (#809).
+	FeaturedImage *string
+}
+
+// applyPageUpdates applies title, body, and optional front matter field changes
+// to an existing page file using the yaml.v3 Node API to preserve field
+// ordering, comments, and YAML style (issue #111).
+func applyPageUpdates(fileContent, newTitle, newBody string, opts pageUpdateOpts) (string, error) {
+	if !strings.HasPrefix(fileContent, "---\n") {
+		return "", fmt.Errorf("no YAML frontmatter delimiter")
+	}
+	rest := fileContent[4:]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return "", fmt.Errorf("unterminated YAML frontmatter")
+	}
+	yamlPart := rest[:end]
+	bodyPart := rest[end+4:] // everything after the closing ---
+
+	needsYAML := newTitle != "" || opts.Tags != nil || opts.Categories != nil ||
+		opts.Draft != nil || opts.Description != nil || opts.FeaturedImage != nil
+
+	if needsYAML {
+		var doc yaml.Node
+		if err := yaml.Unmarshal([]byte(yamlPart), &doc); err != nil {
+			return "", fmt.Errorf("YAML parse: %w", err)
+		}
+		if len(doc.Content) == 0 || doc.Content[0] == nil || doc.Content[0].Kind != yaml.MappingNode {
+			return "", fmt.Errorf("YAML parse: frontmatter root must be a mapping")
+		}
+		mapping := doc.Content[0]
+		if newTitle != "" {
+			setYAMLKey(mapping, "title", newTitle)
+		}
+		if opts.Tags != nil {
+			setYAMLSeq(mapping, "tags", opts.Tags)
+		}
+		if opts.Categories != nil {
+			setYAMLSeq(mapping, "categories", opts.Categories)
+		}
+		if opts.Draft != nil {
+			setYAMLBool(mapping, "draft", *opts.Draft)
+		}
+		if opts.Description != nil {
+			if *opts.Description == "" {
+				deleteYAMLKey(mapping, "description")
+			} else {
+				setYAMLKey(mapping, "description", *opts.Description)
+			}
+		}
+		if opts.FeaturedImage != nil {
+			if *opts.FeaturedImage == "" {
+				deleteYAMLKey(mapping, "featuredImage")
+			} else {
+				setYAMLKey(mapping, "featuredImage", *opts.FeaturedImage)
+			}
+		}
+		out, err := marshalWithIndent(doc.Content[0], 2)
+		if err != nil {
+			return "", fmt.Errorf("YAML marshal: %w", err)
+		}
+		yamlPart = strings.TrimRight(string(out), "\n")
+	}
+
+	if newBody != "" {
+		bodyPart = "\n\n" + newBody
+	}
+
+	return "---\n" + yamlPart + "\n---" + bodyPart, nil
+}
+
+// setYAMLKey updates the value of key in a YAML mapping node in-place,
+// appending a new key-value pair when key is absent.
+func setYAMLKey(mapping *yaml.Node, key, value string) {
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1].SetString(value)
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value},
+	)
+}
+
+func deleteYAMLKey(mapping *yaml.Node, key string) {
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content = append(mapping.Content[:i], mapping.Content[i+2:]...)
+			return
+		}
+	}
+}
+
+// setYAMLSeq sets a sequence (list) value in a YAML mapping node in-place,
+// appending a new key-sequence pair when key is absent.
+func setYAMLSeq(mapping *yaml.Node, key string, values []string) {
+	seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	for _, v := range values {
+		seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v})
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1] = seq
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		seq,
+	)
+}
+
+// setYAMLBool sets a boolean value in a YAML mapping node in-place,
+// appending a new key-value pair when key is absent.
+func setYAMLBool(mapping *yaml.Node, key string, value bool) {
+	v := "false"
+	if value {
+		v = "true"
+	}
+	node := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: v}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1] = node
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		node,
+	)
+}
+
+func marshalWithIndent(v any, indent int) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(indent)
+	if err := enc.Encode(v); err != nil {
+		_ = enc.Close()
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func inspectDeleteSource(dir string) contentmodel.ResolvedSource {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return contentmodel.ResolvedSource{}
+	}
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == "index.md" || (strings.HasPrefix(name, "index.") && strings.HasSuffix(name, ".md")) {
+			files = append(files, filepath.Join(dir, name))
+		}
+	}
+	if len(files) == 0 {
+		return contentmodel.ResolvedSource{}
+	}
+	sort.Strings(files)
+	path := files[0]
+	return contentmodel.ResolvedSource{
+		SourcePath: path,
+		Lang:       inferLangFromIndexFile(path),
+	}
+}
+
+func inferLangFromIndexFile(path string) string {
+	base := filepath.Base(path)
+	if base == "index.md" {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(base, "index."), ".md")
+}
+
+// bundleHasRemainingLangFiles reports whether dir still contains any
+// index.md/index.<lang>.md file (#682) — used by delete_page after removing
+// one language's source file to decide whether the bundle directory (and
+// any shared assets) should also be removed, or whether another
+// translation is still present and the directory must survive.
+func bundleHasRemainingLangFiles(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == "index.md" || (strings.HasPrefix(name, "index.") && strings.HasSuffix(name, ".md")) {
+			return true
+		}
+	}
+	return false
+}
+
+func bundleHasOtherLangFiles(dir, excludedPath string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() || filepath.Join(dir, e.Name()) == excludedPath {
+			continue
+		}
+		name := e.Name()
+		if name == "index.md" || (strings.HasPrefix(name, "index.") && strings.HasSuffix(name, ".md")) {
+			return true
+		}
+	}
+	return false
+}
+
+func bundleHasUnselectedLangFiles(dir string, selected map[string]bool) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name != "index.md" && !(strings.HasPrefix(name, "index.") && strings.HasSuffix(name, ".md")) {
+			continue
+		}
+		if !selected[filepath.Join(dir, name)] {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveExistingSource(contentRoot, slug, lang string) (contentmodel.ResolvedSource, error) {
+	resolved, err := contentmodel.ResolvePageSource(slug, lang, contentRoot)
+	if err != nil {
+		msg := err.Error()
+		switch {
+		case strings.HasPrefix(msg, "source_file_not_found:"):
+			return contentmodel.ResolvedSource{}, fmt.Errorf("not_found: page not found")
+		default:
+			return contentmodel.ResolvedSource{}, err
+		}
+	}
+	return resolved, nil
+}
+
+// Defs returns the tool definitions for this package (used to build the global registry).
+func Defs() []tools.ToolDef {
+	return []tools.ToolDef{
+		{Name: "create_page", RequiredScope: "write"},
+		{Name: "update_page", RequiredScope: "write"},
+		{Name: "delete_page", RequiredScope: "write"},
+		{Name: "upload_page_asset", RequiredScope: "write"},
+		{Name: "delete_page_asset", RequiredScope: "write"},
+		{Name: "begin_asset_upload", RequiredScope: "write"},
+		{Name: "upload_asset_chunk", RequiredScope: "write"},
+		{Name: "commit_asset_upload", RequiredScope: "write"},
+		{Name: "get_mutation_status", RequiredScope: "write"},
+		{Name: "get_rate_limits", RequiredScope: "write"},
+		{Name: "plan_content_change", RequiredScope: ""},
+		{Name: "apply_content_plan", RequiredScope: "write"},
+		{Name: "rollback_change", RequiredScope: "write"},
+		{Name: "list_page_snapshots", RequiredScope: "write"},
+		{Name: "plan_bundle_change", RequiredScope: ""},
+		{Name: "apply_bundle_plan", RequiredScope: "write"},
+		{Name: "rollback_bundle", RequiredScope: "write"},
+		{Name: "create_bundle", RequiredScope: "write"},
+		{Name: "delete_bundle", RequiredScope: "write"},
+		{Name: "create_change_set", RequiredScope: "write"},
+	}
+}
+
+// validateFrontmatterRoundTrip parses content's frontmatter block to confirm
+// it can be re-parsed cleanly. A body that begins with a second YAML frontmatter
+// block (duplicated-frontmatter corruption signature) is rejected.
+func validateFrontmatterRoundTrip(content string) error {
+	if !strings.HasPrefix(content, "---\n") {
+		return fmt.Errorf("missing YAML frontmatter delimiter")
+	}
+	rest := content[4:]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return fmt.Errorf("unterminated YAML frontmatter")
+	}
+	yamlBytes := []byte(rest[:end])
+	var fm any
+	if err := yaml.Unmarshal(yamlBytes, &fm); err != nil {
+		return fmt.Errorf("frontmatter YAML invalid after update: %w", err)
+	}
+	var doc frontmatterDoc
+	if err := yaml.Unmarshal(yamlBytes, &doc); err != nil {
+		return fmt.Errorf("frontmatter YAML invalid after update: %w", err)
+	}
+	if doc.TestContent && !doc.Draft {
+		return fmt.Errorf("test_content pages must remain draft:true until the test_content marker is removed")
+	}
+	body := strings.TrimSpace(rest[end+4:])
+	// Detect duplicated frontmatter: body starts with "---\n" and contains a
+	// closing "---" within the first 30 lines. A bare thematic break ("---"
+	// immediately followed by non-YAML content) is not rejected.
+	if strings.HasPrefix(body, "---\n") {
+		inner := body[4:]
+		innerEnd := strings.Index(inner, "\n---")
+		if innerEnd >= 0 {
+			lines := strings.Count(inner[:innerEnd], "\n")
+			if lines <= 30 {
+				return fmt.Errorf("body contains a second frontmatter block — frontmatter appears to be duplicated")
+			}
+		}
+	}
+	return nil
+}
+
+// simpleDiff produces a unified diff between old and new, labelled with path.
+// Returns an empty string when the contents are identical.
+func simpleDiff(path, old, new string) string {
+	if old == new {
+		return ""
+	}
+	oldLines := strings.Split(old, "\n")
+	newLines := strings.Split(new, "\n")
+	m, n := len(oldLines), len(newLines)
+	if m > 500 || n > 500 {
+		return fmt.Sprintf("--- a/%s\n+++ b/%s\n# content changed (%d → %d lines)\n", path, path, m, n)
+	}
+	// Clamp after the guard so static analysis can verify allocation sizes are bounded.
+	m, n = min(m, 500), min(n, 500)
+	// Wagner-Fischer LCS
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+	for i := 1; i <= m; i++ {
+		for j := 1; j <= n; j++ {
+			if oldLines[i-1] == newLines[j-1] {
+				dp[i][j] = dp[i-1][j-1] + 1
+			} else if dp[i-1][j] >= dp[i][j-1] {
+				dp[i][j] = dp[i-1][j]
+			} else {
+				dp[i][j] = dp[i][j-1]
+			}
+		}
+	}
+	type edit struct {
+		kind rune
+		text string
+	}
+	edits := make([]edit, 0, m+n)
+	i, j := m, n
+	for i > 0 || j > 0 {
+		switch {
+		case i > 0 && j > 0 && oldLines[i-1] == newLines[j-1]:
+			edits = append(edits, edit{' ', oldLines[i-1]})
+			i--
+			j--
+		case j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]):
+			edits = append(edits, edit{'+', newLines[j-1]})
+			j--
+		default:
+			edits = append(edits, edit{'-', oldLines[i-1]})
+			i--
+		}
+	}
+	// Reverse
+	for l, r := 0, len(edits)-1; l < r; l, r = l+1, r-1 {
+		edits[l], edits[r] = edits[r], edits[l]
+	}
+	// Locate changed regions and expand with context
+	const ctx = 3
+	type hunk struct{ s, e int }
+	var hunks []hunk
+	inChange := false
+	cs := 0
+	for k, ed := range edits {
+		if ed.kind != ' ' {
+			if !inChange {
+				cs = k
+				inChange = true
+			}
+		} else if inChange {
+			hunks = append(hunks, hunk{max(0, cs-ctx), min(len(edits)-1, k+ctx-1)})
+			inChange = false
+		}
+	}
+	if inChange {
+		hunks = append(hunks, hunk{max(0, cs-ctx), len(edits) - 1})
+	}
+	// Merge overlapping hunks
+	merged := hunks[:0]
+	for _, h := range hunks {
+		if len(merged) > 0 && h.s <= merged[len(merged)-1].e+1 {
+			if h.e > merged[len(merged)-1].e {
+				merged[len(merged)-1].e = h.e
+			}
+		} else {
+			merged = append(merged, h)
+		}
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "--- a/%s\n+++ b/%s\n", path, path)
+	for _, h := range merged {
+		oldStart, newStart, oldCount, newCount := 1, 1, 0, 0
+		for k := 0; k < h.s; k++ {
+			if edits[k].kind != '+' {
+				oldStart++
+			}
+			if edits[k].kind != '-' {
+				newStart++
+			}
+		}
+		for k := h.s; k <= h.e; k++ {
+			if edits[k].kind != '+' {
+				oldCount++
+			}
+			if edits[k].kind != '-' {
+				newCount++
+			}
+		}
+		fmt.Fprintf(&sb, "@@ -%d,%d +%d,%d @@\n", oldStart, oldCount, newStart, newCount)
+		for k := h.s; k <= h.e; k++ {
+			fmt.Fprintf(&sb, "%c%s\n", edits[k].kind, edits[k].text)
+		}
+	}
+	return sb.String()
+}
+
+func appendAuditLog(path, entry string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(entry)
+	return err
+}

@@ -1,0 +1,14 @@
+{{ define "main" }}
+  <article class="content-page page-shell post-page">
+    <header class="content-page__header">
+      <a class="back-link" href="{{ "/posts/" | relURL }}">← Back to Blog</a>
+      <p class="eyebrow">BLOG / {{ .Date.Format "02 JAN 2006" }}</p>
+      <h1>{{ .Title }}</h1>
+      {{ with .Description }}<p class="lede">{{ . }}</p>{{ end }}
+      <div class="content-meta"><span>By {{ .Params.author | default "Avery Freeman" }}</span>{{ with .Params.categories }}<span class="content-meta__chip">{{ delimit . " · " }}</span>{{ end }}</div>
+      {{ with .Params.thumbnail }}<figure class="post-hero-image"><img src="{{ . | relURL }}" alt="{{ $.Params.thumbnail_alt | default $.Title }}" loading="eager" decoding="async"></figure>{{ end }}
+    </header>
+    <div class="content-page__body prose">{{ .Content }}</div>
+    <footer class="post-footer"><a class="text-link" href="{{ "/posts/" | relURL }}">Browse all posts <span aria-hidden="true">↗</span></a></footer>
+  </article>
+{{ end }}

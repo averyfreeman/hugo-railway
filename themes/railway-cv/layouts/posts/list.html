@@ -1,0 +1,40 @@
+{{ define "main" }}
+  {{ $posts := (where .Site.RegularPages "Section" "posts").ByDate.Reverse }}
+  <section class="archive page-shell posts-archive">
+    <header class="archive__header">
+      <p class="eyebrow">BLOG / PUBLISHED WRITING</p>
+      <h1>{{ .Title }}</h1>
+      <p class="lede">{{ .Description }}</p>
+    </header>
+
+    <section class="post-search card" aria-labelledby="post-search-title" data-pagefind-ignore>
+      <div><p class="eyebrow">LOCAL SEARCH</p><h2 id="post-search-title">Search the archive.</h2><p>Search runs against the published pages built into this site.</p></div>
+      <label for="post-search-input">Search posts</label>
+      <div class="post-search__controls">
+        <input id="post-search-input" class="input input-bordered" type="search" name="q" placeholder="Try a tool, system, or topic" autocomplete="off" data-post-search>
+        <button type="button" class="btn btn-outline filter-clear" data-post-search-clear>Clear</button>
+      </div>
+      <p class="post-search__status" aria-live="polite" aria-atomic="true" data-post-search-status>Search the local archive by title or content.</p>
+      <ol class="post-search__results" data-post-search-results></ol>
+    </section>
+
+    <div class="posts-list-heading">
+      <h2>All published posts</h2><span>{{ len $posts }} posts · newest first</span>
+    </div>
+    <div class="posts-list">
+      {{ range $posts }}
+        <article class="post-row">
+          {{ with .Params.thumbnail }}
+            <a class="post-row__thumbnail" href="{{ $.RelPermalink }}" aria-hidden="true" tabindex="-1"><img src="{{ . | relURL }}" alt="" loading="lazy" decoding="async"></a>
+          {{ end }}
+          <div class="post-row__content">
+            <p class="post-row__date">{{ .Date.Format "02 Jan 2006" }}</p>
+            <h3><a href="{{ .RelPermalink }}">{{ .Title }}</a></h3>
+            <p>{{ .Description | default (.Summary | plainify) }}</p>
+          </div>
+          <a class="post-row__read" href="{{ .RelPermalink }}" aria-label="Read {{ .Title }}">Read <span aria-hidden="true">↗</span></a>
+        </article>
+      {{ end }}
+    </div>
+  </section>
+{{ end }}

@@ -1,0 +1,10 @@
+{{ define "main" }}
+  <section class="migration-shell page-shell">
+    <header class="migration-header">
+      <p class="eyebrow">VITEPRESS / REVIEW SURFACE</p>
+      <h1>{{ .Title }}</h1>
+      {{ with .Description }}<p class="lede">{{ . }}</p>{{ end }}
+    </header>
+    <div class="migration-body prose">{{ .Content }}</div>
+  </section>
+{{ end }}

@@ -1,0 +1,29 @@
+{{ define "main" }}
+  {{ $back := "/vitepress-migration/" }}
+  {{ $backLabel := "migration review" }}
+  {{ if eq .Params.migration_kind "article" }}{{ $back = "/articles_2/" }}{{ $backLabel = "articles" }}{{ end }}
+  {{ if eq .Params.migration_kind "policy" }}{{ $back = "/policy_2/" }}{{ $backLabel = "policy working notes" }}{{ end }}
+  <article class="migration-shell migration-shell--single page-shell">
+    <header class="migration-header">
+      <a class="back-link" href="{{ $back | relURL }}">← Back to {{ $backLabel }}</a>
+      <p class="eyebrow">STAGED IMPORT / {{ .Params.migration_kind | upper }}</p>
+      <h1>{{ .Title }}</h1>
+      {{ with .Params.summary }}<p class="lede">{{ . }}</p>{{ end }}
+      {{ if .Params.working_note }}<p class="migration-notice">This is an exploratory public policy working note, not an institutional position or fact-checking record.</p>{{ end }}
+      <div class="content-meta">
+        {{ with .Date }}<span class="content-meta__chip">{{ .Format "02 Jan 2006" }}</span>{{ end }}
+        {{ with .Params.author }}<span class="content-meta__chip">{{ . }}</span>{{ end }}
+        {{ with .Params.categories }}<span class="content-meta__tags">{{ delimit . " · " }}</span>{{ end }}
+        {{ with .Params.source_path }}<span class="content-meta__tags">source / {{ . }}</span>{{ end }}
+      </div>
+      {{ with .Params.policy_hero }}
+        <figure class="migration-hero">
+          <img src="{{ . | relURL }}" alt="{{ $.Params.policy_hero_alt | default $.Title }}" loading="eager">
+        </figure>
+      {{ end }}
+    </header>
+    <div class="migration-body prose">
+      {{ .Content }}
+    </div>
+  </article>
+{{ end }}

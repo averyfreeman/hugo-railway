@@ -1,0 +1,33 @@
+@import "tailwindcss";
+@source "../../layouts";
+
+@plugin "daisyui" {
+  themes: false;
+  include: navbar, button, card, badge, input, select;
+}
+
+@plugin "daisyui/theme" {
+  name: "signal";
+  default: true;
+  color-scheme: dark;
+
+  --color-base-100: var(--surface-raised);
+  --color-base-200: var(--surface);
+  --color-base-300: var(--surface-deep);
+  --color-base-content: var(--ink);
+  --color-primary: var(--violet);
+  --color-primary-content: #f9f7ff;
+  --color-secondary: var(--violet-soft);
+  --color-secondary-content: #1c1930;
+  --color-accent: var(--mint);
+  --color-accent-content: #17221c;
+  --color-neutral: var(--surface-raised);
+  --color-neutral-content: var(--ink);
+
+  --radius-selector: 0.25rem;
+  --radius-field: 0.25rem;
+  --radius-box: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}

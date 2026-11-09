@@ -1,0 +1,5 @@
+<div class="content-meta">
+  {{ with .Params.kernel }}<span class="content-meta__chip badge badge-outline">kernel / {{ . }}</span>{{ end }}
+  {{ with .Params.publication_type }}<span class="content-meta__chip badge badge-outline">{{ . }}</span>{{ end }}
+  {{ with .Params.tags }}<span class="content-meta__tags">{{ delimit . " · " }}</span>{{ end }}
+</div>

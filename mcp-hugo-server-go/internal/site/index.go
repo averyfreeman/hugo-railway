@@ -1,0 +1,1039 @@
+package site
+
+import (
+	"bytes"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/config"
+	"github.com/jmrGrav/mcp-hugo-server-go/internal/taxonomy"
+	"golang.org/x/net/html"
+)
+
+type entry struct {
+	page       Page
+	parsedDate time.Time
+}
+
+type Index struct {
+	mu                sync.RWMutex
+	entries           []entry
+	bySlug            map[string]int
+	aliasSlugs        map[string]string
+	tags              []string
+	categories        []string
+	info              map[string]string
+	contentClassifier *ContentClassifier
+	blCache           backlinkCache
+	builtAt           time.Time
+	staleCache        staleCache
+	// verificationSlugs is cfg.TechnicalVerificationSlugs (#1186), captured
+	// at construction time so NewClassifier(idx) and idx.Classifier() apply
+	// it without needing cfg threaded through separately. Per-instance
+	// rather than a package-level setting specifically so two indexes built
+	// from different configs (e.g. a test constructing Index{} directly, or
+	// two indexes with different config in the same process) never share or
+	// clobber each other's allowlist.
+	verificationSlugs map[string]struct{}
+}
+
+// staleCache memoizes StaleAgainstDisk's result for staleCheckInterval so a
+// burst of reader-tool calls (get_backlinks, get_related_content,
+// get_broken_links) doesn't each pay for a full disk walk — the staleness
+// signal is a backstop for out-of-band edits, not a real-time guarantee, so
+// a short cache window is an acceptable trade for read-path cost.
+type staleCache struct {
+	mu        sync.Mutex
+	checkedAt time.Time
+	stale     bool
+	newest    time.Time
+}
+
+// staleCheckInterval is a var, not a const, only so SetStaleCheckIntervalForTesting
+// can shrink it in tests that need to observe a staleness transition without
+// a real 30s sleep. Production code must never change it.
+var staleCheckInterval = 30 * time.Second
+
+// SetStaleCheckIntervalForTesting overrides the staleness-cache TTL for the
+// duration of a test and returns a func to restore the previous value.
+// Exists solely so external test packages (e.g. internal/tools/read) can
+// observe a staleness transition without sleeping for the real interval.
+func SetStaleCheckIntervalForTesting(d time.Duration) func() {
+	prev := staleCheckInterval
+	staleCheckInterval = d
+	return func() { staleCheckInterval = prev }
+}
+
+// Reload rebuilds the index from disk, atomically replacing all in-memory
+// state. Safe to call concurrently with read methods (uses RWMutex).
+func (idx *Index) Reload(cfg config.Config) error {
+	fresh, err := NewIndex(cfg)
+	if err != nil {
+		return err
+	}
+	idx.mu.Lock()
+	idx.entries = fresh.entries
+	idx.bySlug = fresh.bySlug
+	idx.aliasSlugs = fresh.aliasSlugs
+	idx.tags = fresh.tags
+	idx.categories = fresh.categories
+	idx.info = fresh.info
+	idx.contentClassifier = fresh.contentClassifier
+	idx.verificationSlugs = fresh.verificationSlugs
+	idx.builtAt = fresh.builtAt
+	idx.mu.Unlock()
+	idx.blCache.invalidate()
+	idx.staleCache.mu.Lock()
+	idx.staleCache.checkedAt = time.Time{}
+	idx.staleCache.mu.Unlock()
+	return nil
+}
+
+// RemoveBySlug removes the entry for slug from the public index immediately.
+// Call this after delete_page to prevent stale sitemap results before the next build.
+func (idx *Index) RemoveBySlug(slug string) {
+	if idx == nil {
+		return
+	}
+	idx.mu.Lock()
+	norm := normalizeSlug(slug)
+	pos, ok := idx.bySlug[norm]
+	if ok {
+		idx.entries = append(idx.entries[:pos], idx.entries[pos+1:]...)
+		delete(idx.bySlug, norm)
+		for i := pos; i < len(idx.entries); i++ {
+			idx.bySlug[idx.entries[i].page.Slug] = i
+		}
+	}
+	idx.mu.Unlock()
+	if ok {
+		idx.blCache.invalidate()
+	}
+}
+
+// UpsertPage inserts or replaces a page entry in the public index.
+// Use this to stake a placeholder for newly created pages (before build).
+func (idx *Index) UpsertPage(p Page) {
+	if idx == nil {
+		return
+	}
+	norm := normalizeSlug(p.Slug)
+	p.Slug = norm
+	idx.mu.Lock()
+	if pos, ok := idx.bySlug[norm]; ok {
+		idx.entries[pos].page = p
+	} else {
+		idx.bySlug[norm] = len(idx.entries)
+		idx.entries = append(idx.entries, entry{page: p})
+	}
+	idx.mu.Unlock()
+	idx.blCache.invalidate()
+}
+
+// GetBacklinks returns pages that contain an internal link to targetSlug.
+// The reverse-link map is built lazily on first call and invalidated on Reload/RemoveBySlug/UpsertPage.
+func (idx *Index) GetBacklinks(targetSlug string) []BacklinkEntry {
+	if idx == nil {
+		return nil
+	}
+	m := idx.blCache.getOrBuild(idx)
+	norm := normalizeSlug(targetSlug)
+	return m[norm]
+}
+
+// BuiltAt returns when this index's in-memory state was last populated
+// (NewIndex/Reload), independent of when individual pages were published.
+func (idx *Index) BuiltAt() time.Time {
+	if idx == nil {
+		return time.Time{}
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.builtAt
+}
+
+// StaleAgainstDisk reports whether any HTML file under cfg.SiteRoot has been
+// modified since this index was built, and if so, the most recent such
+// modification time. The index is only refreshed by Reload — called
+// automatically after build_site; create_page/delete_page patch entries
+// in-memory (UpsertPage/RemoveBySlug) but do not advance builtAt — so
+// content that reaches SiteRoot any other way (a manual `hugo` build
+// outside this server, a direct filesystem edit) can desync
+// backlinks/related-content/broken-links results from what's actually on
+// disk without any in-process signal. This is that signal. Result is
+// cached for staleCheckInterval so a burst of reader-tool calls doesn't
+// each pay for a full stat-only disk walk; the signal is a best-effort
+// backstop, not a real-time guarantee.
+func (idx *Index) StaleAgainstDisk(cfg config.Config) (stale bool, newest time.Time) {
+	if idx == nil {
+		return false, time.Time{}
+	}
+	idx.staleCache.mu.Lock()
+	defer idx.staleCache.mu.Unlock()
+	if time.Since(idx.staleCache.checkedAt) < staleCheckInterval {
+		return idx.staleCache.stale, idx.staleCache.newest
+	}
+	stale, newest = idx.computeStaleAgainstDisk(cfg)
+	idx.staleCache.checkedAt = time.Now()
+	idx.staleCache.stale = stale
+	idx.staleCache.newest = newest
+	return stale, newest
+}
+
+// computeStaleAgainstDisk mirrors NewIndex's own walk filters (hidden-path
+// rejection, symlink rejection, isHTMLFile) so it never flags a file the
+// index itself would have skipped — a false "stale" on an intentionally
+// excluded file would undermine trust in the whole signal.
+func (idx *Index) computeStaleAgainstDisk(cfg config.Config) (stale bool, newest time.Time) {
+	builtAt := idx.BuiltAt()
+	root := strings.TrimSpace(cfg.SiteRoot)
+	if root == "" || builtAt.IsZero() {
+		return false, time.Time{}
+	}
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if p == root {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+
+		if cfg.RejectHiddenPath && isHiddenPath(rel) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !isHTMLFile(filepath.Base(rel)) {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.ModTime().After(builtAt) {
+			stale = true
+			if info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+		}
+		return nil
+	})
+	return stale, newest
+}
+
+func NewIndex(cfg config.Config) (*Index, error) {
+	verificationSlugs := normalizeVerificationSlugs(cfg.TechnicalVerificationSlugs)
+	builtAt := time.Now()
+	root := strings.TrimSpace(cfg.SiteRoot)
+	if root == "" {
+		return &Index{
+			bySlug:            map[string]int{},
+			aliasSlugs:        map[string]string{},
+			info:              map[string]string{"name": cfg.SiteName, "url": cfg.SiteURL, "lang": cfg.DefaultLanguage},
+			builtAt:           builtAt,
+			verificationSlugs: verificationSlugs,
+		}, nil
+	}
+
+	canonicalRoot, err := canonicalDir(root)
+	if err != nil {
+		return nil, err
+	}
+	warnIfSiteRootLooksLikeProjectRoot(canonicalRoot)
+
+	maxEntries := cfg.MaxIndexEntries
+	if maxEntries <= 0 {
+		maxEntries = 5000
+	}
+	defaultLang := cfg.DefaultLanguage
+	if defaultLang == "" {
+		defaultLang = "en"
+	}
+
+	idx := &Index{
+		bySlug:            map[string]int{},
+		aliasSlugs:        map[string]string{},
+		info:              map[string]string{"name": cfg.SiteName, "url": cfg.SiteURL, "lang": defaultLang},
+		builtAt:           builtAt,
+		verificationSlugs: verificationSlugs,
+	}
+
+	tagSet := map[string]struct{}{}
+	catSet := map[string]struct{}{}
+	// ownerIsAlias tracks, per occupied slug, whether the entry currently
+	// sitting in bySlug got there via a <link rel=canonical> pointing at a
+	// *different* slug (an alias page, #184's grav-csp-nonce case) rather
+	// than by genuinely owning that slug. filepath.WalkDir order is lexical,
+	// not canonical-aware, so an alias can be walked before the page it
+	// points at — without this, that alias would permanently squat the slot
+	// and the real page would be dropped as a "duplicate" (#1112).
+	ownerIsAlias := map[string]bool{}
+
+	err = filepath.WalkDir(canonicalRoot, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if p == canonicalRoot {
+			return nil
+		}
+		rel, err := filepath.Rel(canonicalRoot, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+
+		if cfg.RejectHiddenPath && isHiddenPath(rel) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			if cfg.RejectSymlinks {
+				return fmt.Errorf("symlink rejected: %s", rel)
+			}
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		base := filepath.Base(rel)
+		if !isHTMLFile(base) {
+			return nil
+		}
+		if len(idx.entries) >= maxEntries {
+			return fmt.Errorf("index entry limit exceeded: %d", maxEntries)
+		}
+
+		info, err := os.Stat(p)
+		if err != nil {
+			return err
+		}
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+
+		pg, parsedDate, err := parseHTMLPage(raw, rel, info.ModTime(), cfg.SiteURL, defaultLang)
+		if err != nil {
+			return err
+		}
+		if pg.Slug == "" {
+			return nil
+		}
+		pg.OutputPath = rel
+		ownSlug := slugFromRel(rel)
+		isAlias := ownSlug != pg.Slug
+
+		if pos, exists := idx.bySlug[pg.Slug]; exists {
+			if isAlias {
+				// An alias never displaces whoever currently occupies its
+				// canonical target's slot — #184's dedup semantics are
+				// unchanged. Still record the alias mapping so a link to
+				// this file's own URL can be recognized as "exists, not
+				// canonical" instead of "missing" (#1112).
+				idx.aliasSlugs[ownSlug] = pg.Slug
+				slog.Warn("site index: duplicate slug detected, skipping", "slug", pg.Slug, "path", p)
+				return nil
+			}
+			if !ownerIsAlias[pg.Slug] {
+				// Two files both genuinely claim the same slug — a real
+				// content conflict, not a walk-order artifact. Unchanged
+				// first-wins behavior.
+				slog.Warn("site index: duplicate slug detected, skipping", "slug", pg.Slug, "path", p)
+				return nil
+			}
+			// The slot was squatted by an alias walked earlier; this file is
+			// that alias's genuine canonical owner. Demote the alias and
+			// install the real page in its place.
+			demoted := idx.entries[pos]
+			idx.aliasSlugs[slugFromRel(demoted.page.OutputPath)] = pg.Slug
+			idx.entries[pos] = entry{page: pg, parsedDate: parsedDate}
+			ownerIsAlias[pg.Slug] = false
+			return nil
+		}
+
+		if isAlias {
+			idx.aliasSlugs[ownSlug] = pg.Slug
+			ownerIsAlias[pg.Slug] = true
+		}
+		idx.bySlug[pg.Slug] = len(idx.entries)
+		idx.entries = append(idx.entries, entry{page: pg, parsedDate: parsedDate})
+
+		for _, tag := range pg.Tags {
+			tagSet[tag] = struct{}{}
+		}
+		for _, cat := range pg.Categories {
+			catSet[cat] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sort.SliceStable(idx.entries, func(i, j int) bool {
+		di := idx.entries[i].parsedDate
+		dj := idx.entries[j].parsedDate
+		if di.Equal(dj) {
+			return idx.entries[i].page.Slug < idx.entries[j].page.Slug
+		}
+		return di.After(dj)
+	})
+
+	idx.bySlug = make(map[string]int, len(idx.entries))
+	for i := range idx.entries {
+		idx.bySlug[idx.entries[i].page.Slug] = i
+	}
+
+	for tag := range tagSet {
+		idx.tags = append(idx.tags, tag)
+	}
+	sort.Strings(idx.tags)
+
+	for cat := range catSet {
+		idx.categories = append(idx.categories, cat)
+	}
+	sort.Strings(idx.categories)
+
+	idx.contentClassifier = NewClassifier(idx)
+
+	return idx, nil
+}
+
+func (idx *Index) GetBySlug(slug string) (*Page, bool) {
+	if idx == nil || slug == "" {
+		return nil, false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	norm := normalizeSlug(slug)
+	pos, ok := idx.bySlug[norm]
+	if !ok {
+		return nil, false
+	}
+	p := idx.entries[pos].page
+	return &p, true
+}
+
+// ResolveAlias reports whether slug is a known canonical-collapse alias —
+// a real, walkable file whose own <link rel=canonical> pointed at a
+// different page, so #184's dedup never gave it its own bySlug/entries slot.
+// A true ok means slug legitimately exists on disk and resolves to the
+// returned canonical slug; it is not a "missing page" (#1112).
+func (idx *Index) ResolveAlias(slug string) (string, bool) {
+	if idx == nil || slug == "" {
+		return "", false
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	target, ok := idx.aliasSlugs[normalizeSlug(slug)]
+	return target, ok
+}
+
+// ScoredPage pairs a search result with its match score (the count of
+// query terms that matched somewhere in the page's title/summary/url/tags/
+// categories — see scoreEntry). Exposing the score lets a caller judge
+// match strength instead of treating every hit as equally relevant.
+type ScoredPage struct {
+	Page  Page
+	Score int
+}
+
+func (idx *Index) Search(query string, limit int) []Page {
+	if idx == nil {
+		return nil
+	}
+	scored := idx.SearchScored(query, limit)
+	out := make([]Page, len(scored))
+	for i, s := range scored {
+		out[i] = s.Page
+	}
+	return out
+}
+
+func (idx *Index) SearchScored(query string, limit int) []ScoredPage {
+	if idx == nil {
+		return nil
+	}
+	idx.mu.RLock()
+	pages := idx.contentPagesLocked()
+	idx.mu.RUnlock()
+	if limit <= 0 || limit > len(pages) {
+		limit = len(pages)
+	}
+	terms := strings.Fields(strings.ToLower(query))
+	var results []ScoredPage
+	for _, page := range pages {
+		s := scoreEntry(page, terms)
+		if len(terms) == 0 {
+			s = 1
+		}
+		if s > 0 {
+			results = append(results, ScoredPage{Page: page, Score: s})
+		}
+	}
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].Score == results[j].Score {
+			return results[i].Page.Date > results[j].Page.Date
+		}
+		return results[i].Score > results[j].Score
+	})
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results
+}
+
+func (idx *Index) RecentPosts(n int) []Page {
+	if idx == nil {
+		return nil
+	}
+	idx.mu.RLock()
+	classifier := idx.classifier()
+	var posts []Page
+	for _, e := range idx.entries {
+		if classifier.IsArticle(e.page) {
+			posts = append(posts, e.page)
+		}
+	}
+	idx.mu.RUnlock()
+	if n > 0 && len(posts) > n {
+		posts = posts[:n]
+	}
+	return posts
+}
+
+func (idx *Index) AllTags() []string {
+	if idx == nil {
+		return nil
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.tags
+}
+
+func (idx *Index) AllCategories() []string {
+	if idx == nil {
+		return nil
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.categories
+}
+
+func (idx *Index) Sitemap() []Page {
+	if idx == nil {
+		return nil
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	out := make([]Page, len(idx.entries))
+	for i, e := range idx.entries {
+		out[i] = e.page
+	}
+	return out
+}
+
+func (idx *Index) GetFeed(limit int) []Page {
+	if idx == nil {
+		return nil
+	}
+	idx.mu.RLock()
+	out := idx.contentPagesLocked()
+	idx.mu.RUnlock()
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func (idx *Index) SiteInfo() map[string]string {
+	if idx == nil {
+		return map[string]string{}
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.info
+}
+
+func parseHTMLPage(raw []byte, rel string, modTime time.Time, siteURL, defaultLang string) (Page, time.Time, error) {
+	doc, err := html.Parse(bytes.NewReader(raw))
+	if err != nil {
+		return Page{}, time.Time{}, err
+	}
+	meta := collectMeta(doc)
+
+	slug := meta.canonicalSlug
+	if slug == "" {
+		slug = slugFromRel(rel)
+	}
+	if slug == "" {
+		return Page{}, time.Time{}, nil
+	}
+
+	parsedDate := firstNonZeroTime(meta.published, meta.modified, modTime)
+	dateStr := ""
+	if !parsedDate.IsZero() {
+		dateStr = parsedDate.UTC().Format(time.RFC3339)
+	}
+
+	canonicalURL := meta.canonicalURL
+	if canonicalURL == "" {
+		canonicalURL = joinURL(siteURL, slug)
+	}
+
+	tags := taxonomy.DeduplicateRaw(meta.tags)
+	cats := taxonomy.DeduplicateRaw(meta.categories)
+
+	pg := Page{
+		Slug:       slug,
+		Title:      firstNonEmptyStr(meta.ogTitle, meta.title, slugTitleFallback(slug)),
+		Summary:    firstNonEmptyStr(meta.ogDescription, meta.description),
+		Tags:       tags,
+		Categories: cats,
+		Date:       dateStr,
+		URL:        canonicalURL,
+		Lang:       firstNonEmptyStr(collapseToDefaultLangSubtag(meta.lang, defaultLang), defaultLang),
+		RawHTML:    bodyHTML(raw),
+	}
+	return pg, parsedDate, nil
+}
+
+type htmlMeta struct {
+	title         string
+	description   string
+	canonicalURL  string
+	canonicalSlug string
+	lang          string
+	ogTitle       string
+	ogDescription string
+	section       string
+	published     time.Time
+	modified      time.Time
+	tags          []string
+	categories    []string
+}
+
+func collectMeta(doc *html.Node) htmlMeta {
+	var meta htmlMeta
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n == nil {
+			return
+		}
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "html":
+				if v := nodeAttr(n, "lang"); v != "" {
+					meta.lang = v
+				}
+			case "title":
+				if meta.title == "" {
+					meta.title = strings.TrimSpace(textContent(n))
+				}
+			case "meta":
+				name := strings.ToLower(nodeAttr(n, "name"))
+				prop := strings.ToLower(nodeAttr(n, "property"))
+				content := strings.TrimSpace(nodeAttr(n, "content"))
+				switch {
+				case name == "description" && meta.description == "":
+					meta.description = content
+				case prop == "og:title" && meta.ogTitle == "":
+					meta.ogTitle = content
+				case prop == "og:description" && meta.ogDescription == "":
+					meta.ogDescription = content
+				case prop == "article:section" && meta.section == "":
+					meta.section = content
+				case prop == "article:published_time" && meta.published.IsZero():
+					meta.published = parseRFC3339(content)
+				case prop == "article:modified_time" && meta.modified.IsZero():
+					meta.modified = parseRFC3339(content)
+				case prop == "article:tag" && content != "":
+					meta.tags = append(meta.tags, content)
+				case prop == "article:category" && content != "":
+					meta.categories = append(meta.categories, content)
+				case name == "keywords" && content != "":
+					meta.categories = append(meta.categories, splitCSV(content)...)
+				}
+			case "link":
+				rel := strings.ToLower(nodeAttr(n, "rel"))
+				if strings.Contains(rel, "canonical") && meta.canonicalURL == "" {
+					meta.canonicalURL = strings.TrimSpace(nodeAttr(n, "href"))
+					meta.canonicalSlug = slugFromCanonical(meta.canonicalURL)
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(doc)
+	return meta
+}
+
+func bodyHTML(raw []byte) string {
+	doc, err := html.Parse(bytes.NewReader(raw))
+	if err != nil {
+		return string(raw)
+	}
+	body := findElement(doc, "body")
+	if body == nil {
+		return string(raw)
+	}
+	var buf bytes.Buffer
+	for c := body.FirstChild; c != nil; c = c.NextSibling {
+		_ = html.Render(&buf, c)
+	}
+	return buf.String()
+}
+
+func findElement(n *html.Node, name string) *html.Node {
+	var out *html.Node
+	var walk func(*html.Node)
+	walk = func(cur *html.Node) {
+		if cur == nil || out != nil {
+			return
+		}
+		if cur.Type == html.ElementNode && cur.Data == name {
+			out = cur
+			return
+		}
+		for c := cur.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return out
+}
+
+func nodeAttr(n *html.Node, key string) string {
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, key) {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+func textContent(n *html.Node) string {
+	var buf strings.Builder
+	var walk func(*html.Node)
+	walk = func(cur *html.Node) {
+		if cur == nil {
+			return
+		}
+		if cur.Type == html.TextNode {
+			buf.WriteString(cur.Data)
+			buf.WriteByte(' ')
+		}
+		for c := cur.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(n)
+	return strings.Join(strings.Fields(buf.String()), " ")
+}
+
+func parseRFC3339(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func slugFromCanonical(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if i := strings.Index(raw, "://"); i >= 0 {
+		raw = raw[i+3:]
+		if j := strings.IndexByte(raw, '/'); j >= 0 {
+			raw = raw[j:]
+		} else {
+			raw = "/"
+		}
+	}
+	if raw == "" {
+		return ""
+	}
+	if !strings.HasPrefix(raw, "/") {
+		raw = "/" + raw
+	}
+	if decoded, err := url.PathUnescape(raw); err == nil {
+		raw = decoded
+	}
+	return normalizeSlug(raw)
+}
+
+func slugFromRel(rel string) string {
+	rel = filepath.ToSlash(rel)
+	switch {
+	case rel == "index.html":
+		return "/"
+	case strings.HasSuffix(rel, "/index.html"):
+		return normalizeSlug("/" + strings.TrimSuffix(rel, "/index.html"))
+	case strings.HasSuffix(rel, ".html"):
+		return normalizeSlug("/" + strings.TrimSuffix(rel, ".html"))
+	default:
+		return normalizeSlug("/" + strings.TrimSuffix(rel, filepath.Ext(rel)))
+	}
+}
+
+func normalizeSlug(raw string) string {
+	if raw == "" {
+		return "/"
+	}
+	clean := pathClean(raw)
+	if clean == "." {
+		return "/"
+	}
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	if strings.HasSuffix(clean, "/index") {
+		clean = strings.TrimSuffix(clean, "index")
+	}
+	if strings.HasSuffix(clean, "/index/") {
+		clean = strings.TrimSuffix(clean, "index/")
+	}
+	if clean != "/" && !strings.HasSuffix(clean, "/") {
+		clean = clean + "/"
+	}
+	return clean
+}
+
+func pathClean(raw string) string {
+	if raw == "" {
+		return "/"
+	}
+	raw = strings.ReplaceAll(raw, "//", "/")
+	if !strings.HasPrefix(raw, "/") {
+		raw = "/" + raw
+	}
+	clean := filepath.ToSlash(filepath.Clean(raw))
+	if clean == "." {
+		return "/"
+	}
+	return clean
+}
+
+func isHTMLFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".html", ".htm":
+		return true
+	}
+	return false
+}
+
+func scoreEntry(p Page, terms []string) int {
+	if len(terms) == 0 {
+		return 1
+	}
+	fields := []string{
+		strings.ToLower(p.Title),
+		strings.ToLower(p.Summary),
+		strings.ToLower(p.URL),
+		strings.ToLower(strings.Join(p.Tags, " ")),
+		strings.ToLower(strings.Join(p.Categories, " ")),
+	}
+	score := 0
+	for _, term := range terms {
+		for _, field := range fields {
+			if strings.Contains(field, term) {
+				score++
+				break
+			}
+		}
+	}
+	return score
+}
+
+func joinURL(siteURL, slug string) string {
+	siteURL = strings.TrimRight(strings.TrimSpace(siteURL), "/")
+	slug = strings.TrimSpace(slug)
+	if siteURL == "" {
+		return slug
+	}
+	if slug == "" || slug == "/" {
+		return siteURL + "/"
+	}
+	return siteURL + normalizeSlug(slug)
+}
+
+// primaryLangSubtag returns an HTML `<html lang>` attribute's BCP-47 primary
+// subtag ("fr-FR" -> "fr").
+func primaryLangSubtag(lang string) string {
+	lang = strings.TrimSpace(lang)
+	if lang == "" {
+		return ""
+	}
+	if i := strings.IndexAny(lang, "-_"); i > 0 {
+		lang = lang[:i]
+	}
+	return strings.ToLower(lang)
+}
+
+// collapseToDefaultLangSubtag collapses a raw `<html lang>` attribute to its
+// primary subtag only when that subtag matches the configured default
+// language. Themes commonly render the SEO-preferred region-qualified form
+// for the default language ("fr-FR") even though Hugo's own language key
+// (and this server's frontmatter `lang` field) is the short primary subtag
+// ("fr") — comparing the raw attribute as-is against source languages then
+// silently orphans every default-language page (#1099). Left untouched
+// otherwise, so a site whose Hugo language key is itself region-qualified
+// (e.g. `languages.pt-BR`, with `<html lang="pt-BR">` matching frontmatter
+// `lang: pt-BR` exactly) keeps its existing exact-match behavior.
+func collapseToDefaultLangSubtag(lang, defaultLang string) string {
+	lang = strings.TrimSpace(lang)
+	if lang == "" || strings.EqualFold(lang, defaultLang) {
+		return lang
+	}
+	primary := primaryLangSubtag(lang)
+	if primary != "" && primary == primaryLangSubtag(defaultLang) {
+		return primary
+	}
+	return lang
+}
+
+func firstNonEmptyStr(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func firstNonZeroTime(values ...time.Time) time.Time {
+	for _, v := range values {
+		if !v.IsZero() {
+			return v
+		}
+	}
+	return time.Time{}
+}
+
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func slugTitleFallback(slug string) string {
+	slug = strings.TrimSuffix(strings.TrimSpace(slug), "/")
+	if slug == "" || slug == "/" {
+		return "Home"
+	}
+	parts := strings.Split(slug, "/")
+	leaf := parts[len(parts)-1]
+	if leaf == "" {
+		return "Home"
+	}
+	leaf = strings.ReplaceAll(leaf, "-", " ")
+	leaf = strings.ReplaceAll(leaf, "_", " ")
+	return strings.ToUpper(leaf[:1]) + leaf[1:]
+}
+
+func canonicalDir(root string) (string, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return "", fmt.Errorf("empty root")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("root is not a directory: %s", abs)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("root must not be a symlink: %s", abs)
+	}
+	return abs, nil
+}
+
+// warnIfSiteRootLooksLikeProjectRoot logs a warning when canonicalRoot looks
+// like a Hugo project root (contains a themes/ directory, or a hugo.toml/
+// hugo.yaml/hugo.yml/config.toml site config file) rather than a build-output
+// directory. site_root must be the Hugo build output (publishDir, normally
+// {hugo_root}/public) — pointing it at the project root causes any vendored
+// theme's raw .html layout templates under themes/ to be walked and
+// misparsed as content pages, silently corrupting published-page counts and
+// the link graph. This is a warning, not a hard error: it's a strong signal
+// of misconfiguration but not a certainty (an unusual but valid site could
+// have a themes/ or hugo.toml-named directory under its real publishDir).
+func warnIfSiteRootLooksLikeProjectRoot(canonicalRoot string) {
+	markers := []string{"themes", "content", "hugo.toml", "hugo.yaml", "hugo.yml", "config.toml"}
+	var found []string
+	for _, m := range markers {
+		if _, err := os.Stat(filepath.Join(canonicalRoot, m)); err == nil {
+			found = append(found, m)
+		}
+	}
+	if len(found) > 0 {
+		slog.Warn("site index: site_root looks like a Hugo project root, not a build-output directory",
+			"site_root", canonicalRoot,
+			"found", found,
+			"hint", "site_root should point at the Hugo build output (publishDir, normally {hugo_root}/public), not the project root — vendored theme .html templates under themes/ will otherwise be misparsed as content pages")
+	}
+}
+
+// NormalizeSlug normalizes a URL path to a canonical slug with leading and trailing slashes.
+func NormalizeSlug(raw string) string { return normalizeSlug(raw) }
+
+func isHiddenPath(rel string) bool {
+	if rel == "" {
+		return false
+	}
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if strings.HasPrefix(part, ".") {
+			return true
+		}
+	}
+	return false
+}
